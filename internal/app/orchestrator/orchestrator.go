@@ -15,7 +15,15 @@ import (
 	"github.com/Luew2/FreeCode/internal/ports"
 )
 
-const DefaultMaxSteps = 8
+const (
+	DefaultMaxSteps = 8
+	// maxEmptyRetries caps how many times the orchestrator will re-poll the
+	// model after an empty turn (no text, no tool calls). Empty turns are
+	// almost always provider glitches; retrying twice with progressively
+	// stronger nudges recovers from them without spinning forever when the
+	// model is genuinely stuck.
+	maxEmptyRetries = 2
+)
 
 type Runner struct {
 	Model  ports.ModelClient
@@ -90,6 +98,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 	// tool_choice=required gives them no escape hatch on the retry turn.
 	// After the forced turn we drop back to default (auto) regardless.
 	forceToolNextTurn := false
+	emptyRetries := 0
 	for step := 1; step <= maxSteps; step++ {
 		tools := r.toolSpecs()
 		prepared, err := contextmgr.Prepare(messages, tools, request.ContextBudget)
@@ -136,6 +145,29 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 		}
 		if len(turn.toolCalls) == 0 {
 			text := strings.TrimSpace(turn.text)
+			// Empty-turn retry: a turn with no text AND no tool calls is
+			// almost always a provider glitch (dropped chunk, tool_choice
+			// matched nothing, content-filter redact). Real "I have
+			// nothing to say" responses are vanishingly rare in an agent
+			// context. Retry up to maxEmptyRetries times with a
+			// progressively stronger nudge before accepting the empty
+			// outcome. This keeps the agent from quietly giving up after
+			// a single transient hiccup.
+			if text == "" && emptyRetries < maxEmptyRetries && step < maxSteps {
+				emptyRetries++
+				notice := fmt.Sprintf("model returned empty response, retrying %d/%d", emptyRetries, maxEmptyRetries)
+				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", notice, assistantMessagePayload(step, "empty_retry", nil)); err != nil {
+					return Response{}, err
+				}
+				messages = append(messages, model.TextMessage(model.RoleDeveloper, emptyResponseRetryPrompt(emptyRetries, tools)))
+				// Force tool use on the retry once tools exist; the empty
+				// response often means the model couldn't decide what to do
+				// next and needs the constraint nudge.
+				if len(tools) > 0 {
+					forceToolNextTurn = true
+				}
+				continue
+			}
 			if !followThroughFired && needsToolFollowThrough(text, tools) && step < maxSteps {
 				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", text, assistantMessagePayload(step, "needs_tool_followthrough", nil)); err != nil {
 					return Response{}, err
@@ -206,6 +238,34 @@ func needsToolFollowThrough(text string, tools []model.ToolSpec) bool {
 		return false
 	}
 	return true
+}
+
+// emptyResponseRetryPrompt returns the developer-message nudge we inject
+// after an empty model turn. The first retry is gentle ("did you mean to
+// answer?"); the second is stricter ("if you have nothing to say, say so
+// in plain text"). We deliberately avoid escalating into a forced tool
+// call by name — emptyRetries is for ANY empty case, including ones where
+// the model legitimately has nothing tool-relevant to do.
+func emptyResponseRetryPrompt(attempt int, tools []model.ToolSpec) string {
+	if attempt <= 1 {
+		base := "Your previous response was empty. Either call a tool to do the work or write a brief textual answer for the user. Do not return another empty response."
+		if len(tools) > 0 {
+			names := toolNameList(tools)
+			base += " Available tools: " + names + "."
+		}
+		return base
+	}
+	return "Your previous response was still empty. This is the last retry — respond with at least one word of text now, even if it is just a short status update like \"done\" or \"unable to proceed because <reason>\". Do not stay silent."
+}
+
+func toolNameList(tools []model.ToolSpec) string {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		if strings.TrimSpace(tool.Name) != "" {
+			names = append(names, tool.Name)
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 func toolFollowThroughPrompt(tools []model.ToolSpec) string {

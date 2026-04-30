@@ -70,6 +70,78 @@ func TestRunnerThreadsPriorMessagesIntoFirstRequest(t *testing.T) {
 	}
 }
 
+func TestRunnerRetriesEmptyTurnsBeforeGivingUp(t *testing.T) {
+	// First and second turns are empty; third produces real text. The
+	// orchestrator should retry through the empties and surface the third
+	// reply as the final answer instead of returning an empty result the
+	// user is left staring at.
+	client := &scriptedModelClient{
+		scripts: [][]model.Event{
+			{{Type: model.EventCompleted}},
+			{{Type: model.EventCompleted}},
+			{
+				{Type: model.EventTextDelta, Text: "actual answer after retries"},
+				{Type: model.EventCompleted},
+			},
+		},
+	}
+	tools := &fakeTools{result: "x", specs: []model.ToolSpec{{Name: "read_file"}}}
+	log := &memoryEventLog{}
+	resp, err := Runner{Model: client, Tools: tools, Log: log}.Run(context.Background(), Request{
+		SessionID:   "s1",
+		Model:       model.NewRef("local", "coder"),
+		UserRequest: "go",
+		MaxSteps:    8,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Text != "actual answer after retries" {
+		t.Fatalf("response text = %q, want third turn accepted", resp.Text)
+	}
+	if got, want := len(client.requests), 3; got != want {
+		t.Fatalf("requests = %d, want %d (initial + 2 empty retries)", got, want)
+	}
+
+	var emptyRetryEvents int
+	for _, e := range log.events {
+		if e.Type == session.EventAssistantMessage && e.Payload != nil && e.Payload["status"] == "empty_retry" {
+			emptyRetryEvents++
+		}
+	}
+	if emptyRetryEvents != 2 {
+		t.Fatalf("empty_retry events = %d, want 2", emptyRetryEvents)
+	}
+}
+
+func TestRunnerAcceptsEmptyAfterRetryBudgetExhausted(t *testing.T) {
+	// All three turns are empty. After 2 retries the orchestrator gives up
+	// and logs the empty result as final, returning "" — the workbench
+	// renders this as "(no response)" so the user knows the turn ended.
+	client := &scriptedModelClient{
+		scripts: [][]model.Event{
+			{{Type: model.EventCompleted}},
+			{{Type: model.EventCompleted}},
+			{{Type: model.EventCompleted}},
+		},
+	}
+	resp, err := Runner{Model: client, Tools: &fakeTools{result: "x"}, Log: &memoryEventLog{}}.Run(context.Background(), Request{
+		SessionID:   "s1",
+		Model:       model.NewRef("local", "coder"),
+		UserRequest: "go",
+		MaxSteps:    8,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Text != "" {
+		t.Fatalf("response text = %q, want empty after exhausted retries", resp.Text)
+	}
+	if got := len(client.requests); got != 3 {
+		t.Fatalf("requests = %d, want 3 (initial + 2 retries)", got)
+	}
+}
+
 func TestRunnerForcesToolChoiceOnFollowThroughTurn(t *testing.T) {
 	// First turn: model produces text-only "I'll inspect..." which trips the
 	// follow-through heuristic. The orchestrator should issue the second
