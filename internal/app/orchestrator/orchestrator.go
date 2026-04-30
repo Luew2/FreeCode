@@ -168,24 +168,32 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 				if hint := diagnosticHint(turn.diagnostics); hint != "" {
 					notice += " (" + hint + ")"
 				}
-				// Inline raw chunk snippets directly in the chat so the user
-				// can immediately see what shape the model is producing.
-				// Show the FIRST chunk with non-empty choices when we have
-				// it (that's the shape that actually carries deltas) and
-				// fall back to the last chunk (usually just usage stats).
-				if turn.diagnostics != nil {
-					if first := turn.diagnostics.RawFirstChunk; first != "" {
-						if len(first) > 600 {
-							first = first[:600] + "...[truncated]"
+				// Inline EVERY captured raw chunk directly in the chat so
+				// the user can see exactly what the model sent without
+				// needing to dig into the artifact. Cap the inline dump
+				// to 30 chunks and 8KB total to keep one chat message
+				// from running away — the full dump is still in the
+				// model_response_dump artifact below if you need it.
+				if turn.diagnostics != nil && len(turn.diagnostics.RawChunks) > 0 {
+					notice += "\n\nAll raw chunks (" + fmt.Sprintf("%d", len(turn.diagnostics.RawChunks)) + "):\n```jsonl\n"
+					inlined := 0
+					inlinedBytes := 0
+					for _, raw := range turn.diagnostics.RawChunks {
+						if inlined >= 30 || inlinedBytes+len(raw) > 8*1024 {
+							notice += "...[" + fmt.Sprintf("%d", len(turn.diagnostics.RawChunks)-inlined) + " more chunks in artifact dump]\n"
+							break
 						}
-						notice += "\n\nFirst contentful chunk:\n```json\n" + first + "\n```"
+						notice += raw + "\n"
+						inlined++
+						inlinedBytes += len(raw)
 					}
-					if last := turn.diagnostics.RawLastChunk; last != "" && last != turn.diagnostics.RawFirstChunk {
-						if len(last) > 400 {
-							last = last[:400] + "...[truncated]"
-						}
-						notice += "\n\nLast chunk:\n```json\n" + last + "\n```"
+					notice += "```"
+				} else if turn.diagnostics != nil && turn.diagnostics.RawLastChunk != "" {
+					last := turn.diagnostics.RawLastChunk
+					if len(last) > 600 {
+						last = last[:600] + "...[truncated]"
 					}
+					notice += "\n\nLast chunk only:\n```json\n" + last + "\n```"
 				}
 				payload := assistantMessagePayload(step, "empty_retry", nil)
 				if turn.diagnostics != nil {
@@ -392,6 +400,9 @@ func diagnosticHint(diag *model.Diagnostics) string {
 	}
 	if diag.DroppedCalls > 0 {
 		parts = append(parts, fmt.Sprintf("dropped_tool_calls=%d", diag.DroppedCalls))
+	}
+	if diag.ReasoningTokens > 0 {
+		parts = append(parts, fmt.Sprintf("recovered %d reasoning tokens", diag.ReasoningTokens))
 	}
 	if diag.TextDeltaCount == 0 && diag.ToolCallCount == 0 {
 		if diag.CompletionTokens > 0 {

@@ -206,6 +206,29 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 		if acc.AddChunk(chunk) {
 			sdkAcceptedChunks++
 		}
+		// Parse the raw JSON ourselves to recover wire-format fields the
+		// openai-go SDK does not surface: reasoning_content (Z.ai's GLM,
+		// DeepSeek, Qwen reasoning models), thinking (Anthropic-style on
+		// some compat providers), function_call (legacy single-tool), and
+		// tool_calls when they arrive in chunks the SDK accumulator
+		// dropped. The smoking-gun symptom is finish_reason=tool_calls
+		// with completion_tokens > 0 but our extracted text+tool_calls is
+		// empty — those tokens lived in a field we did not read.
+		if extra := parseExtendedDelta(chunk.RawJSON()); extra != nil {
+			if extra.ReasoningContent != "" {
+				diag.TextDeltaCount++
+				diag.ReasoningTokens += approxTokens(extra.ReasoningContent)
+				events <- model.Event{Type: model.EventTextDelta, Text: extra.ReasoningContent}
+			}
+			if extra.Thinking != "" {
+				diag.TextDeltaCount++
+				diag.ReasoningTokens += approxTokens(extra.Thinking)
+				events <- model.Event{Type: model.EventTextDelta, Text: extra.Thinking}
+			}
+			if extra.LegacyFunctionCall != nil {
+				fallbackTools.addLegacy(extra.LegacyFunctionCall)
+			}
+		}
 		if raw := chunk.RawJSON(); raw != "" {
 			lastChunkJSON = raw
 			// Capture the first chunk whose choices[] is non-empty —
@@ -474,6 +497,96 @@ func (a *toolCallAccumulator) complete() []model.ToolCall {
 		})
 	}
 	return out
+}
+
+// extendedDelta carries fields the openai-go SDK does not natively expose
+// but compat providers commonly use to stream content. Captured via a raw
+// JSON re-parse of each chunk so we can recover content the SDK silently
+// drops because the field names are non-standard.
+type extendedDelta struct {
+	ReasoningContent   string
+	Thinking           string
+	LegacyFunctionCall *legacyFunctionCall
+}
+
+type legacyFunctionCall struct {
+	Name      string
+	Arguments string
+}
+
+// parseExtendedDelta returns nil if the chunk has no extended fields we
+// care about. The "happy path" (a chunk with only the SDK-known fields)
+// avoids any allocation past the unmarshal of a small struct.
+func parseExtendedDelta(raw string) *extendedDelta {
+	if raw == "" {
+		return nil
+	}
+	var envelope struct {
+		Choices []struct {
+			Delta struct {
+				ReasoningContent string `json:"reasoning_content"`
+				Thinking         string `json:"thinking"`
+				FunctionCall     *struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function_call"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return nil
+	}
+	if len(envelope.Choices) == 0 {
+		return nil
+	}
+	delta := envelope.Choices[0].Delta
+	if delta.ReasoningContent == "" && delta.Thinking == "" && delta.FunctionCall == nil {
+		return nil
+	}
+	out := &extendedDelta{
+		ReasoningContent: delta.ReasoningContent,
+		Thinking:         delta.Thinking,
+	}
+	if delta.FunctionCall != nil {
+		out.LegacyFunctionCall = &legacyFunctionCall{
+			Name:      delta.FunctionCall.Name,
+			Arguments: delta.FunctionCall.Arguments,
+		}
+	}
+	return out
+}
+
+// approxTokens estimates token count for a text string. Used only for
+// diagnostics; the real provider counts win for billing.
+func approxTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	return (len(s) + 3) / 4
+}
+
+// addLegacy folds a streamed legacy `function_call` (single-call,
+// pre-tool_calls API) into the same accumulator as modern tool_calls so
+// the orchestrator does not need to know the difference. Treats
+// successive deltas as additive (the same way openai-go would for
+// tool_calls).
+func (a *toolCallAccumulator) addLegacy(call *legacyFunctionCall) {
+	if call == nil {
+		return
+	}
+	key := accumulatorKey{index: 0, id: "legacy_function_call"}
+	partial := a.bySlot[key]
+	if partial == nil {
+		partial = &partialToolCall{id: "legacy_function_call"}
+		a.bySlot[key] = partial
+		a.order = append(a.order, key)
+	}
+	if call.Name != "" {
+		partial.name = call.Name
+	}
+	if call.Arguments != "" {
+		partial.arguments.WriteString(call.Arguments)
+	}
 }
 
 // extractInlineError returns the human-readable error message from a

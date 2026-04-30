@@ -223,6 +223,14 @@ type Diagnostics struct {
 	// non-zero value indicates the wire format had something the SDK
 	// didn't handle directly.
 	FallbackCalls int
+	// ReasoningTokens estimates how much of the response lived in a
+	// non-standard reasoning field (delta.reasoning_content for Z.ai's
+	// GLM, DeepSeek, Qwen reasoning models; delta.thinking on some compat
+	// providers). When the SDK reported completion_tokens > 0 but we got
+	// no parseable content, the orchestrator surfaces this so the user
+	// knows the model is "thinking" into a channel we don't render
+	// directly.
+	ReasoningTokens int
 	// RawFirstChunk is the first chunk whose choices array was non-empty
 	// (i.e. the first chunk that purportedly carried real model output).
 	// This is what tells us which delta fields the provider is using —
