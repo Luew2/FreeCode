@@ -298,6 +298,12 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 		streamMeta := map[string]string{}
 		var fullTranscript []TranscriptItem
 		agentIndexes := map[string]int{}
+		// agentTranscriptIndexes maps an agent_id to the position of its
+		// transcript entry. The orchestrator emits an EventAgent twice per
+		// subagent (running, completed) so we'd otherwise render the same
+		// task description as two near-identical messages. With this map we
+		// update the existing transcript entry's status/text in place.
+		agentTranscriptIndexes := map[string]int{}
 		appendTranscript := func(kind TranscriptKind, actor string, title string, text string, opts map[string]string) {
 			text = strings.TrimSpace(text)
 			if text == "" && kind != TranscriptThinking && kind != TranscriptTool && kind != TranscriptPatch && kind != TranscriptShell && kind != TranscriptAgent && kind != TranscriptContext && kind != TranscriptError {
@@ -472,7 +478,27 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 				opts["agent_id"] = agentItem.ID
 				opts["status"] = agentItem.Status
 				opts["role"] = agentItem.Role
-				appendTranscript(TranscriptAgent, event.Actor, agentTranscriptTitle(agentItem), firstNonEmpty(agentItem.Summary, event.Text), opts)
+				agentText := firstNonEmpty(agentItem.Summary, event.Text)
+				if existingIdx, ok := agentTranscriptIndexes[agentItem.ID]; ok && existingIdx < len(fullTranscript) {
+					prev := fullTranscript[existingIdx]
+					prev.Status = agentItem.Status
+					if strings.TrimSpace(agentText) != "" {
+						prev.Text = strings.TrimSpace(agentText)
+					}
+					prev.Title = agentTranscriptTitle(agentItem)
+					if prev.Meta == nil {
+						prev.Meta = map[string]string{}
+					}
+					for key, value := range opts {
+						if value != "" && key != "status" {
+							prev.Meta[key] = value
+						}
+					}
+					fullTranscript[existingIdx] = prev
+				} else {
+					appendTranscript(TranscriptAgent, event.Actor, agentTranscriptTitle(agentItem), agentText, opts)
+					agentTranscriptIndexes[agentItem.ID] = len(fullTranscript) - 1
+				}
 			case session.EventContextCompacted:
 				appendTranscript(TranscriptContext, event.Actor, "context", event.Text, transcriptEventMeta(event))
 			case session.EventError:

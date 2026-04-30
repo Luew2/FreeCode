@@ -450,11 +450,16 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	// Mouse wheel always scrolls the transcript regardless of focus. That
+	// matches what users intuit ("the chat is the primary content; my wheel
+	// scrolls the chat") and means scrolling chat doesn't require an extra
+	// keypress to switch focus first. If/when the right pane gains a
+	// genuinely scrollable surface we can route based on cursor X position.
 	switch msg.Type {
 	case tea.MouseWheelUp:
-		m.scrollFocused(-3)
+		m.chat.LineUp(3)
 	case tea.MouseWheelDown:
-		m.scrollFocused(3)
+		m.chat.LineDown(3)
 	}
 	return m, nil
 }
@@ -946,9 +951,18 @@ func (m model) headerView() string {
 		dash(string(m.state.Approval)),
 	)
 	if m.busy {
-		status += "  running"
+		status += "  " + spinnerGlyph() + " running"
 	}
 	return headerStyle.Width(m.width).Render(truncate(status, m.width-2))
+}
+
+// spinnerGlyph returns a Braille spinner frame indexed by wall-clock time so
+// it animates as the 75ms streamTickCmd repeatedly re-renders the view. No
+// model state needed — the next render naturally picks the next frame.
+func spinnerGlyph() string {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	idx := int(time.Now().UnixMilli()/100) % len(frames)
+	return frames[idx]
 }
 
 // focusedPaneView renders only the focused pane at full body width. Used
@@ -3054,7 +3068,11 @@ func (m *model) moveSelection(delta int) {
 	case focusAgents:
 		m.leftCursor = clamp(m.leftCursor+delta, 0, len(m.agentDisplayRows()))
 	case focusTranscript:
-		m.chat.MoveSelection(delta)
+		// SmartMove scrolls within the selected message when it overflows
+		// the viewport before advancing to the next/previous cell — so the
+		// user can read the middle of long messages with j/k instead of
+		// jumping past them.
+		m.chat.SmartMove(delta)
 	case focusContext:
 		m.contextCursor = clamp(m.contextCursor+delta, 0, max(0, len(m.contextEntries())-1))
 	}
