@@ -689,7 +689,14 @@ func (m model) handleCommandKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		line := m.commandLine()
+		// Clear the buffer and exit command mode BEFORE dispatching: the
+		// previous behavior left the typed command lingering in the input
+		// after Enter, requiring an explicit Esc to leave command mode.
+		// Some executeLine branches set their own mode (e.g. opening a
+		// modal); they will overwrite these values, which is fine.
+		m.command.SetValue("")
 		m.command.Blur()
+		m.mode = modeNormal
 		return m.executeLine(line)
 	}
 	var cmd tea.Cmd
@@ -2021,7 +2028,13 @@ func (m model) shareTerminalDirect(value string) (tea.Model, tea.Cmd) {
 		m.termSlot = slot - 1
 		m.term = m.terms[m.termSlot]
 	}
-	m.setRightTab(workbench.RightTabTerm)
+	// Switch the right tab to terminal so the shared session is visible if
+	// the user looks for it, but DO NOT take focus — :st is supposed to be
+	// a side-effecting toggle that keeps you in whatever pane you were
+	// already working in (chat, agents, files). The previous behavior
+	// silently moved focus to the right context pane on every :st, which
+	// felt jumpy.
+	m.state.RightTab = workbench.RightTabTerm
 	term := m.currentTerminal()
 	width, height := m.terminalPTYSize()
 	if !term.active {
