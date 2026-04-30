@@ -3,7 +3,22 @@ package model
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
+
+// debugEnabled is a process-wide toggle the TUI flips with :debug. When
+// on, the model clients always populate Diagnostics.RawChunks (every
+// chunk from every turn, not just turns we suspect we mishandled), and
+// the workbench gives the UI an orange border so the user has a visible
+// reminder that they're paying for the extra logging.
+var debugEnabled atomic.Bool
+
+// SetDebug toggles process-wide debug logging. Safe to call from any
+// goroutine.
+func SetDebug(on bool) { debugEnabled.Store(on) }
+
+// Debug reports the current debug-mode state.
+func Debug() bool { return debugEnabled.Load() }
 
 type ProviderID string
 type ModelID string
@@ -193,6 +208,12 @@ type Diagnostics struct {
 	TextDeltaCount int
 	ToolCallCount  int
 	DroppedCalls   int
+	// CompletionTokens is what the provider reports for output_tokens. If
+	// this is > 0 but TextDeltaCount + ToolCallCount == 0 the model
+	// produced something the parser didn't recognize — a strong signal
+	// that the wire format has fields we're not handling (e.g.
+	// reasoning_content, thinking blocks, or a legacy function_call).
+	CompletionTokens int
 	// RejectedChunks counts chunks the SDK accumulator silently rejected
 	// (most commonly because the chunk's id didn't match the first chunk's
 	// id — a quirk seen with some compat providers and proxies).
@@ -202,7 +223,23 @@ type Diagnostics struct {
 	// non-zero value indicates the wire format had something the SDK
 	// didn't handle directly.
 	FallbackCalls int
+	// RawFirstChunk is the first chunk whose choices array was non-empty
+	// (i.e. the first chunk that purportedly carried real model output).
+	// This is what tells us which delta fields the provider is using —
+	// "delta.content" vs "delta.reasoning_content" vs "delta.thinking"
+	// vs the legacy "delta.function_call" — without us having to dump
+	// the entire stream.
+	RawFirstChunk string
 	RawLastChunk  string
+	// RawChunks holds every raw chunk JSON we received this turn (up to
+	// the per-chunk and total caps applied at capture time). The model
+	// client populates this only when it looks like the parser missed
+	// content — i.e. when CompletionTokens > 0 but we extracted no text
+	// and no tool calls. Dumping the whole stream is the only way to
+	// debug a wire format we don't know about yet, and the user
+	// explicitly asked for it; we keep it bounded so a runaway provider
+	// can't blow up the session log.
+	RawChunks []string
 }
 
 type ToolCall struct {

@@ -191,6 +191,14 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 	sdkAcceptedChunks := 0
 	diag := &model.Diagnostics{}
 	var lastChunkJSON string
+	var firstContentfulChunkJSON string
+	// Keep all raw chunks for forensic debugging. Capped at maxKeptChunks
+	// pieces and maxRawTotal bytes so an out-of-control provider can't
+	// blow up our session log.
+	const maxKeptChunks = 60
+	const maxRawTotal = 32 * 1024
+	var capturedChunks []string
+	capturedBytes := 0
 
 	for stream.Next() {
 		diag.ChunkCount++
@@ -200,6 +208,17 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 		}
 		if raw := chunk.RawJSON(); raw != "" {
 			lastChunkJSON = raw
+			// Capture the first chunk whose choices[] is non-empty —
+			// that's the chunk most likely to expose the wire format we
+			// need to debug. Final chunks are usually just usage with
+			// choices=[], which tells us nothing about the delta shape.
+			if firstContentfulChunkJSON == "" && len(chunk.Choices) > 0 {
+				firstContentfulChunkJSON = raw
+			}
+			if len(capturedChunks) < maxKeptChunks && capturedBytes+len(raw) <= maxRawTotal {
+				capturedChunks = append(capturedChunks, raw)
+				capturedBytes += len(raw)
+			}
 		}
 
 		// Some providers stream a JSON envelope with an `error` field
@@ -294,6 +313,27 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 			lastChunkJSON = lastChunkJSON[:2048] + "...[truncated]"
 		}
 		diag.RawLastChunk = lastChunkJSON
+	}
+	if firstContentfulChunkJSON != "" && firstContentfulChunkJSON != lastChunkJSON {
+		if len(firstContentfulChunkJSON) > 2048 {
+			firstContentfulChunkJSON = firstContentfulChunkJSON[:2048] + "...[truncated]"
+		}
+		diag.RawFirstChunk = firstContentfulChunkJSON
+	}
+	// Capture the provider's own completion-token tally so the orchestrator
+	// can spot the smoking-gun "model produced N tokens but we captured 0"
+	// pattern that says we're missing a wire-format field.
+	if acc.Usage.CompletionTokens > 0 {
+		diag.CompletionTokens = int(acc.Usage.CompletionTokens)
+	}
+	// Attach the captured raw chunks to diagnostics when debug mode is on
+	// (always — the user explicitly opted in to verbose logging) or when
+	// we suspect we missed content (the "model produced tokens but we got
+	// nothing" case, or when the SDK silently rejected chunks). On normal
+	// turns keeping all chunks would balloon the log file for no benefit.
+	suspectMissedContent := (diag.CompletionTokens > 0 && diag.TextDeltaCount == 0 && diag.ToolCallCount == 0) || diag.RejectedChunks > 0
+	if model.Debug() || suspectMissedContent {
+		diag.RawChunks = capturedChunks
 	}
 	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
 }

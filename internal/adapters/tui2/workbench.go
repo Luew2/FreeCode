@@ -20,6 +20,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/Luew2/FreeCode/internal/app/workbench"
+	coremodel "github.com/Luew2/FreeCode/internal/core/model"
 	"github.com/Luew2/FreeCode/internal/core/permission"
 	"github.com/Luew2/FreeCode/internal/core/session"
 )
@@ -1758,6 +1759,12 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		return m.approveRef("all")
 	case line == ":R" || line == ":r all" || line == ":r *":
 		return m.rejectRef("all")
+	case line == ":debug" || line == ":debug toggle":
+		return m.toggleDebugMode()
+	case line == ":debug on":
+		return m.setDebugMode(true)
+	case line == ":debug off":
+		return m.setDebugMode(false)
 	default:
 		m.mode = modeNormal
 		m.state.Notice = "unknown command " + line
@@ -3115,6 +3122,24 @@ func (m *model) followLatestTranscript() {
 	m.chat.FollowLatest()
 }
 
+// toggleDebugMode flips :debug on/off. With debug on the model clients
+// log every chunk of every turn (not just suspicious ones) and the TUI
+// border turns orange so the user has a constant visible reminder that
+// extra logging is active.
+func (m model) toggleDebugMode() (tea.Model, tea.Cmd) {
+	return m.setDebugMode(!coremodel.Debug())
+}
+
+func (m model) setDebugMode(on bool) (tea.Model, tea.Cmd) {
+	coremodel.SetDebug(on)
+	if on {
+		m.state.Notice = "debug mode ON — orange border. Every model chunk is dumped as a model_response_dump artifact. :debug off to disable."
+	} else {
+		m.state.Notice = "debug mode OFF"
+	}
+	return m, nil
+}
+
 // firstPendingApprovalID returns the id of the topmost pending approval, so
 // `a`/`r` from any pane can act on it without first switching focus to the
 // right context pane. Returns false when nothing is pending.
@@ -3554,6 +3579,16 @@ func configureRenderer(w io.Writer) {
 }
 
 func paneStyle(active bool) lipgloss.Style {
+	// Orange border when debug mode is on — a constant visible reminder
+	// that the session is logging every model chunk to disk and that
+	// :debug needs to be flipped off when the user is done diagnosing.
+	if coremodel.Debug() {
+		debugColor := lipgloss.Color("208") // ANSI orange
+		if active {
+			return activeStyle.Copy().BorderForeground(debugColor)
+		}
+		return borderStyle.Copy().BorderForeground(debugColor)
+	}
 	if active {
 		return activeStyle
 	}

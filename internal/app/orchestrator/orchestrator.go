@@ -143,6 +143,15 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 		if err != nil {
 			return Response{}, err
 		}
+		// In debug mode we dump every turn's raw chunks regardless of
+		// whether the parser captured content. This is what the user
+		// explicitly opted into with :debug — the orange border on the
+		// TUI is the visible reminder that they're paying for it.
+		if model.Debug() && turn.diagnostics != nil && len(turn.diagnostics.RawChunks) > 0 {
+			if err := r.appendRawDump(ctx, request.SessionID, &sequence, step, turn.diagnostics); err != nil {
+				return Response{}, err
+			}
+		}
 		if len(turn.toolCalls) == 0 {
 			text := strings.TrimSpace(turn.text)
 			// Empty-turn retry: a turn with no text AND no tool calls is
@@ -159,15 +168,24 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 				if hint := diagnosticHint(turn.diagnostics); hint != "" {
 					notice += " (" + hint + ")"
 				}
-				// Inline a short raw-chunk snippet directly in the chat
-				// message so the user can immediately see what shape the
-				// model is producing. Full dump goes to an artifact below.
-				if turn.diagnostics != nil && turn.diagnostics.RawLastChunk != "" {
-					snippet := turn.diagnostics.RawLastChunk
-					if len(snippet) > 600 {
-						snippet = snippet[:600] + "...[truncated]"
+				// Inline raw chunk snippets directly in the chat so the user
+				// can immediately see what shape the model is producing.
+				// Show the FIRST chunk with non-empty choices when we have
+				// it (that's the shape that actually carries deltas) and
+				// fall back to the last chunk (usually just usage stats).
+				if turn.diagnostics != nil {
+					if first := turn.diagnostics.RawFirstChunk; first != "" {
+						if len(first) > 600 {
+							first = first[:600] + "...[truncated]"
+						}
+						notice += "\n\nFirst contentful chunk:\n```json\n" + first + "\n```"
 					}
-					notice += "\n\nLast raw chunk:\n```json\n" + snippet + "\n```"
+					if last := turn.diagnostics.RawLastChunk; last != "" && last != turn.diagnostics.RawFirstChunk {
+						if len(last) > 400 {
+							last = last[:400] + "...[truncated]"
+						}
+						notice += "\n\nLast chunk:\n```json\n" + last + "\n```"
+					}
 				}
 				payload := assistantMessagePayload(step, "empty_retry", nil)
 				if turn.diagnostics != nil {
@@ -284,13 +302,20 @@ func emptyResponseRetryPrompt(attempt int, tools []model.ToolSpec) string {
 	return "Your previous response was still empty. This is the last retry — respond with at least one word of text now, even if it is just a short status update like \"done\" or \"unable to proceed because <reason>\". Do not stay silent."
 }
 
-// appendRawDump records the raw last chunk of a model response as an
-// artifact-bearing event so the user can inspect it from the workbench
-// when an empty turn happens. Surfacing this in the UI is the difference
-// between "the model is broken somehow" and "the model emitted X but we
-// dropped it because Y" — the former is a dead end, the latter is a fix.
+// appendRawDump records the raw chunks of a model response as an
+// artifact-bearing event so the user can inspect them from the workbench
+// when an empty turn happens. We dump every chunk we captured (the model
+// client populates RawChunks only when it suspects we missed content) so
+// the user can see the WIRE FORMAT the provider is actually sending —
+// the difference between "the model is broken somehow" and "the model
+// emitted X but we dropped it because Y" — the former is a dead end, the
+// latter is a fix.
 func (r Runner) appendRawDump(ctx context.Context, sessionID session.ID, sequence *int, step int, diag *model.Diagnostics) error {
-	if r.Log == nil || diag == nil || diag.RawLastChunk == "" {
+	if r.Log == nil || diag == nil {
+		return nil
+	}
+	body := buildRawDumpBody(diag)
+	if body == "" {
 		return nil
 	}
 	*sequence++
@@ -311,22 +336,37 @@ func (r Runner) appendRawDump(ctx context.Context, sessionID session.ID, sequenc
 			"artifact": map[string]any{
 				"id":        artifactID,
 				"kind":      "model_response_dump",
-				"title":     fmt.Sprintf("model response dump (step %d)", step),
-				"body":      diag.RawLastChunk,
-				"mime_type": "application/json",
+				"title":     fmt.Sprintf("model response dump (step %d, %d chunks)", step, diag.ChunkCount),
+				"body":      body,
+				"mime_type": "application/x-ndjson",
 				"metadata": map[string]any{
-					"step":             fmt.Sprintf("%d", step),
-					"finish_reason":    diag.FinishReason,
-					"chunks":           fmt.Sprintf("%d", diag.ChunkCount),
-					"text_deltas":      fmt.Sprintf("%d", diag.TextDeltaCount),
-					"tool_calls":       fmt.Sprintf("%d", diag.ToolCallCount),
-					"dropped_calls":    fmt.Sprintf("%d", diag.DroppedCalls),
-					"local_only":       "false",
-					"share_with_model": "false",
+					"step":              fmt.Sprintf("%d", step),
+					"finish_reason":     diag.FinishReason,
+					"chunks":            fmt.Sprintf("%d", diag.ChunkCount),
+					"chunks_captured":   fmt.Sprintf("%d", len(diag.RawChunks)),
+					"text_deltas":       fmt.Sprintf("%d", diag.TextDeltaCount),
+					"tool_calls":        fmt.Sprintf("%d", diag.ToolCallCount),
+					"dropped_calls":     fmt.Sprintf("%d", diag.DroppedCalls),
+					"completion_tokens": fmt.Sprintf("%d", diag.CompletionTokens),
+					"local_only":        "false",
+					"share_with_model":  "false",
 				},
 			},
 		},
 	})
+}
+
+// buildRawDumpBody concatenates raw chunks one-per-line in NDJSON form so
+// the artifact body is greppable / pasteable for diagnosis. Falls back to
+// the single last chunk when no full capture was preserved.
+func buildRawDumpBody(diag *model.Diagnostics) string {
+	if len(diag.RawChunks) > 0 {
+		return strings.Join(diag.RawChunks, "\n")
+	}
+	if diag.RawLastChunk != "" {
+		return diag.RawLastChunk
+	}
+	return ""
 }
 
 // diagnosticHint summarizes what the model actually returned in a one-line
@@ -354,7 +394,11 @@ func diagnosticHint(diag *model.Diagnostics) string {
 		parts = append(parts, fmt.Sprintf("dropped_tool_calls=%d", diag.DroppedCalls))
 	}
 	if diag.TextDeltaCount == 0 && diag.ToolCallCount == 0 {
-		parts = append(parts, "no text or tool_calls in response")
+		if diag.CompletionTokens > 0 {
+			parts = append(parts, fmt.Sprintf("model produced %d tokens that we did not parse — likely an unknown wire-format field", diag.CompletionTokens))
+		} else {
+			parts = append(parts, "no text or tool_calls in response")
+		}
 	}
 	return strings.Join(parts, "; ")
 }
