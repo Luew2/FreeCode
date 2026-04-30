@@ -275,13 +275,13 @@ func TestBusyQueueDrainsAfterCurrentRunCompletes(t *testing.T) {
 }
 
 func TestCancelClearsQueuedSubmits(t *testing.T) {
-	// :cancel must drop pending queued prompts without disturbing the
-	// in-flight run. We don't try to interrupt the current turn — that
-	// requires Submit-side context plumbing the user hasn't asked for.
 	controller := &fakeController{state: workbench.State{Approval: permission.ModeAuto, Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)
+	runCtx, cancel := context.WithCancel(context.Background())
 	m.busy = true
 	m.activeRun = 7
+	m.activeCtx = runCtx
+	m.activeCancel = cancel
 	m.submitQueue = []queuedSubmit{
 		{text: "a", approval: permission.ModeAuto},
 		{text: "b", approval: permission.ModeAuto},
@@ -295,11 +295,45 @@ func TestCancelClearsQueuedSubmits(t *testing.T) {
 	if len(m.submitQueue) != 0 {
 		t.Fatalf("submitQueue after :cancel = %d, want 0", len(m.submitQueue))
 	}
-	if !strings.Contains(m.state.Notice, "cancelled 2") {
-		t.Fatalf("notice = %q, want cancelled-count message", m.state.Notice)
+	if !strings.Contains(m.state.Notice, "cancelled active run and 2") {
+		t.Fatalf("notice = %q, want active cancel message", m.state.Notice)
 	}
-	if !m.busy {
-		t.Fatalf("busy flipped off, want :cancel to leave the in-flight run alone")
+	select {
+	case <-runCtx.Done():
+	default:
+		t.Fatalf("run context was not cancelled")
+	}
+}
+
+func TestNoqueueClearsQueuedSubmitsWithoutCancellingActiveRun(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Approval: permission.ModeAuto, Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.busy = true
+	m.activeRun = 7
+	m.activeCtx = runCtx
+	m.activeCancel = cancel
+	m.submitQueue = []queuedSubmit{
+		{text: "a", approval: permission.ModeAuto},
+		{text: "b", approval: permission.ModeAuto},
+	}
+
+	next, cmd := m.executeLine(":noqueue")
+	if cmd != nil {
+		t.Fatalf(":noqueue returned cmd, want immediate notice update")
+	}
+	m = next.(model)
+	if len(m.submitQueue) != 0 {
+		t.Fatalf("submitQueue after :noqueue = %d, want 0", len(m.submitQueue))
+	}
+	select {
+	case <-runCtx.Done():
+		t.Fatalf(":noqueue cancelled active run")
+	default:
+	}
+	if !strings.Contains(m.state.Notice, "cleared 2") {
+		t.Fatalf("notice = %q, want cleared-count message", m.state.Notice)
 	}
 }
 
@@ -328,6 +362,21 @@ func TestApprovalModalApprovesPendingItem(t *testing.T) {
 	next, _ = next.(model).Update(msg)
 	if controller.approved != "p1" {
 		t.Fatalf("approved = %q, want p1", controller.approved)
+	}
+}
+
+func TestUppercaseADoesNotEscalateApprovalMode(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Approval: permission.ModeAsk, Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.mode = modeNormal
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	if cmd != nil {
+		t.Fatalf("A returned cmd, want no approval mutation")
+	}
+	m = next.(model)
+	if controller.state.Approval != permission.ModeAsk || m.state.Approval != permission.ModeAsk {
+		t.Fatalf("approval mode changed controller/model = %s/%s", controller.state.Approval, m.state.Approval)
 	}
 }
 
@@ -917,6 +966,29 @@ func TestSettingsOpensScrollableDetailOverlay(t *testing.T) {
 	}
 }
 
+func TestContextCommandShowsNextTurnContextPreview(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Commands: workbench.DefaultCommands(),
+		ContextPreview: workbench.ContextPreview{
+			Summary:            "Main orchestrator, 2 transcript cells, ~20 tokens",
+			Included:           []string{"new prompt", "visible main conversation history"},
+			Excluded:           []string{"unshared terminal state"},
+			TokenEstimate:      20,
+			ActiveConversation: "Main orchestrator",
+		},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+
+	next, cmd := m.executeLine(":context")
+	if cmd != nil {
+		t.Fatalf(":context returned unexpected cmd")
+	}
+	m = next.(model)
+	if m.overlay != overlayDetail || !containsAll(m.state.Detail.Body, "included next turn", "visible main conversation history", "unshared terminal state") {
+		t.Fatalf("context detail = overlay %d body:\n%s", m.overlay, m.state.Detail.Body)
+	}
+}
+
 func TestCopyModeShowsSelectedText(t *testing.T) {
 	controller := &fakeController{state: workbench.State{
 		Commands: workbench.DefaultCommands(),
@@ -992,12 +1064,12 @@ func TestWorkspacePaneNavigationAndRightTabSwitching(t *testing.T) {
 		t.Fatalf("second ctrl+l focus = %d, want context", m.focus)
 	}
 	m = pressKeys(t, m, "]")
-	if m.state.RightTab != workbench.RightTabGit {
-		t.Fatalf("right tab = %q, want git", m.state.RightTab)
-	}
-	m = pressKeys(t, m, "[")
 	if m.state.RightTab != workbench.RightTabArtifacts {
 		t.Fatalf("right tab = %q, want artifacts", m.state.RightTab)
+	}
+	m = pressKeys(t, m, "[")
+	if m.state.RightTab != workbench.RightTabFiles {
+		t.Fatalf("right tab = %q, want files", m.state.RightTab)
 	}
 	m = pressKeys(t, m, "1")
 	if m.state.RightTab != workbench.RightTabFiles || m.focus != focusContext {
@@ -1007,10 +1079,57 @@ func TestWorkspacePaneNavigationAndRightTabSwitching(t *testing.T) {
 	if m.state.RightTab != workbench.RightTabGit || m.focus != focusContext {
 		t.Fatalf("3 tab/focus = %q/%d, want git context", m.state.RightTab, m.focus)
 	}
+	m = pressKeys(t, m, "5")
+	if m.state.RightTab != workbench.RightTabOps || m.focus != focusContext {
+		t.Fatalf("5 tab/focus = %q/%d, want ops context", m.state.RightTab, m.focus)
+	}
 	m.focus = focusTranscript
 	m = pressKeys(t, m, "1")
-	if m.state.RightTab != workbench.RightTabGit || m.focus != focusTranscript {
-		t.Fatalf("1 outside context tab/focus = %q/%d, want unchanged git transcript", m.state.RightTab, m.focus)
+	if m.state.RightTab != workbench.RightTabOps || m.focus != focusTranscript {
+		t.Fatalf("1 outside context tab/focus = %q/%d, want unchanged ops transcript", m.state.RightTab, m.focus)
+	}
+}
+
+func TestOpsTabRendersOperationalStateAndContextInspector(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Commands: workbench.DefaultCommands(),
+		Approvals: []workbench.ApprovalItem{{
+			ID:      "p1",
+			Title:   "edit README",
+			Action:  "write",
+			Subject: "README.md",
+			Body:    "diff",
+		}},
+		Agents: []workbench.AgentItem{{ID: "a1", Name: "worker", Status: "running", Summary: "editing README"}},
+		ContextPreview: workbench.ContextPreview{
+			Summary:            "Main orchestrator, 1 transcript cells, ~12 tokens",
+			Included:           []string{"new prompt", "visible main conversation history"},
+			Excluded:           []string{"local-only shell output"},
+			TokenEstimate:      12,
+			ActiveConversation: "Main orchestrator",
+		},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.focus = focusContext
+	m.state.RightTab = workbench.RightTabOps
+	m.mode = modeNormal
+	m.overlay = overlayNone
+	m.busy = true
+	m.activeRun = 4
+	m.submitQueue = []queuedSubmit{{text: "follow up"}}
+
+	view := stripANSI(m.rightView(58, 16))
+	if !containsAll(view, "Ops", "run state", "active run #4", "next model context", "approval edit README", "worker running") {
+		t.Fatalf("ops view missing expected state:\n%s", view)
+	}
+	m.contextCursor = 2 // ctx entry after run + queued prompt
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatalf("context inspector returned unexpected cmd")
+	}
+	m = next.(model)
+	if m.overlay != overlayDetail || !strings.Contains(m.state.Detail.Body, "included next turn") {
+		t.Fatalf("context detail = overlay %d item %#v", m.overlay, m.state.Detail)
 	}
 }
 
@@ -1075,6 +1194,31 @@ func TestShareTermCommandEnablesDirectTerminalTools(t *testing.T) {
 	}
 	if !strings.Contains(m.state.Notice, "terminal 2 shared") {
 		t.Fatalf("notice = %q, want terminal 2 shared", m.state.Notice)
+	}
+}
+
+func TestShareOutputAttachesTerminalWithoutLiveTools(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.terms = []*terminalSession{
+		{active: true, lines: []string{"one"}},
+		{active: true, lines: []string{"two"}},
+	}
+	m.term = m.terms[0]
+	m.termSlot = 0
+
+	next, cmd := m.executeLine(":sto 2")
+	if cmd == nil {
+		t.Fatalf(":sto returned nil cmd, want terminal attachment action")
+	}
+	msg := firstActionMsg(t, cmd)
+	next, _ = next.(model).Update(msg)
+	m = next.(model)
+	if m.terminalShared {
+		t.Fatalf(":sto enabled live terminal sharing")
+	}
+	if controller.sharedTerminalTitle == "" || !strings.Contains(controller.sharedTerminalBody, "two") {
+		t.Fatalf("shared terminal title/body = %q/%q, want terminal 2 output attached", controller.sharedTerminalTitle, controller.sharedTerminalBody)
 	}
 }
 
@@ -1169,6 +1313,23 @@ func TestTerminalCtrlGDocksAndReturnsToChat(t *testing.T) {
 	}
 }
 
+func TestTerminalEscPassesThroughAndKeepsTerminalMode(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands(), RightTab: workbench.RightTabTerm}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.mode = modeTerminal
+	m.focus = focusContext
+	m.term = &terminalSession{active: true, lines: []string{"ready"}}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd != nil {
+		t.Fatalf("esc returned unexpected cmd")
+	}
+	m = next.(model)
+	if m.mode != modeTerminal || m.focus != focusContext {
+		t.Fatalf("mode/focus = %s/%d, want terminal context", m.mode, m.focus)
+	}
+}
+
 func TestTermCommandOpensWithoutFocusingOrExpanding(t *testing.T) {
 	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)
@@ -1178,8 +1339,8 @@ func TestTermCommandOpensWithoutFocusingOrExpanding(t *testing.T) {
 		t.Fatalf(":term returned unexpected cmd")
 	}
 	m = next.(model)
-	if m.mode != modeNormal || m.focus != focusContext || m.activeRightTab() != workbench.RightTabTerm || m.term.expanded || len(m.terms) != 1 {
-		t.Fatalf("mode/focus/tab/expanded/terms = %s/%d/%s/%v/%d, want normal context term docked", m.mode, m.focus, m.activeRightTab(), m.term.expanded, len(m.terms))
+	if m.mode != modeNormal || m.focus != focusTranscript || m.activeRightTab() != workbench.RightTabTerm || m.term.expanded || len(m.terms) != 1 {
+		t.Fatalf("mode/focus/tab/expanded/terms = %s/%d/%s/%v/%d, want normal transcript term docked", m.mode, m.focus, m.activeRightTab(), m.term.expanded, len(m.terms))
 	}
 }
 

@@ -154,21 +154,33 @@ func TestChatRendererHardWrapsLongUnbreakableTokens(t *testing.T) {
 func TestChatRendererCollapsesUnselectedToolBodies(t *testing.T) {
 	chat := newChatRenderer(80, 20)
 	chat.SetItems([]workbench.TranscriptItem{
-		{ID: "m1", Kind: workbench.TranscriptTool, Title: "terminal_write", Text: `{"command":"ls"}`, Status: "requested"},
+		{ID: "m1", Kind: workbench.TranscriptTool, Title: "read_file", Text: `{"path":"README.md"}`, Status: "completed"},
 		{ID: "m2", Kind: workbench.TranscriptAssistant, Text: "done"},
 	})
 
 	view := stripANSI(chat.View())
-	if strings.Contains(view, `{"command":"ls"}`) {
+	if strings.Contains(view, `{"path":"README.md"}`) {
 		t.Fatalf("unselected tool body is visible:\n%s", view)
 	}
-	if !strings.Contains(view, "m1 tool terminal_write requested") {
+	if !strings.Contains(view, "m1 tool read_file completed") {
 		t.Fatalf("collapsed tool header missing:\n%s", view)
 	}
 
 	chat.MoveSelection(-1)
 	view = stripANSI(chat.View())
-	if strings.Contains(view, `{"command":"ls"}`) {
+	if strings.Contains(view, `{"path":"README.md"}`) {
 		t.Fatalf("selected tool body should stay hidden in transcript:\n%s", view)
+	}
+}
+
+func TestChatRendererKeepsTerminalToolBodiesVisible(t *testing.T) {
+	chat := newChatRenderer(80, 20)
+	chat.SetItems([]workbench.TranscriptItem{
+		{ID: "m1", Kind: workbench.TranscriptTool, Title: "terminal_write", Text: `{"command":"ls"}`, Status: "requested"},
+	})
+
+	view := stripANSI(chat.View())
+	if !strings.Contains(view, `{"command":"ls"}`) {
+		t.Fatalf("terminal tool body is hidden:\n%s", view)
 	}
 }

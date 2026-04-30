@@ -2,7 +2,7 @@
 
 FreeCode is a Vim-shaped coding CLI: fast, modal, keyboard-first, and built around addressable artifacts. It is intended to make arbitrary inference endpoints boring to configure while keeping every model request, tool call, file edit, patch, and agent trace inspectable.
 
-The current MVP has a provider-neutral Go core, OpenAI-compatible `/v1/chat/completions` and Anthropic-compatible `/v1/messages` support, read tools, preview-gated patch writes, JSONL session logs with recovery, Git status/diff commands, structured context compaction, swarm agents, persistent terminal sharing, diagnostics, and a Bubble Tea terminal workbench.
+The current MVP has a provider-neutral Go core, OpenAI-compatible `/v1/chat/completions` and Anthropic-compatible `/v1/messages` support, read tools, preview-gated patch writes, JSONL session logs with recovery, Git status/diff commands, structured context compaction, swarm agents, persistent terminal sharing, diagnostics, an Ops board, and a Bubble Tea terminal workbench.
 
 ## Local Development
 
@@ -40,7 +40,7 @@ j/k                 move selection
 Ctrl+H/Ctrl+L       switch panes
 left/right arrows   local horizontal action; right pane cycles tabs
 h/l or [/]          local horizontal action; right pane cycles tabs
-1/2/3/4             switch right pane tabs when the right pane is focused
+1/2/3/4/5           switch right pane tabs when the right pane is focused
 ga / gt / gm / gf   jump to agents / transcript / messages / files panes
 gd                  jump to active detail; opens approval inspector when pending
 b                   return to the main orchestrator chat
@@ -49,13 +49,15 @@ d                   inspect selected item
 y / Y               copy selected item without/with fences
 v                   copy selection mode; mouse selection/Cmd+C also works on visible text
 a / r               approve or reject selected pending action
-Ctrl+A              cycle read-only -> ask -> auto approval
 :                   enter command mode
+:ls / :buffers      list conversation buffers
+:b main / :b a1     switch conversation buffer
+:bn / :bp           next/previous conversation buffer
 :sessions           list prior sessions for this workspace
 :new                start a new session
 :rename <title>     rename the current session
 :resume <id>        resume a prior session
-:files/:artifacts/:git
+:files/:artifacts/:git/:ops
                     switch right pane tab
 :edit README.md     open a workspace file in external Neovim
 :agent <prompt>     send a directed follow-up to the active agent conversation
@@ -67,7 +69,10 @@ Ctrl+A              cycle read-only -> ask -> auto approval
 :st [n]             share terminal n with the agent; enables terminal_read/terminal_write
 :st off             revoke direct terminal sharing
 :share-term [n]     long form of :st
+:sto [n]            attach recent terminal output to the next prompt without live control
+:share-output [n]   long form of :sto
 :settings           show provider/model/editor settings
+:context            inspect what FreeCode will attach to the next model turn
 :memory             inspect remembered structured context
 :doctor             run local diagnostics
 :debug-bundle       show a redacted bug-report bundle
@@ -78,10 +83,13 @@ Ctrl+A              cycle read-only -> ask -> auto approval
 :danger confirm     approve all tools for this session
 :compact            write a compact session summary
 :cancel             cancel the active run and clear queued prompts
+:noqueue            clear queued prompts without cancelling the active run
 q                   quit
 ```
 
 File editing currently uses an external Neovim handoff. Configure `editor_command` in `.freecode/config.toml` when you want a specific Neovim invocation; `editor_double_esc` is available for the planned embedded editor and defaults off so Vim keeps ownership of `Esc`.
+
+Inside the persistent terminal, the shell owns `Esc`. Use `Ctrl+G` to return focus to FreeCode while leaving the terminal running.
 
 Check local repo and runtime status:
 
@@ -179,6 +187,6 @@ danger      allow all tool classes after explicit :danger confirm
 
 Patch writes are preview-first. A preview token is bound to the exact patch digest and changed files, expires automatically, and is consumed when applied. Patch application revalidates file contents under a workspace-level lock and rolls back partial writes when possible.
 
-Terminal sharing is local-only until you explicitly run `:st [n]`. Once shared, the agent gets `terminal_read` and `terminal_write` for that terminal only; use `:st off` to revoke access. One-shot `:!` commands are local artifacts and are not sent to the model unless explicitly shared later.
+Terminal sharing is local-only until you explicitly run `:st [n]`. Once shared, the agent gets `terminal_read` and `terminal_write` for that terminal only; use `:st off` to revoke access. Use `:sto [n]` when you only want to attach recent terminal output to the next prompt without granting live terminal control. One-shot `:!` commands are local artifacts and are not sent to the model unless explicitly attached later.
 
-Context compaction writes a structured handoff snapshot with the active objective, constraints, preferences, touched files, commands, approvals, agent state, pending work, and unresolved risks. Use `:memory` to inspect what FreeCode currently remembers.
+Context compaction writes a structured handoff snapshot with the active objective, constraints, preferences, touched files, commands, approvals, agent state, pending work, and unresolved risks. Use `:context` to inspect what the next model turn will receive and `:memory` to inspect what FreeCode currently remembers.

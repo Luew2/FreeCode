@@ -949,14 +949,40 @@ func TestShareTerminalLogsModelVisibleContext(t *testing.T) {
 	if state.RightTab != RightTabTerm {
 		t.Fatalf("right tab = %q, want term", state.RightTab)
 	}
-	if len(state.Transcript) != 1 || state.Transcript[0].Kind != TranscriptContext || state.Transcript[0].Title != "shared terminal" {
-		t.Fatalf("transcript = %#v, want shared terminal context cell", state.Transcript)
+	if len(state.Transcript) != 1 || state.Transcript[0].Kind != TranscriptContext || state.Transcript[0].Title != "Recent terminal" {
+		t.Fatalf("transcript = %#v, want attached terminal context cell", state.Transcript)
 	}
 	if state.TokenEstimate == 0 {
 		t.Fatalf("token estimate = 0, want shared terminal included in context estimate")
 	}
 	if len(log.events) != 1 || log.events[0].Type != session.EventArtifact || !strings.Contains(log.events[0].Text, "PASS") {
 		t.Fatalf("events = %#v, want model-visible terminal artifact text", log.events)
+	}
+}
+
+func TestLoadBuildsOperationsAndContextPreview(t *testing.T) {
+	log := &memoryLog{}
+	ctx := context.Background()
+	events := []session.Event{
+		{ID: "u1", SessionID: "s1", Type: session.EventUserMessage, Actor: "user", Text: "review this"},
+		{ID: "tool1", SessionID: "s1", Type: session.EventTool, Actor: "tool", Text: "ok", Payload: map[string]any{"name": "read_file"}},
+	}
+	for _, event := range events {
+		if err := log.Append(ctx, event); err != nil {
+			t.Fatalf("Append returned error: %v", err)
+		}
+	}
+	service := &Service{Log: log, SessionID: "s1"}
+
+	state, err := service.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if state.ContextPreview.Summary == "" || !strings.Contains(strings.Join(state.ContextPreview.Included, "\n"), "new prompt") {
+		t.Fatalf("context preview = %#v, want populated next-turn preview", state.ContextPreview)
+	}
+	if len(state.Operations.Items) == 0 {
+		t.Fatalf("operations = %#v, want operation items", state.Operations)
 	}
 }
 
@@ -1038,7 +1064,7 @@ func TestSubmitPromptPassesVisibleConversationAndSharedTerminalContext(t *testin
 		!strings.Contains(submitted.TurnContext, "earlier agent answer") {
 		t.Fatalf("turn context = %q, want selected agent history", submitted.TurnContext)
 	}
-	if !strings.Contains(submitted.TurnContext, "Terminal output explicitly shared") ||
+	if !strings.Contains(submitted.TurnContext, "Terminal output explicitly attached") ||
 		!strings.Contains(submitted.TurnContext, "go test ./...") ||
 		!strings.Contains(submitted.TurnContext, "PASS") {
 		t.Fatalf("turn context = %q, want explicit shared terminal output", submitted.TurnContext)

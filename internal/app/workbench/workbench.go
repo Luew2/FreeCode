@@ -184,6 +184,8 @@ type State struct {
 	RightTab           RightTab
 	ActiveConversation ConversationTarget
 	Editor             EditorState
+	Operations         OperationsState
+	ContextPreview     ContextPreview
 
 	Sessions             []SessionSummary
 	Transcript           []TranscriptItem
@@ -235,6 +237,7 @@ const (
 	RightTabArtifacts RightTab = "artifacts"
 	RightTabGit       RightTab = "git"
 	RightTabTerm      RightTab = "term"
+	RightTabOps       RightTab = "ops"
 )
 
 type EditorState struct {
@@ -246,6 +249,27 @@ type EditorState struct {
 	Line              int
 	Error             string
 	DoubleEscToReturn bool
+}
+
+type OperationsState struct {
+	Items []OperationItem
+}
+
+type OperationItem struct {
+	ID     string
+	Kind   string
+	Title  string
+	Status string
+	Body   string
+	Target string
+}
+
+type ContextPreview struct {
+	Summary            string
+	Included           []string
+	Excluded           []string
+	TokenEstimate      int
+	ActiveConversation string
 }
 
 type CompletionCandidate struct {
@@ -580,7 +604,7 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 					if item.Kind == "terminal" {
 						kind = TranscriptContext
 						actor = "local"
-						title = "shared terminal"
+						title = firstNonEmpty(item.Title, "attached terminal output")
 						text = item.Body
 						opts["share_with_model"] = firstNonEmpty(item.Meta["share_with_model"], "true")
 					}
@@ -669,8 +693,152 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 		return artifactSortKey(state.Artifacts[i].ID) < artifactSortKey(state.Artifacts[j].ID)
 	})
 	state.Approvals = pendingApprovals(state.Artifacts, approvalDecisions)
+	state.ContextPreview = contextPreviewFromState(state)
+	state.Operations = operationsFromState(state)
 	state.CompletionCandidates = completionCandidates(state)
 	return state, nil
+}
+
+func operationsFromState(state State) OperationsState {
+	var items []OperationItem
+	items = append(items, OperationItem{
+		ID:     "ctx",
+		Kind:   "context",
+		Title:  "next context",
+		Status: fmt.Sprintf("~%d tokens", state.TokenEstimate),
+		Body:   state.ContextPreview.Summary,
+		Target: "context",
+	})
+	if state.ActiveConversation.ID != "" || state.ActiveConversation.Title != "" {
+		items = append(items, OperationItem{
+			ID:     "chat",
+			Kind:   "conversation",
+			Title:  "active buffer",
+			Status: conversationLabel(state.ActiveConversation),
+			Target: state.ActiveConversation.ID,
+		})
+	}
+	if len(state.Approvals) > 0 {
+		items = append(items, OperationItem{
+			ID:     "approvals",
+			Kind:   "approval",
+			Title:  "pending approvals",
+			Status: strconv.Itoa(len(state.Approvals)),
+			Body:   approvalIDs(state.Approvals),
+			Target: "approvals",
+		})
+	}
+	running, blocked, completed := agentStatusCounts(state.Agents)
+	if len(state.Agents) > 0 {
+		items = append(items, OperationItem{
+			ID:     "agents",
+			Kind:   "agents",
+			Title:  "agents",
+			Status: fmt.Sprintf("%d running  %d blocked  %d done", running, blocked, completed),
+			Target: "agents",
+		})
+	}
+	if len(state.GitFiles) > 0 {
+		items = append(items, OperationItem{
+			ID:     "git",
+			Kind:   "git",
+			Title:  "git changes",
+			Status: strconv.Itoa(len(state.GitFiles)),
+			Target: "git",
+		})
+	}
+	if recent := recentOperationalItem(state.Transcript); recent.ID != "" {
+		items = append(items, recent)
+	}
+	return OperationsState{Items: items}
+}
+
+func contextPreviewFromState(state State) ContextPreview {
+	target := conversationLabel(state.ActiveConversation)
+	if target == "" {
+		target = "Main orchestrator"
+	}
+	included := []string{"new prompt", "visible " + strings.ToLower(target) + " conversation history"}
+	excluded := []string{"local-only :! shell output unless attached with :sto", "unshared terminal state"}
+	if len(state.Transcript) == 0 {
+		included = []string{"new prompt"}
+	}
+	if hasSharedTerminalContext(state.Transcript) {
+		included = append(included, "attached terminal output")
+	}
+	if len(state.Approvals) > 0 {
+		included = append(included, fmt.Sprintf("%d pending approval(s)", len(state.Approvals)))
+	}
+	summary := fmt.Sprintf("%s, %d transcript cells, ~%d tokens", target, len(state.Transcript), state.TokenEstimate)
+	return ContextPreview{
+		Summary:            summary,
+		Included:           included,
+		Excluded:           excluded,
+		TokenEstimate:      state.TokenEstimate,
+		ActiveConversation: target,
+	}
+}
+
+func hasSharedTerminalContext(items []TranscriptItem) bool {
+	for _, item := range items {
+		if item.Kind == TranscriptContext && firstNonEmpty(item.Meta["share_with_model"], "false") == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+func conversationLabel(target ConversationTarget) string {
+	target = normalizeConversationTarget(target)
+	if target.Kind == "agent" {
+		return firstNonEmpty(target.Title, target.ID, "agent")
+	}
+	return firstNonEmpty(target.Title, "Main orchestrator")
+}
+
+func approvalIDs(approvals []ApprovalItem) string {
+	var ids []string
+	for _, approval := range approvals {
+		if approval.ID != "" {
+			ids = append(ids, approval.ID)
+		}
+	}
+	return strings.Join(ids, " ")
+}
+
+func agentStatusCounts(agents []AgentItem) (running int, blocked int, completed int) {
+	for _, agent := range agents {
+		status := strings.ToLower(strings.TrimSpace(agent.Status))
+		switch {
+		case strings.Contains(status, "block") || strings.TrimSpace(agent.BlockedReason) != "":
+			blocked++
+		case strings.Contains(status, "complete") || strings.Contains(status, "done"):
+			completed++
+		default:
+			running++
+		}
+	}
+	return running, blocked, completed
+}
+
+func recentOperationalItem(items []TranscriptItem) OperationItem {
+	for i := len(items) - 1; i >= 0; i-- {
+		item := items[i]
+		switch item.Kind {
+		case TranscriptTool, TranscriptPatch, TranscriptShell, TranscriptError:
+			title := firstNonEmpty(item.Title, item.Actor, string(item.Kind))
+			status := firstNonEmpty(item.Status, string(item.Kind))
+			return OperationItem{
+				ID:     "recent",
+				Kind:   string(item.Kind),
+				Title:  "recent " + string(item.Kind) + ": " + title,
+				Status: status,
+				Body:   item.Text,
+				Target: item.ID,
+			}
+		}
+	}
+	return OperationItem{}
 }
 
 func (s *Service) SubmitPrompt(ctx context.Context, request SubmitRequest) (State, error) {
@@ -711,7 +879,7 @@ func (s *Service) submitTurnContext(ctx context.Context, target ConversationTarg
 		}
 	}
 	if terminal := s.sharedTerminalTurnContext(ctx, 6000); terminal != "" {
-		sections = append(sections, "Terminal output explicitly shared by the user with :st:\n"+terminal)
+		sections = append(sections, "Terminal output explicitly attached by the user with :sto / :share-output:\n"+terminal)
 	}
 	return trimContext(strings.Join(sections, "\n\n"), 12000)
 }
@@ -727,7 +895,7 @@ func transcriptTurnContext(items []TranscriptItem, target ConversationTarget, ma
 		}
 	}
 	for _, item := range items {
-		if item.Kind == TranscriptContext && item.Title == "shared terminal" {
+		if item.Kind == TranscriptContext && firstNonEmpty(item.Meta["share_with_model"], "false") == "true" {
 			continue
 		}
 		text := strings.TrimSpace(item.Text)
@@ -945,7 +1113,7 @@ func (s *Service) ShareTerminal(ctx context.Context, title string, body string) 
 	}
 	title = strings.TrimSpace(title)
 	if title == "" {
-		title = "Shared terminal output"
+		title = "Attached terminal output"
 	}
 	if len(body) > 64*1024 {
 		body = body[:64*1024] + "\n[truncated]"
@@ -992,7 +1160,7 @@ func (s *Service) ShareTerminal(ctx context.Context, title string, body string) 
 	}
 	state.Detail = item
 	state.RightTab = RightTabTerm
-	state.Notice = "terminal output shared with next prompt"
+	state.Notice = "terminal output attached to next prompt"
 	return state, nil
 }
 
@@ -1323,6 +1491,53 @@ func (s *Service) Memory(ctx context.Context) (State, error) {
 		},
 	}
 	state.Notice = "remembered state ~" + strconv.Itoa(tokens) + " tokens"
+	return state, nil
+}
+
+func (s *Service) Context(ctx context.Context) (State, error) {
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	target := s.activeConversation()
+	turnContext := s.submitTurnContext(ctx, target)
+	if strings.TrimSpace(turnContext) == "" {
+		turnContext = "No additional context would be attached beyond the new prompt."
+	}
+	var sections []string
+	sections = append(sections,
+		"Next model turn context",
+		"",
+		"active conversation: "+conversationLabel(target),
+		"estimated transcript tokens: "+strconv.Itoa(state.TokenEstimate),
+		"",
+		"Included:",
+	)
+	if len(state.ContextPreview.Included) == 0 {
+		sections = append(sections, "  - new prompt only")
+	} else {
+		for _, item := range state.ContextPreview.Included {
+			sections = append(sections, "  - "+item)
+		}
+	}
+	if len(state.ContextPreview.Excluded) > 0 {
+		sections = append(sections, "", "Excluded:")
+		for _, item := range state.ContextPreview.Excluded {
+			sections = append(sections, "  - "+item)
+		}
+	}
+	sections = append(sections, "", "Rendered context:", turnContext)
+	state.Detail = Item{
+		ID:       "context",
+		Kind:     "context",
+		Title:    "Next model context",
+		Body:     strings.Join(sections, "\n"),
+		MIMEType: "text/plain",
+		Meta: map[string]string{
+			"estimated_tokens": strconv.Itoa(state.TokenEstimate),
+		},
+	}
+	state.Notice = "context preview ready"
 	return state, nil
 }
 
@@ -1809,6 +2024,7 @@ func DefaultCommands() []Command {
 		command("shell.run", "Run shell command", "Shell", "Run a local shell command and open its output as a local-only artifact.", "!", "shell", "bash", "terminal", "command"),
 		command("terminal.open", "Open terminal", "Shell", "Open the persistent local terminal.", ":term", "terminal", "term", "shell", "pty"),
 		command("terminal.share", "Share terminal with agent", "Shell", "Enable direct terminal_read and terminal_write tools for the selected terminal.", ":st [n]", "terminal", "share", "context", "control"),
+		command("terminal.share_output", "Attach terminal output", "Shell", "Attach recent terminal output to the next model turn without granting live terminal control.", ":sto [n]", "terminal", "output", "attach", "context"),
 		command("conversation.main", "Return to main chat", "Prompt", "Switch the center pane back to the main orchestrator conversation.", "b", "main", "back", "orchestrator"),
 		command("agent.followup", "Send to selected agent", "Agents", "Send the composer text as a directed follow-up to the selected agent.", ":agent", "agent", "follow up", "conversation"),
 		command("agent.swarm", "Start swarm run", "Agents", "Send a prompt to the main orchestrator as a long-running swarm task.", ":s/:swarm", "swarm", "agent", "staged", "long running"),
@@ -1820,6 +2036,7 @@ func DefaultCommands() []Command {
 		command("tab.artifacts", "Show artifacts", "Artifacts", "Switch the right pane to chat artifacts and pending approvals.", "2/:artifacts", "artifacts", "approvals", "patches"),
 		command("tab.git", "Show Git", "Git", "Switch the right pane to changed files and diffs.", "3/:git", "git", "diff", "status"),
 		command("tab.term", "Show terminal", "Shell", "Switch the right pane to the persistent local terminal.", ":term", "terminal", "shell", "right pane"),
+		command("tab.ops", "Show operations", "Ops", "Switch the right pane to live runs, queued prompts, approvals, terminal sharing, and context.", "5/:ops", "ops", "operations", "jobs", "queue"),
 		command("file.edit", "Edit file", "Files", "Open a project file in external Neovim.", ":edit", "edit", "nvim", "file"),
 		command("item.open", "Open selected item", "Files", "Open a file in $EDITOR or show a non-file item in detail.", "o", "open", "file", "artifact"),
 		command("item.detail", "Inspect selected item", "Files", "Show full details for the selected message, agent, file, code block, or patch.", "d", "detail", "inspect"),
@@ -1829,12 +2046,15 @@ func DefaultCommands() []Command {
 		command("mouse.toggle", "Toggle mouse capture", "Files", "Toggle terminal mouse capture. Off = native click-drag selection works in chat. On = scroll wheel scrolls panes.", "m", "mouse", "scroll", "select", "copy"),
 		command("approval.approve", "Approve selected action", "Approvals", "Approve and apply the selected pending tool, patch, or write action.", "a", "approve", "apply", "permission"),
 		command("approval.reject", "Reject selected action", "Approvals", "Reject the selected pending tool, patch, or write action.", "r", "reject", "permission"),
-		command("approval.cycle", "Cycle approval mode", "Approvals", "Cycle read-only -> ask -> auto.", "Ctrl+A", "approval", "auto approve", "permissions"),
+		command("approval.read_only", "Set approval read-only", "Approvals", "Disable write and shell actions for this session.", ":approval read-only", "approval", "read only", "permissions"),
+		command("approval.ask", "Set approval ask", "Approvals", "Ask before workspace writes and shell actions.", ":approval ask", "approval", "ask", "permissions"),
 		command("approval.auto", "Set approval auto", "Approvals", "Auto-approve normal workspace writes for this session.", ":approval auto", "approval", "auto", "permissions"),
 		command("approval.danger", "Confirm danger mode", "Approvals", "Approve all tool classes for this session after explicit confirmation.", ":danger confirm", "danger", "permissions"),
 		command("context.compact", "Compact context", "Context", "Write a compact summary for the active session.", ":compact", "compact", "context"),
+		command("context.inspect", "Inspect next context", "Context", "Show exactly what FreeCode will attach to the next model turn.", ":context", "context", "next prompt", "model input"),
 		command("context.memory", "Show remembered state", "Context", "Show the structured context FreeCode will carry into future turns.", ":memory", "memory", "handoff", "state", "context"),
 		command("context.cancel", "Cancel active run", "Context", "Cancel the active model/tool run and drop queued follow-ups.", ":cancel", "cancel", "interrupt", "stop"),
+		command("context.noqueue", "Clear queued prompts", "Context", "Drop queued follow-up prompts without cancelling the active run.", ":noqueue", "queue", "clear", "drop"),
 		command("diagnostics.doctor", "Run doctor", "Diagnostics", "Check config, workspace, git, editor, terminal, and provider setup.", ":doctor", "doctor", "diagnostics", "health"),
 		command("diagnostics.debug_bundle", "Create debug bundle", "Diagnostics", "Show a redacted diagnostic bundle for bug reports.", ":debug-bundle", "debug", "bundle", "redact", "diagnostics"),
 		command("settings.open", "Settings", "Provider", "Show provider, model, approval, and editor settings.", ":settings", "settings", "provider", "model", "editor"),
@@ -1842,18 +2062,18 @@ func DefaultCommands() []Command {
 		command("quit", "Quit", "Help", "Exit FreeCode.", "q", "quit", "exit"),
 	}
 	plainSyntax := map[string]string{
-		"prompt.insert":     "i/:i <prompt>",
-		"shell.run":         "!:! <command>",
-		"conversation.main": "b/:main",
-		"agent.followup":    ":agent <prompt>",
-		"agent.swarm":       ":s/:swarm <prompt>",
-		"item.open":         "o/:o f1[:line]|m1",
-		"item.detail":       "d/:d p1|m1|a1",
-		"item.copy":         "y c1|m1",
-		"item.copy.full":    "Y c1|m1",
-		"approval.approve":  "a p1",
-		"approval.reject":   "r p1",
-		"approval.cycle":    "ctrl-a",
+		"prompt.insert":         "i/:i <prompt>",
+		"shell.run":             "!:! <command>",
+		"terminal.share_output": ":sto [n]",
+		"conversation.main":     "b/:main",
+		"agent.followup":        ":agent <prompt>",
+		"agent.swarm":           ":s/:swarm <prompt>",
+		"item.open":             "o/:o f1[:line]|m1",
+		"item.detail":           "d/:d p1|m1|a1",
+		"item.copy":             "y c1|m1",
+		"item.copy.full":        "Y c1|m1",
+		"approval.approve":      "a p1",
+		"approval.reject":       "r p1",
 	}
 	for i := range commands {
 		if syntax := plainSyntax[commands[i].ID]; syntax != "" {
@@ -2438,7 +2658,7 @@ func completionCandidates(state State) []CompletionCandidate {
 			add("command", key, command.Title)
 		}
 	}
-	for _, value := range []string{":sessions", ":new", ":rename", ":resume", ":ls", ":buffers", ":b", ":bn", ":bp", ":files", ":artifacts", ":git", ":term", ":terminal", ":t", ":share-term", ":share-terminal", ":st", ":tabn", ":tabp", ":Explore", ":edit", ":e", ":agent", ":s", ":swarm", ":!", ":settings", ":compact", ":approval"} {
+	for _, value := range []string{":sessions", ":new", ":rename", ":resume", ":ls", ":buffers", ":b", ":bn", ":bp", ":files", ":artifacts", ":git", ":ops", ":term", ":terminal", ":t", ":share-term", ":share-terminal", ":st", ":sto", ":share-output", ":tabn", ":tabp", ":Explore", ":edit", ":e", ":agent", ":s", ":swarm", ":!", ":settings", ":compact", ":context", ":memory", ":cancel", ":noqueue", ":approval"} {
 		add("command", value, strings.TrimPrefix(value, ":"))
 	}
 	for _, summary := range state.Sessions {

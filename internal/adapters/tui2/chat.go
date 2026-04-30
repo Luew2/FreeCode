@@ -222,6 +222,16 @@ func (c *chatRenderer) renderCell(item workbench.TranscriptItem, selected bool) 
 func chatBodyCollapsed(item workbench.TranscriptItem, selected bool) bool {
 	switch item.Kind {
 	case workbench.TranscriptTool:
+		title := strings.ToLower(firstNonEmpty(item.Title, item.Meta["tool_call_name"]))
+		if strings.Contains(title, "terminal_read") || strings.Contains(title, "terminal_write") {
+			return false
+		}
+		if item.Status != "" && item.Status != "ok" && item.Status != "completed" && item.Status != "success" {
+			return false
+		}
+		if item.Meta["tool_call_error"] != "" {
+			return false
+		}
 		return true
 	default:
 		return false
@@ -348,7 +358,7 @@ func chatHeaderLabel(item workbench.TranscriptItem) string {
 	case workbench.TranscriptAgent:
 		return strings.TrimSpace("agent " + firstNonEmpty(title, item.Actor))
 	case workbench.TranscriptContext:
-		return "context"
+		return firstNonEmpty(title, "context")
 	case workbench.TranscriptError:
 		return "error"
 	default:

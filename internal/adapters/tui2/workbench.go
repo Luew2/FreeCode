@@ -232,6 +232,7 @@ type contextEntry struct {
 	path     string
 	name     string
 	status   string
+	body     string
 	line     int
 	approval bool
 	depth    int
@@ -471,7 +472,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleTerminalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "ctrl+g", "esc":
+	case "ctrl+g":
 		m.mode = modeNormal
 		if term := m.currentTerminal(); term != nil {
 			term.expanded = false
@@ -545,14 +546,6 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+k", "?":
 		return m.openPalette(), nil
-	case "ctrl+a":
-		if m.focus != focusContext {
-			m.state.Notice = "approval shortcuts are available in the right pane"
-			return m, nil
-		}
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, m.state.Approval.Cycle())
-		})
 	case "b":
 		return m.activateMainConversation()
 	case "i":
@@ -613,12 +606,6 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.state.Notice = "no pending approvals"
 		return m, nil
-	case "A":
-		// Cycling approval mode is workspace-wide, not pane-bound — no
-		// reason to gate it on context pane focus.
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAuto)
-		})
 	case "1":
 		if m.focus != focusContext {
 			return m, nil
@@ -642,6 +629,12 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.setRightTab(workbench.RightTabTerm)
+		return m, nil
+	case "5":
+		if m.focus != focusContext {
+			return m, nil
+		}
+		m.setRightTab(workbench.RightTabOps)
 		return m, nil
 	case "z":
 		if m.focus == focusContext && m.activeRightTab() == workbench.RightTabTerm {
@@ -877,10 +870,6 @@ func (m model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.approveSelected()
 	case "r":
 		return m.rejectSelected()
-	case "A":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAuto)
-		})
 	case "ctrl+f", "pgdown":
 		m.approval.ViewDown()
 		return m, nil
@@ -1025,6 +1014,9 @@ func (m model) headerView() string {
 	if len(m.submitQueue) > 0 {
 		status += fmt.Sprintf("  queued:%d", len(m.submitQueue))
 	}
+	if _, slot := m.sharedTerminal(); slot >= 0 {
+		status += fmt.Sprintf("  term:%d shared", slot+1)
+	}
 	return headerStyle.Width(m.width).Render(truncate(status, m.width-2))
 }
 
@@ -1092,7 +1084,7 @@ func (m model) composerView() string {
 	width := max(1, m.width-4)
 	switch m.mode {
 	case modeTerminal:
-		return composerStyle.Width(width).Render("TERM  shell owns keys  Esc/Ctrl+G normal  Ctrl+C interrupt  :st share from normal")
+		return composerStyle.Width(width).Render("TERM  shell owns keys  Ctrl+G normal  Ctrl+C interrupt  :st live share from normal")
 	case modeCommand:
 		label := "COMMAND"
 		if m.command.Prompt == "!" {
@@ -1102,7 +1094,7 @@ func (m model) composerView() string {
 	case modeInsert:
 		return composerStyle.Width(width).Render("INSERT  Enter send  Esc normal\n" + m.composer.View())
 	default:
-		status := "NORMAL  i prompt  : command  ! shell  :term terminal  :st share  Ctrl+K palette  Ctrl+H/L panes  h/l left/right local  j/k select  Enter activate  y copy  v select  m mouse"
+		status := "NORMAL  i prompt  : command  ! shell  :term terminal  :st live  :sto attach  Ctrl+K palette  Ctrl+H/L panes  h/l local  j/k select  Enter activate  y copy  v copy"
 		if m.busy {
 			status += "  running"
 		}
@@ -1126,7 +1118,7 @@ func (m model) noticeView() string {
 		notice = pending
 	}
 	if notice == "" {
-		notice = "j/k move  Ctrl+H/L panes  h/l left/right local  Enter activate  :s swarm  :! shell  :term terminal  d detail  y copy  v select  m mouse  q quit"
+		notice = "j/k move  Ctrl+H/L panes  h/l local  Enter activate  :s swarm  :! shell  :term terminal  :ops ops  d detail  y copy  v copy  q quit"
 	}
 	return noticeStyle.Width(m.width).Render(truncate(notice, m.width-2))
 }
@@ -1286,6 +1278,9 @@ func (m model) rightView(width int, height int) string {
 		}
 		return fitLines(lines, width, height)
 	}
+	if m.activeRightTab() == workbench.RightTabOps {
+		return m.opsView(width, height, lines)
+	}
 	entries := m.contextEntries()
 	if len(entries) == 0 {
 		lines = append(lines, mutedStyle.Render(m.emptyRightTabText()))
@@ -1309,6 +1304,27 @@ func (m model) rightView(width int, height int) string {
 			}
 			lines = append(lines, line)
 		}
+	}
+	if end < len(entries) && len(lines) < height {
+		lines = append(lines, mutedStyle.Render("..."))
+	}
+	return fitLines(lines, width, height)
+}
+
+func (m model) opsView(width int, height int, lines []string) string {
+	lines = append(lines, mutedStyle.Render("Enter open  d detail  a/r approvals  :context inspect"))
+	entries := m.contextEntries()
+	if len(entries) == 0 {
+		lines = append(lines, mutedStyle.Render("No active operations"))
+		return fitLines(lines, width, height)
+	}
+	available := max(0, height-len(lines))
+	start, end := visibleRange(len(entries), m.contextCursor, max(1, available))
+	if start > 0 && len(lines) < height {
+		lines = append(lines, mutedStyle.Render("..."))
+	}
+	for i := start; i < end && len(lines) < height; i++ {
+		lines = append(lines, m.contextEntryLines(entries[i], width, m.contextCursor == i)...)
 	}
 	if end < len(entries) && len(lines) < height {
 		lines = append(lines, mutedStyle.Render("..."))
@@ -1340,7 +1356,7 @@ func (m model) terminalContentView(width int, height int) string {
 		return fitLines([]string{
 			mutedStyle.Render(fmt.Sprintf("Terminal %d is ready. Press Enter to focus and start it.", m.termSlot+1)),
 			mutedStyle.Render("Run :t to create another terminal, or :t N to select one."),
-			mutedStyle.Render("Terminal output is local-only until :st or :share-term."),
+			mutedStyle.Render(":st grants live agent control; :sto attaches output once."),
 		}, width, height)
 	}
 	bodyHeight := max(1, height-1)
@@ -1348,9 +1364,9 @@ func (m model) terminalContentView(width int, height int) string {
 	if m.terminalShared && m.sharedTermSlot == m.termSlot {
 		shared = "  shared"
 	}
-	status := fmt.Sprintf("term %d/%d%s  Esc/Ctrl+G returns to FreeCode", m.termSlot+1, max(1, len(m.terms)), shared)
+	status := fmt.Sprintf("term %d/%d%s  Ctrl+G returns to FreeCode", m.termSlot+1, max(1, len(m.terms)), shared)
 	if m.mode != modeTerminal {
-		status = fmt.Sprintf("term %d/%d%s  Enter focus  z expand  :st share with agent  :st off revoke", m.termSlot+1, max(1, len(m.terms)), shared)
+		status = fmt.Sprintf("term %d/%d%s  Enter focus  z expand  :st live control  :sto attach output", m.termSlot+1, max(1, len(m.terms)), shared)
 	}
 	lines := []string{mutedStyle.Render(truncate(status, max(1, width-1)))}
 	lines = append(lines, strings.Split(term.view(width, bodyHeight), "\n")...)
@@ -1402,6 +1418,15 @@ func (m model) contextEntryLines(entry contextEntry, width int, active bool) []s
 			head,
 			mutedStyle.Render("    " + compactPath(path, max(8, width-6))),
 		}
+	case "ops", "ops-agent", "ops-approval", "ops-terminal", "ops-context":
+		head := selectableLine(active, prefix, entry.label)
+		if entry.status == "" {
+			return []string{head}
+		}
+		return []string{
+			head,
+			mutedStyle.Render("    " + truncate(entry.status, max(8, width-6))),
+		}
 	default:
 		return []string{selectableLine(active, prefix, entry.label)}
 	}
@@ -1417,6 +1442,7 @@ func (m model) rightTabHeader() string {
 		{workbench.RightTabArtifacts, "Artifacts"},
 		{workbench.RightTabGit, "Git"},
 		{workbench.RightTabTerm, "Term"},
+		{workbench.RightTabOps, "Ops"},
 	}
 	var parts []string
 	for _, item := range labels {
@@ -1447,6 +1473,8 @@ func (m model) rightTabCount(tab workbench.RightTab) int {
 			return 1
 		}
 		return 0
+	case workbench.RightTabOps:
+		return len(m.opsEntries())
 	default:
 		return len(m.state.Approvals) + len(m.state.Artifacts)
 	}
@@ -1460,6 +1488,8 @@ func (m model) emptyRightTabText() string {
 		return "No git changes"
 	case workbench.RightTabTerm:
 		return "Terminal is stopped. Run :term to start it."
+	case workbench.RightTabOps:
+		return "No active operations"
 	default:
 		return "No approvals or artifacts"
 	}
@@ -1559,7 +1589,7 @@ func (m model) approvalView() string {
 		titleStyle.Render("Approval Required"),
 		fmt.Sprintf("%s of %d  %s  %s", approval.ID, len(m.state.Approvals), approval.Action, approval.Title),
 		approvalSubjectLine(approval),
-		mutedStyle.Render("a approve/apply  r reject  A auto approval  d detail  Ctrl+F/B scroll  Esc close"),
+		mutedStyle.Render("a approve/apply  r reject  :approval auto/ask/read-only  d detail  Ctrl+F/B scroll  Esc close"),
 		"",
 	}
 	lines = append(lines, m.approval.View())
@@ -1612,6 +1642,8 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m.openNewTerminal(false)
 	case "terminal.share":
 		return m.shareTerminalDirect("")
+	case "terminal.share_output":
+		return m.shareTerminalOutputDirect("")
 	case "item.open":
 		return m.openSelected()
 	case "item.detail":
@@ -1628,9 +1660,13 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m.approveSelected()
 	case "approval.reject":
 		return m.rejectSelected()
-	case "approval.cycle":
+	case "approval.read_only":
 		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, m.state.Approval.Cycle())
+			return m.controller.SetApproval(ctx, permission.ModeReadOnly)
+		})
+	case "approval.ask":
+		return m.runAction(func(ctx context.Context) (workbench.State, error) {
+			return m.controller.SetApproval(ctx, permission.ModeAsk)
 		})
 	case "approval.auto":
 		return m.runAction(func(ctx context.Context) (workbench.State, error) {
@@ -1641,6 +1677,8 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "context.compact":
 		return m.runAction(m.controller.Compact)
+	case "context.inspect":
+		return m.showContextInspector()
 	case "context.memory":
 		if reporter, ok := m.controller.(memoryReporter); ok {
 			return m.runAction(reporter.Memory)
@@ -1649,6 +1687,8 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "context.cancel":
 		return m.executeLine(":cancel")
+	case "context.noqueue":
+		return m.executeLine(":noqueue")
 	case "diagnostics.doctor":
 		if reporter, ok := m.controller.(diagnosticsReporter); ok {
 			return m.runAction(reporter.Doctor)
@@ -1681,6 +1721,9 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "tab.git", "workspace.git":
 		m.setRightTab(workbench.RightTabGit)
+		return m, nil
+	case "tab.ops":
+		m.setRightTab(workbench.RightTabOps)
 		return m, nil
 	case "workspace.term":
 		return m.openNewTerminal(false)
@@ -1739,6 +1782,9 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 	case line == ":git":
 		m.setRightTab(workbench.RightTabGit)
 		return m, nil
+	case line == ":ops":
+		m.setRightTab(workbench.RightTabOps)
+		return m, nil
 	case line == ":term" || line == ":terminal" || line == ":t":
 		return m.openNewTerminal(false)
 	case strings.HasPrefix(line, ":term "):
@@ -1763,6 +1809,12 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		return m.shareTerminalDirect(strings.TrimSpace(strings.TrimPrefix(line, ":share-terminal ")))
 	case strings.HasPrefix(line, ":st "):
 		return m.shareTerminalDirect(strings.TrimSpace(strings.TrimPrefix(line, ":st ")))
+	case line == ":sto" || line == ":share-output":
+		return m.shareTerminalOutputDirect("")
+	case strings.HasPrefix(line, ":sto "):
+		return m.shareTerminalOutputDirect(strings.TrimSpace(strings.TrimPrefix(line, ":sto ")))
+	case strings.HasPrefix(line, ":share-output "):
+		return m.shareTerminalOutputDirect(strings.TrimSpace(strings.TrimPrefix(line, ":share-output ")))
 	case line == ":tabn" || line == ":tabnext" || line == ":tn":
 		m.cycleRightTab(1)
 		return m, nil
@@ -1780,6 +1832,8 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		return m.showSettings()
 	case line == ":compact" || line == "/compact":
 		return m.runAction(m.controller.Compact)
+	case line == ":context":
+		return m.showContextInspector()
 	case line == ":memory" || line == ":what-state" || line == ":remember":
 		if reporter, ok := m.controller.(memoryReporter); ok {
 			return m.runAction(reporter.Memory)
@@ -1798,7 +1852,16 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		}
 		m.state.Notice = "debug bundle is unavailable"
 		return m, nil
-	case line == ":cancel" || line == ":noqueue":
+	case line == ":noqueue":
+		dropped := len(m.submitQueue)
+		m.submitQueue = nil
+		if dropped == 0 {
+			m.state.Notice = "queue is empty"
+		} else {
+			m.state.Notice = fmt.Sprintf("cleared %d queued prompt(s)", dropped)
+		}
+		return m, nil
+	case line == ":cancel":
 		// :cancel interrupts the active run when possible and also drops
 		// queued follow-ups so stale prompts do not fire after cancellation.
 		dropped := len(m.submitQueue)
@@ -1869,9 +1932,9 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		return m.approveRef(strings.TrimSpace(strings.TrimPrefix(line, ":a ")))
 	case strings.HasPrefix(line, ":r "):
 		return m.rejectRef(strings.TrimSpace(strings.TrimPrefix(line, ":r ")))
-	case line == ":A" || line == ":a all" || line == ":a *":
+	case line == ":a all" || line == ":a *":
 		return m.approveRef("all")
-	case line == ":R" || line == ":r all" || line == ":r *":
+	case line == ":r all" || line == ":r *":
 		return m.rejectRef("all")
 	case line == ":debug" || line == ":debug toggle":
 		return m.toggleDebugMode()
@@ -1992,6 +2055,107 @@ func (m model) showSettings() (tea.Model, tea.Cmd) {
 	m.detail.SetYOffset(0)
 	m.syncDetailViewport()
 	return m, nil
+}
+
+func (m model) showContextInspector() (tea.Model, tea.Cmd) {
+	m.state.Detail = workbench.Item{
+		ID:       "context",
+		Kind:     "context",
+		Title:    "Next model context",
+		Body:     m.contextInspectorBody(),
+		MIMEType: "text/plain",
+	}
+	m.state.Notice = "context preview"
+	m.focus = focusContext
+	m.overlay = overlayDetail
+	m.detail.SetYOffset(0)
+	m.syncDetailViewport()
+	return m, nil
+}
+
+func (m model) contextInspectorBody() string {
+	preview := m.state.ContextPreview
+	var lines []string
+	lines = append(lines,
+		"active conversation: "+firstNonEmpty(preview.ActiveConversation, m.state.ActiveConversation.Title, "Main orchestrator"),
+		fmt.Sprintf("estimated tokens: ~%d", firstNonZero(preview.TokenEstimate, m.state.TokenEstimate)),
+	)
+	if m.busy {
+		lines = append(lines, fmt.Sprintf("active run: #%d", m.activeRun))
+	}
+	if len(m.submitQueue) > 0 {
+		lines = append(lines, fmt.Sprintf("queued prompts: %d", len(m.submitQueue)))
+	}
+	lines = append(lines, "", "included next turn:")
+	included := preview.Included
+	if len(included) == 0 {
+		included = []string{"new prompt"}
+	}
+	for _, item := range included {
+		lines = append(lines, "  - "+item)
+	}
+	if term, slot := m.sharedTerminal(); term != nil {
+		lines = append(lines,
+			fmt.Sprintf("  - live terminal %d access via terminal_read/terminal_write", slot+1),
+			"",
+			fmt.Sprintf("live terminal %d tail:", slot+1),
+			trimTerminalTail(term.tail(80)),
+		)
+	}
+	attached := attachedTerminalArtifacts(m.state.Transcript)
+	if len(attached) > 0 {
+		lines = append(lines, "", "attached terminal output:")
+		for _, item := range attached {
+			lines = append(lines, "  - "+item)
+		}
+	}
+	if len(preview.Excluded) > 0 {
+		lines = append(lines, "", "excluded by default:")
+		for _, item := range preview.Excluded {
+			lines = append(lines, "  - "+item)
+		}
+	}
+	if len(m.state.Approvals) > 0 {
+		lines = append(lines, "", fmt.Sprintf("pending approvals: %d", len(m.state.Approvals)))
+	}
+	if preview.Summary != "" {
+		lines = append(lines, "", "summary:", preview.Summary)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func attachedTerminalArtifacts(items []workbench.TranscriptItem) []string {
+	var out []string
+	for _, item := range items {
+		if item.Kind != workbench.TranscriptContext {
+			continue
+		}
+		if firstNonEmpty(item.Meta["share_with_model"], "false") != "true" {
+			continue
+		}
+		out = append(out, firstNonEmpty(item.Title, item.ID, "attached terminal output"))
+	}
+	return out
+}
+
+func trimTerminalTail(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "  (no terminal output yet)"
+	}
+	if len(text) > 4096 {
+		text = text[len(text)-4096:]
+	}
+	return text
+}
+
+func firstNonZero(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func (m model) showBuffers() (tea.Model, tea.Cmd) {
@@ -2124,11 +2288,16 @@ func (m model) startTerminal(expand bool, focus bool) (tea.Model, tea.Cmd) {
 	if term == nil {
 		return m.openNewTerminal(focus)
 	}
-	m.setRightTab(workbench.RightTabTerm)
+	previousFocus := m.focus
+	m.state.RightTab = workbench.RightTabTerm
+	m.contextCursor = 0
 	term.expanded = expand
 	m.mode = modeNormal
 	if focus {
 		m.mode = modeTerminal
+		m.focus = focusContext
+	} else {
+		m.focus = previousFocus
 	}
 	m.overlay = overlayNone
 	width, height := m.terminalPTYSize()
@@ -2145,7 +2314,7 @@ func (m model) startTerminal(expand bool, focus bool) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	term.resize(width, height)
-	m.state.Notice = fmt.Sprintf("terminal %d focused; Esc or Ctrl+G returns", m.termSlot+1)
+	m.state.Notice = fmt.Sprintf("terminal %d focused; Ctrl+G returns", m.termSlot+1)
 	return m, m.terminalReadCmd()
 }
 
@@ -2226,6 +2395,25 @@ func (m model) shareTerminalDirect(value string) (tea.Model, tea.Cmd) {
 	return m, m.terminalReadCmdFor(term)
 }
 
+func (m model) shareTerminalOutputDirect(value string) (tea.Model, tea.Cmd) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value != "" {
+		slot := parseTerminalSlot(value)
+		if slot <= 0 {
+			m.state.Notice = "usage: :sto [terminal-number]"
+			return m, nil
+		}
+		m.ensureTerminalList()
+		if slot > len(m.terms) {
+			m.state.Notice = fmt.Sprintf("terminal %d does not exist", slot)
+			return m, nil
+		}
+		m.termSlot = slot - 1
+		m.term = m.terms[m.termSlot]
+	}
+	return m.shareTerminal(160)
+}
+
 func (m model) shareTerminal(limit int) (tea.Model, tea.Cmd) {
 	term := m.currentTerminal()
 	if term == nil {
@@ -2242,9 +2430,9 @@ func (m model) shareTerminal(limit int) (tea.Model, tea.Cmd) {
 		m.state.Notice = "terminal sharing is unavailable"
 		return m, nil
 	}
-	title := "Shared terminal output"
+	title := fmt.Sprintf("Attached terminal %d output", m.termSlot+1)
 	if limit > 0 {
-		title = fmt.Sprintf("Shared terminal output (%d lines)", limit)
+		title = fmt.Sprintf("Attached terminal %d output (%d lines)", m.termSlot+1, limit)
 	}
 	m.detailPending = false
 	return m.runAction(func(ctx context.Context) (workbench.State, error) {
@@ -2537,6 +2725,17 @@ func (m model) openSelected() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		switch entry.kind {
+		case "ops-context":
+			return m.showContextInspector()
+		case "ops-terminal":
+			m.setRightTab(workbench.RightTabTerm)
+			return m, nil
+		case "ops-agent":
+			return m.activateConversationRef(entry.id)
+		case "ops-approval":
+			return m.detailOpsEntry(entry)
+		case "ops":
+			return m.detailOpsEntry(entry)
 		case "folder":
 			m.toggleFolder(entry.path)
 			return m, nil
@@ -2575,11 +2774,22 @@ func (m model) activateSelected() (tea.Model, tea.Cmd) {
 			m.state.Notice = "nothing selected"
 			return m, nil
 		}
-		if entry.kind == "folder" {
+		switch entry.kind {
+		case "ops-context":
+			return m.showContextInspector()
+		case "ops-terminal":
+			m.setRightTab(workbench.RightTabTerm)
+			return m, nil
+		case "ops-agent":
+			return m.activateConversationRef(entry.id)
+		case "ops-approval":
+			return m.detailOpsEntry(entry)
+		case "ops":
+			return m.detailOpsEntry(entry)
+		case "folder":
 			m.toggleFolder(entry.path)
 			return m, nil
-		}
-		if entry.kind == "git" {
+		case "git":
 			return m.detailRef(firstNonEmpty(entry.id, entry.path))
 		}
 	}
@@ -2780,12 +2990,41 @@ func (m model) openPath(path string, line int, ref string) (tea.Model, tea.Cmd) 
 }
 
 func (m model) detailSelected() (tea.Model, tea.Cmd) {
+	if m.mode == modeApprove || m.overlay == overlayApproval {
+		if approval, ok := m.selectedApproval(); ok {
+			return m.detailRef(approval.ID)
+		}
+	}
+	if m.focus == focusContext && m.activeRightTab() == workbench.RightTabOps {
+		if entry, ok := m.selectedContextEntry(); ok {
+			return m.detailOpsEntry(entry)
+		}
+	}
 	id, ok := m.selectedID()
 	if !ok {
 		m.state.Notice = "nothing selected"
 		return m, nil
 	}
 	return m.detailRef(id)
+}
+
+func (m model) detailOpsEntry(entry contextEntry) (tea.Model, tea.Cmd) {
+	body := strings.TrimSpace(entry.body)
+	if body == "" {
+		body = strings.TrimSpace(strings.Join([]string{entry.label, entry.status}, "\n"))
+	}
+	m.state.Detail = workbench.Item{
+		ID:       firstNonEmpty(entry.id, "ops"),
+		Kind:     "ops",
+		Title:    entry.label,
+		Body:     body,
+		MIMEType: "text/plain",
+	}
+	m.overlay = overlayDetail
+	m.focus = focusContext
+	m.detail.SetYOffset(0)
+	m.syncDetailViewport()
+	return m, nil
 }
 
 func (m model) detailRef(id string) (tea.Model, tea.Cmd) {
@@ -2884,6 +3123,10 @@ func (m model) selectedCopyText() (string, bool) {
 		entry, ok := m.selectedContextEntry()
 		if !ok {
 			break
+		}
+		if m.activeRightTab() == workbench.RightTabOps {
+			text := strings.TrimSpace(strings.Join([]string{entry.id, entry.label, entry.status, entry.body}, "\n"))
+			return text, text != ""
 		}
 		switch entry.kind {
 		case "approval":
@@ -3067,6 +3310,11 @@ func (m model) selectedContextEntry() (contextEntry, bool) {
 }
 
 func (m model) selectedApproval() (workbench.ApprovalItem, bool) {
+	if m.focus == focusContext {
+		if entry, ok := m.selectedContextEntry(); ok && (entry.kind == "approval" || entry.kind == "ops-approval") {
+			return m.findApproval(entry.id)
+		}
+	}
 	if len(m.state.Approvals) == 0 {
 		return workbench.ApprovalItem{}, false
 	}
@@ -3086,6 +3334,8 @@ func (m model) contextEntries() []contextEntry {
 		return entries
 	case workbench.RightTabTerm:
 		return nil
+	case workbench.RightTabOps:
+		return m.opsEntries()
 	}
 	for _, approval := range m.state.Approvals {
 		label := approval.Title
@@ -3103,6 +3353,94 @@ func (m model) contextEntries() []contextEntry {
 			label = item.Kind
 		}
 		entries = append(entries, contextEntry{id: item.ID, kind: "artifact", label: fmt.Sprintf("%-7s %s", item.Kind, label)})
+	}
+	return entries
+}
+
+func (m model) opsEntries() []contextEntry {
+	var entries []contextEntry
+	runStatus := "idle"
+	if m.busy {
+		runStatus = fmt.Sprintf("active run #%d", m.activeRun)
+	}
+	if len(m.submitQueue) > 0 {
+		runStatus += fmt.Sprintf("  queued:%d", len(m.submitQueue))
+	}
+	entries = append(entries, contextEntry{
+		id:     "run",
+		kind:   "ops",
+		label:  "run state",
+		status: runStatus,
+		body:   runStatus,
+	})
+	for i, queued := range m.submitQueue {
+		title := queued.text
+		if queued.swarm {
+			title = "swarm: " + title
+		}
+		entries = append(entries, contextEntry{
+			id:     fmt.Sprintf("q%d", i+1),
+			kind:   "ops",
+			label:  truncate(title, 80),
+			status: "queued prompt",
+			body:   queued.text,
+		})
+	}
+	contextStatus := firstNonEmpty(m.state.ContextPreview.Summary, fmt.Sprintf("~%d tokens", m.state.TokenEstimate))
+	entries = append(entries, contextEntry{
+		id:     "ctx",
+		kind:   "ops-context",
+		label:  "next model context",
+		status: contextStatus,
+		body:   m.contextInspectorBody(),
+	})
+	if term, slot := m.sharedTerminal(); term != nil {
+		entries = append(entries, contextEntry{
+			id:     fmt.Sprintf("term%d", slot+1),
+			kind:   "ops-terminal",
+			label:  fmt.Sprintf("terminal %d live-shared", slot+1),
+			status: "agent can use terminal_read and terminal_write",
+			body:   term.tail(80),
+		})
+	} else if len(m.terms) > 0 {
+		entries = append(entries, contextEntry{
+			id:     "term",
+			kind:   "ops-terminal",
+			label:  fmt.Sprintf("%d terminal(s)", len(m.terms)),
+			status: "local-only; run :st [n] for live control or :sto [n] to attach output",
+		})
+	}
+	for _, approval := range m.state.Approvals {
+		label := firstNonEmpty(approval.Title, approval.Subject, approval.ID)
+		entries = append(entries, contextEntry{
+			id:       approval.ID,
+			kind:     "ops-approval",
+			label:    "approval " + label,
+			status:   firstNonEmpty(approval.Action, approval.Kind),
+			body:     m.approvalContent(approval),
+			approval: true,
+		})
+	}
+	for _, agent := range m.state.Agents {
+		entries = append(entries, contextEntry{
+			id:     agent.ID,
+			kind:   "ops-agent",
+			label:  agentRowTitle(agent),
+			status: firstNonEmpty(agent.CurrentStep, agent.Summary, agent.BlockedReason, agent.TaskID),
+			body:   strings.Join(nonEmptyLines(agentRowSublines(agent, 100, 8)), "\n"),
+		})
+	}
+	for _, item := range m.state.Operations.Items {
+		if item.ID == "" || item.ID == "ctx" || item.ID == "chat" || item.ID == "approvals" || item.ID == "agents" {
+			continue
+		}
+		entries = append(entries, contextEntry{
+			id:     item.ID,
+			kind:   "ops",
+			label:  item.Title,
+			status: item.Status,
+			body:   item.Body,
+		})
 	}
 	return entries
 }
@@ -3230,8 +3568,10 @@ func workspaceCommands() []workbench.Command {
 		{ID: "tab.files", Title: "Show files", Category: "Workspace", Description: "Switch the right pane to workspace files.", Keybinding: ":files", Key: ":files", Keywords: []string{"files", "right pane"}, Enabled: true},
 		{ID: "tab.artifacts", Title: "Show artifacts", Category: "Workspace", Description: "Switch the right pane to approvals and artifacts.", Keybinding: ":artifacts", Key: ":artifacts", Keywords: []string{"artifacts", "approvals"}, Enabled: true},
 		{ID: "tab.git", Title: "Show git changes", Category: "Workspace", Description: "Switch the right pane to git changes.", Keybinding: ":git", Key: ":git", Keywords: []string{"git", "diff"}, Enabled: true},
+		{ID: "tab.ops", Title: "Show operations", Category: "Workspace", Description: "Switch the right pane to active runs, queue, approvals, agents, terminal sharing, and context.", Keybinding: ":ops", Key: ":ops", Keywords: []string{"ops", "operations", "jobs", "queue"}, Enabled: true},
 		{ID: "terminal.open", Title: "Open terminal", Category: "Shell", Description: "Open the persistent local terminal.", Keybinding: ":term", Key: ":term", Keywords: []string{"terminal", "shell", "pty"}, Enabled: true},
 		{ID: "terminal.share", Title: "Share terminal with agent", Category: "Shell", Description: "Enable direct terminal_read and terminal_write tools for the selected terminal.", Keybinding: ":st [n]", Key: ":st", Keywords: []string{"terminal", "share", "context", "control"}, Enabled: true},
+		{ID: "terminal.share_output", Title: "Attach terminal output", Category: "Shell", Description: "Attach recent terminal output to the next model turn without live terminal control.", Keybinding: ":sto [n]", Key: ":sto", Keywords: []string{"terminal", "attach", "output", "context"}, Enabled: true},
 		{ID: "settings.open", Title: "Settings", Category: "Workspace", Description: "Show current provider, model, approval, and editor settings.", Keybinding: ":settings", Key: ":settings", Keywords: []string{"settings", "config"}, Enabled: true},
 	}
 }
@@ -3299,12 +3639,12 @@ func (m model) completeCommandLine(value string) (string, bool) {
 }
 
 func commandNames() []string {
-	return []string{"sessions", "new", "rename", "resume", "files", "artifacts", "git", "term", "terminal", "t", "share-term", "share-terminal", "st", "edit", "e", "agent", "swarm", "s", "settings", "main", "back", "b", "bn", "bnext", "bp", "bprevious", "ls", "buffers", "tabn", "tabnext", "tabp", "tabprevious", "Explore", "Ex", "w", "q", "qa", "quit", "help", "palette", "compact", "memory", "what-state", "remember", "doctor", "debug-bundle", "cancel", "noqueue", "approval", "danger", "i", "send", "o", "d", "y", "Y", "a", "r", "!"}
+	return []string{"sessions", "new", "rename", "resume", "files", "artifacts", "git", "ops", "term", "terminal", "t", "share-term", "share-terminal", "st", "sto", "share-output", "edit", "e", "agent", "swarm", "s", "settings", "main", "back", "b", "bn", "bnext", "bp", "bprevious", "ls", "buffers", "tabn", "tabnext", "tabp", "tabprevious", "Explore", "Ex", "w", "q", "qa", "quit", "help", "palette", "compact", "context", "memory", "what-state", "remember", "doctor", "debug-bundle", "cancel", "noqueue", "approval", "danger", "i", "send", "o", "d", "y", "Y", "a", "r", "!"}
 }
 
 func commandTakesArgument(command string) bool {
 	switch command {
-	case "rename", "resume", "edit", "e", "agent", "swarm", "s", "share-term", "share-terminal", "st", "i", "send", "b", "o", "d", "y", "Y", "a", "r", "approval", "!":
+	case "rename", "resume", "edit", "e", "agent", "swarm", "s", "share-term", "share-terminal", "st", "sto", "share-output", "i", "send", "b", "o", "d", "y", "Y", "a", "r", "approval", "!":
 		return true
 	default:
 		return false
@@ -3541,7 +3881,7 @@ func (m model) pendingApprovalStrip() string {
 		more := len(ids) - 6
 		ids = append(ids[:6], fmt.Sprintf("+%d", more))
 	}
-	return fmt.Sprintf("pending [%s] — a/r approve/reject; :a all / :a p1-p3 / :A all", strings.Join(ids, " "))
+	return fmt.Sprintf("pending [%s] — a/r approve/reject; :a all / :a p1-p3", strings.Join(ids, " "))
 }
 
 func (m *model) moveSelection(delta int) {
@@ -3586,7 +3926,7 @@ func (m *model) setRightTab(tab workbench.RightTab) {
 }
 
 func (m *model) cycleRightTab(delta int) {
-	tabs := []workbench.RightTab{workbench.RightTabFiles, workbench.RightTabArtifacts, workbench.RightTabGit, workbench.RightTabTerm}
+	tabs := []workbench.RightTab{workbench.RightTabFiles, workbench.RightTabArtifacts, workbench.RightTabGit, workbench.RightTabTerm, workbench.RightTabOps}
 	current := 0
 	active := m.activeRightTab()
 	for i, tab := range tabs {
@@ -3618,10 +3958,10 @@ func (m *model) toggleFolder(path string) {
 
 func (m model) activeRightTab() workbench.RightTab {
 	switch m.state.RightTab {
-	case workbench.RightTabFiles, workbench.RightTabArtifacts, workbench.RightTabGit, workbench.RightTabTerm:
+	case workbench.RightTabFiles, workbench.RightTabArtifacts, workbench.RightTabGit, workbench.RightTabTerm, workbench.RightTabOps:
 		return m.state.RightTab
 	default:
-		return workbench.RightTabArtifacts
+		return workbench.RightTabFiles
 	}
 }
 
