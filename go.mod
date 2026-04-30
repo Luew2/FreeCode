@@ -3,6 +3,7 @@ module github.com/Luew2/FreeCode
 go 1.22
 
 require (
+	github.com/anthropics/anthropic-sdk-go v1.5.0
 	github.com/charmbracelet/bubbles v0.17.1
 	github.com/charmbracelet/bubbletea v0.26.6
 	github.com/charmbracelet/glamour v0.7.0
@@ -10,8 +11,9 @@ require (
 	github.com/charmbracelet/x/ansi v0.1.2
 	github.com/creack/pty v1.1.24
 	github.com/muesli/termenv v0.15.2
+	github.com/openai/openai-go/v3 v3.33.0
 	github.com/pelletier/go-toml/v2 v2.3.0
-	golang.org/x/term v0.21.0
+	golang.org/x/term v0.28.0
 )
 
 require (
@@ -37,11 +39,15 @@ require (
 	github.com/muesli/reflow v0.3.0 // indirect
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
+	github.com/tidwall/gjson v1.18.0 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
+	github.com/tidwall/pretty v1.2.1 // indirect
+	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yuin/goldmark v1.7.13 // indirect
 	github.com/yuin/goldmark-emoji v1.0.6 // indirect
-	golang.org/x/net v0.26.0 // indirect
-	golang.org/x/sync v0.8.0 // indirect
-	golang.org/x/sys v0.21.0 // indirect
-	golang.org/x/text v0.16.0 // indirect
+	golang.org/x/net v0.34.0 // indirect
+	golang.org/x/sync v0.10.0 // indirect
+	golang.org/x/sys v0.29.0 // indirect
+	golang.org/x/text v0.21.0 // indirect
 )

@@ -23,11 +23,18 @@ func TestClientStreamsTextAndToolUse(t *testing.T) {
 			t.Fatalf("Decode request: %v", err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
+		// Anthropic always emits content_block_start before any deltas.
+		// Earlier versions of this test omitted the start for the leading
+		// text block; the SDK's typed accumulator requires the start, so
+		// we now mirror the real wire shape.
+		writeSSE(t, w, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
 		writeSSE(t, w, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "hi"}})
+		writeSSE(t, w, map[string]any{"type": "content_block_stop", "index": 0})
 		writeSSE(t, w, map[string]any{"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": map[string]any{}}})
 		writeSSE(t, w, map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "input_json_delta", "partial_json": `{"path":"README.md"}`}})
+		writeSSE(t, w, map[string]any{"type": "content_block_stop", "index": 1})
 		writeSSE(t, w, map[string]any{"type": "message_delta", "usage": map[string]any{"input_tokens": 3, "output_tokens": 2}})
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		writeSSE(t, w, map[string]any{"type": "message_stop"})
 	}))
 	defer server.Close()
 
@@ -162,15 +169,36 @@ func collectEvents(events <-chan model.Event) []model.Event {
 	return got
 }
 
+// writeSSE emits an Anthropic-style server-sent event. The Anthropic SDK's
+// stream parser dispatches on the SSE `event:` field (not the JSON `type`
+// field), so when the test data has a top-level `type` we mirror it as
+// `event:` to match the real on-the-wire shape.
 func writeSSE(t *testing.T, w io.Writer, value any) {
 	t.Helper()
 	data, err := json.Marshal(value)
 	if err != nil {
 		t.Fatalf("Marshal SSE: %v", err)
 	}
+	if eventType, ok := extractEventType(value); ok {
+		_, _ = io.WriteString(w, "event: ")
+		_, _ = io.WriteString(w, eventType)
+		_, _ = io.WriteString(w, "\n")
+	}
 	_, _ = io.WriteString(w, "data: ")
 	_, _ = w.Write(data)
 	_, _ = io.WriteString(w, "\n\n")
+}
+
+func extractEventType(value any) (string, bool) {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	t, ok := m["type"].(string)
+	if !ok || t == "" {
+		return "", false
+	}
+	return t, true
 }
 
 type fakeSecrets map[string]string

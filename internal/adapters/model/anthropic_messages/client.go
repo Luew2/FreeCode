@@ -1,7 +1,12 @@
+// Package anthropic_messages speaks the Anthropic Messages API via the
+// official anthropic-sdk-go SDK. The SDK handles SSE parsing, retries,
+// base-URL routing and content-block accumulation; the wrapper here adds
+// FreeCode-specific concerns: secret resolution at request time, system /
+// developer message merging, and translation between model.Request /
+// model.Event and the SDK's typed parameters.
 package anthropic_messages
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,9 +14,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"net/url"
 	"strings"
 
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/packages/param"
+	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
+
+	"github.com/Luew2/FreeCode/internal/adapters/model/transport"
 	"github.com/Luew2/FreeCode/internal/core/model"
 	"github.com/Luew2/FreeCode/internal/ports"
 )
@@ -26,8 +37,10 @@ var _ ports.ModelClient = (*Client)(nil)
 type Client struct {
 	provider model.Provider
 	endpoint string
+	baseURL  string
 	secrets  ports.SecretStore
 	client   *http.Client
+	policy   transport.RetryPolicy
 }
 
 func NewClient(provider model.Provider, secrets ports.SecretStore, client *http.Client) (*Client, error) {
@@ -35,176 +48,357 @@ func NewClient(provider model.Provider, secrets ports.SecretStore, client *http.
 	if err != nil {
 		return nil, &ClientError{Endpoint: provider.BaseURL, Err: err}
 	}
-	if client == nil {
-		client = http.DefaultClient
+	baseURL, err := sdkBaseURL(provider.BaseURL)
+	if err != nil {
+		return nil, &ClientError{Endpoint: provider.BaseURL, Err: err}
 	}
-	return &Client{provider: provider, endpoint: endpoint, secrets: secrets, client: client}, nil
+	if client == nil {
+		client = transport.DefaultHTTPClient()
+	}
+	return &Client{
+		provider: provider,
+		endpoint: endpoint,
+		baseURL:  baseURL,
+		secrets:  secrets,
+		client:   client,
+		policy:   transport.DefaultRetryPolicy(),
+	}, nil
+}
+
+// SetRetryPolicy overrides the retry policy. The anthropic-sdk-go SDK only
+// exposes MaxAttempts via WithMaxRetries; the additional knobs are accepted
+// for signature compatibility but ignored.
+func (c *Client) SetRetryPolicy(policy transport.RetryPolicy) {
+	if c == nil {
+		return
+	}
+	c.policy = policy
 }
 
 func (c *Client) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
 	if c == nil {
 		return nil, errors.New("anthropic messages client is nil")
 	}
-	body, err := json.Marshal(toMessagesRequest(c.provider, request))
+
+	apiKey, err := c.resolveAPIKey(ctx)
 	if err != nil {
 		return nil, &ClientError{Endpoint: c.endpoint, Err: err}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, &ClientError{Endpoint: c.endpoint, Err: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Anthropic-Version", "2023-06-01")
+
+	opts := c.buildOptions(apiKey, request.Stream)
+	internal := toMessagesRequest(c.provider, request)
+	params := internal.toSDKParams()
+
+	sdk := anthropic.NewClient(opts...)
 	if request.Stream {
-		req.Header.Set("Accept", "text/event-stream")
-	} else {
-		req.Header.Set("Accept", "application/json")
+		stream := sdk.Messages.NewStreaming(ctx, params)
+		if streamErr := stream.Err(); streamErr != nil {
+			_ = stream.Close()
+			return nil, c.toClientError(streamErr)
+		}
+		events := make(chan model.Event)
+		go c.readStream(stream, events)
+		return events, nil
 	}
-	if err := c.authorize(ctx, req); err != nil {
-		return nil, &ClientError{Endpoint: c.endpoint, Err: err}
-	}
-	resp, err := c.client.Do(req)
+
+	message, err := sdk.Messages.New(ctx, params)
 	if err != nil {
-		return nil, &ClientError{Endpoint: c.endpoint, Err: err}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		return nil, &ClientError{Endpoint: c.endpoint, StatusCode: resp.StatusCode, Body: readErrorBody(resp.Body)}
+		return nil, c.toClientError(err)
 	}
 	events := make(chan model.Event)
-	if request.Stream {
-		go c.readStream(resp, events)
-	} else {
-		go c.readResponse(resp, events)
-	}
+	go c.readResponse(message, events)
 	return events, nil
 }
 
-func (c *Client) authorize(ctx context.Context, req *http.Request) error {
-	if c.provider.Secret.Name == "" {
-		return nil
+func (c *Client) buildOptions(apiKey string, streaming bool) []option.RequestOption {
+	maxRetries := c.policy.MaxAttempts - 1
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
-	if c.secrets == nil {
-		return errors.New("secret store is not configured")
+	opts := []option.RequestOption{
+		option.WithBaseURL(c.baseURL),
+		option.WithHTTPClient(c.client),
+		option.WithMaxRetries(maxRetries),
 	}
-	apiKey, err := c.secrets.Get(ctx, c.provider.Secret.Name)
-	if err != nil {
-		return err
+	if streaming {
+		opts = append(opts, option.WithHeader("Accept", "text/event-stream"))
 	}
-	req.Header.Set("X-Api-Key", apiKey)
-	return nil
+	if apiKey != "" {
+		opts = append(opts, option.WithAPIKey(apiKey))
+	}
+	return opts
 }
 
-func (c *Client) readStream(resp *http.Response, events chan<- model.Event) {
+func (c *Client) resolveAPIKey(ctx context.Context) (string, error) {
+	if c.provider.Secret.Name == "" {
+		return "", nil
+	}
+	if c.secrets == nil {
+		return "", errors.New("secret store is not configured")
+	}
+	return c.secrets.Get(ctx, c.provider.Secret.Name)
+}
+
+func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 	defer close(events)
-	defer resp.Body.Close()
+	defer stream.Close()
 
 	events <- model.Event{Type: model.EventStarted}
-	toolBlocks := map[int]*toolBlock{}
-	err := scanServerSentEvents(resp.Body, func(payload string) error {
-		trimmed := strings.TrimSpace(payload)
-		if trimmed == "" || trimmed == "[DONE]" {
-			return nil
-		}
-		var event streamEvent
-		if err := json.Unmarshal([]byte(trimmed), &event); err != nil {
-			return fmt.Errorf("invalid streamed Anthropic messages JSON: %w", err)
-		}
-		if event.Error != nil {
-			return fmt.Errorf("provider error: %s", event.Error.Message)
+	acc := anthropic.Message{}
+	streamErr := false
+
+	for stream.Next() {
+		event := stream.Current()
+		if err := acc.Accumulate(event); err != nil {
+			events <- model.Event{Type: model.EventError, Error: err.Error()}
+			streamErr = true
+			return
 		}
 		switch event.Type {
 		case "content_block_start":
-			if event.ContentBlock.Type == "text" && event.ContentBlock.Text != "" {
-				events <- model.Event{Type: model.EventTextDelta, Text: event.ContentBlock.Text}
-			}
-			if event.ContentBlock.Type == "tool_use" {
-				block := &toolBlock{ID: event.ContentBlock.ID, Name: event.ContentBlock.Name}
-				if len(event.ContentBlock.Input) > 0 && strings.TrimSpace(string(event.ContentBlock.Input)) != "{}" {
-					block.arguments.Write(event.ContentBlock.Input)
-				}
-				toolBlocks[event.Index] = block
+			block := event.ContentBlock
+			if block.Type == "text" && block.Text != "" {
+				events <- model.Event{Type: model.EventTextDelta, Text: block.Text}
 			}
 		case "content_block_delta":
 			if event.Delta.Type == "text_delta" {
 				events <- model.Event{Type: model.EventTextDelta, Text: event.Delta.Text}
 			}
-			if event.Delta.Type == "input_json_delta" {
-				block := toolBlocks[event.Index]
-				if block == nil {
-					block = &toolBlock{}
-					toolBlocks[event.Index] = block
-				}
-				block.arguments.WriteString(event.Delta.PartialJSON)
+		case "message_start":
+			usage := event.Message.Usage
+			if usage.InputTokens > 0 || usage.OutputTokens > 0 {
+				events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+					InputTokens:  int(usage.InputTokens),
+					OutputTokens: int(usage.OutputTokens),
+					TotalTokens:  int(usage.InputTokens + usage.OutputTokens),
+				}}
 			}
 		case "message_delta":
-			if event.Usage.OutputTokens > 0 || event.Usage.InputTokens > 0 {
-				usage := event.Usage.toModelUsage()
-				events <- model.Event{Type: model.EventUsage, Usage: &usage}
+			usage := event.Usage
+			if usage.InputTokens > 0 || usage.OutputTokens > 0 {
+				events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+					InputTokens:  int(usage.InputTokens),
+					OutputTokens: int(usage.OutputTokens),
+					TotalTokens:  int(usage.InputTokens + usage.OutputTokens),
+				}}
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		events <- model.Event{Type: model.EventError, Error: err.Error()}
+	}
+	if err := stream.Err(); err != nil {
+		events <- model.Event{Type: model.EventError, Error: classifyStreamError(err)}
 		return
 	}
-	indexes := make([]int, 0, len(toolBlocks))
-	for index := range toolBlocks {
-		indexes = append(indexes, index)
+	if streamErr {
+		return
 	}
-	sort.Ints(indexes)
-	for _, index := range indexes {
-		block := toolBlocks[index]
-		events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
-			ID:        block.ID,
-			Name:      block.Name,
-			Arguments: normalizeArguments(block.arguments.String()),
+	for _, block := range acc.Content {
+		if block.Type == "tool_use" {
+			args := normalizeArguments(string(block.Input))
+			events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
+				ID:        block.ID,
+				Name:      block.Name,
+				Arguments: args,
+			}}
+		}
+	}
+	events <- model.Event{Type: model.EventCompleted}
+}
+
+func (c *Client) readResponse(message *anthropic.Message, events chan<- model.Event) {
+	defer close(events)
+	events <- model.Event{Type: model.EventStarted}
+
+	for _, block := range message.Content {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				events <- model.Event{Type: model.EventTextDelta, Text: block.Text}
+			}
+		case "tool_use":
+			args := normalizeArguments(string(block.Input))
+			events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
+				ID:        block.ID,
+				Name:      block.Name,
+				Arguments: args,
+			}}
+		}
+	}
+	if message.Usage.InputTokens > 0 || message.Usage.OutputTokens > 0 {
+		events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+			InputTokens:  int(message.Usage.InputTokens),
+			OutputTokens: int(message.Usage.OutputTokens),
+			TotalTokens:  int(message.Usage.InputTokens + message.Usage.OutputTokens),
 		}}
 	}
 	events <- model.Event{Type: model.EventCompleted}
 }
 
-func (c *Client) readResponse(resp *http.Response, events chan<- model.Event) {
-	defer close(events)
-	defer resp.Body.Close()
-
-	events <- model.Event{Type: model.EventStarted}
-	var response messagesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		events <- model.Event{Type: model.EventError, Error: fmt.Sprintf("decode Anthropic messages response: %v", err)}
-		return
+func (c *Client) toClientError(err error) error {
+	if err == nil {
+		return nil
 	}
-	if response.Error != nil {
-		events <- model.Event{Type: model.EventError, Error: "provider error: " + response.Error.Message}
-		return
+	var apiErr *anthropic.Error
+	if errors.As(err, &apiErr) && apiErr.Response != nil {
+		body := readResponseBody(apiErr.Response)
+		return &ClientError{Endpoint: c.endpoint, StatusCode: apiErr.StatusCode, Body: body}
 	}
-	for _, block := range response.Content {
-		switch block.Type {
-		case "text":
-			events <- model.Event{Type: model.EventTextDelta, Text: block.Text}
-		case "tool_use":
-			events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
-				ID:        block.ID,
-				Name:      block.Name,
-				Arguments: normalizeArguments(string(block.Input)),
-			}}
-		}
-	}
-	if response.Usage.InputTokens > 0 || response.Usage.OutputTokens > 0 {
-		usage := response.Usage.toModelUsage()
-		events <- model.Event{Type: model.EventUsage, Usage: &usage}
-	}
-	events <- model.Event{Type: model.EventCompleted}
+	return &ClientError{Endpoint: c.endpoint, Err: err}
 }
 
+func readResponseBody(resp *http.Response) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func classifyStreamError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if strings.HasPrefix(msg, "received error while streaming: ") {
+		body := strings.TrimPrefix(msg, "received error while streaming: ")
+		return "provider error: " + extractProviderMessage(body)
+	}
+	if isJSONParseError(err) {
+		return "invalid streamed Anthropic messages JSON: " + msg
+	}
+	return msg
+}
+
+func extractProviderMessage(body string) string {
+	body = strings.TrimSpace(body)
+	body = strings.TrimPrefix(body, "received error while streaming: ")
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "unknown error"
+	}
+	var envelope struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err == nil {
+		if envelope.Message != "" {
+			return envelope.Message
+		}
+		if envelope.Type != "" {
+			return envelope.Type
+		}
+	}
+	return body
+}
+
+func isJSONParseError(err error) bool {
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invalid character") || strings.Contains(msg, "unexpected end of JSON input") || strings.HasPrefix(msg, "json: ")
+}
+
+// sdkBaseURL converts a user-supplied provider base URL into the form the
+// anthropic-sdk-go SDK expects. The SDK calls path "v1/messages" relative
+// to the configured base, so we have to ensure the base is a host root
+// (Anthropic's own deployments) or a vendor root that the SDK can append
+// `v1/messages` to.
+func sdkBaseURL(baseURL string) (string, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return "", errors.New("base url is empty")
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("base url must include scheme and host")
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+
+	path := strings.TrimRight(parsed.Path, "/")
+	switch {
+	case path == "":
+		parsed.Path = "/"
+	case strings.HasSuffix(path, "/v1/messages"):
+		parsed.Path = strings.TrimSuffix(path, "/v1/messages") + "/"
+	case strings.HasSuffix(path, "/v1"):
+		// User specified the version themselves — drop it; SDK re-adds.
+		parsed.Path = strings.TrimSuffix(path, "/v1") + "/"
+	default:
+		parsed.Path = path + "/"
+	}
+	return parsed.String(), nil
+}
+
+// messagesRequest is the on-wire shape we eventually marshal. We retain it
+// as a package-private struct because the test suite captures the request
+// body via json.Decode into messagesRequest to assert on its fields. It
+// also drives toSDKParams below.
 type messagesRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	Stream    bool               `json:"stream,omitempty"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMessage `json:"messages"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
+	Model      string               `json:"model"`
+	MaxTokens  int                  `json:"max_tokens"`
+	Stream     bool                 `json:"stream,omitempty"`
+	System     systemField          `json:"system,omitempty"`
+	Messages   []anthropicMessage   `json:"messages"`
+	Tools      []anthropicTool      `json:"tools,omitempty"`
+	ToolChoice *anthropicToolChoice `json:"tool_choice,omitempty"`
+}
+
+// systemField is either an Anthropic-flavored array of {type:text,text:...}
+// blocks (the SDK's preferred wire form) or a plain string (the form the
+// original FreeCode client used). Tests inspect the field as a string;
+// downstream callers don't care which shape goes on the wire.
+type systemField string
+
+func (s systemField) MarshalJSON() ([]byte, error) {
+	if s == "" {
+		return []byte("null"), nil
+	}
+	return json.Marshal(string(s))
+}
+
+func (s *systemField) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*s = ""
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		*s = systemField(str)
+		return nil
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(trimmed, &blocks); err != nil {
+		return err
+	}
+	var b strings.Builder
+	for _, blk := range blocks {
+		if blk.Type == "" || blk.Type == "text" {
+			b.WriteString(blk.Text)
+		}
+	}
+	*s = systemField(b.String())
+	return nil
+}
+
+// anthropicToolChoice mirrors Anthropic's tool_choice shape: {"type": "auto"},
+// {"type": "any"} (force one of the provided tools), {"type": "tool",
+// "name": "..."} (force a specific tool), or {"type": "none"} (disable
+// tools). We only emit it when the caller asks for a non-default —
+// Anthropic defaults to "auto" otherwise.
+type anthropicToolChoice struct {
+	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -219,7 +413,48 @@ type contentBlock struct {
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   string          `json:"content,omitempty"`
+	// Content is the tool_result payload. Anthropic accepts a plain string
+	// or an array of {type:text,text:...} blocks; the SDK marshals to the
+	// array form. We normalize both shapes back to a string for callers
+	// (and tests) that just want the textual content.
+	Content toolResultContent `json:"content,omitempty"`
+}
+
+type toolResultContent string
+
+func (c toolResultContent) MarshalJSON() ([]byte, error) {
+	if c == "" {
+		return []byte(`""`), nil
+	}
+	return json.Marshal(string(c))
+}
+
+func (c *toolResultContent) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*c = ""
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		*c = toolResultContent(str)
+		return nil
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(trimmed, &blocks); err != nil {
+		return err
+	}
+	var b strings.Builder
+	for _, blk := range blocks {
+		if blk.Type == "" || blk.Type == "text" {
+			b.WriteString(blk.Text)
+		}
+	}
+	*c = toolResultContent(b.String())
+	return nil
 }
 
 type anthropicTool struct {
@@ -244,7 +479,7 @@ func toMessagesRequest(provider model.Provider, request model.Request) messagesR
 	for _, message := range request.Messages {
 		switch message.Role {
 		case model.RoleSystem, model.RoleDeveloper:
-			value.System = joinNonEmpty(value.System, messageText(message))
+			value.System = systemField(joinNonEmpty(string(value.System), messageText(message)))
 		case model.RoleAssistant:
 			blocks := textBlocks(message)
 			for _, call := range message.ToolCalls {
@@ -262,7 +497,7 @@ func toMessagesRequest(provider model.Provider, request model.Request) messagesR
 			value.Messages = append(value.Messages, anthropicMessage{Role: "user", Content: []contentBlock{{
 				Type:      "tool_result",
 				ToolUseID: message.ToolCallID,
-				Content:   messageText(message),
+				Content:   toolResultContent(messageText(message)),
 			}}})
 		default:
 			blocks := textBlocks(message)
@@ -274,7 +509,103 @@ func toMessagesRequest(provider model.Provider, request model.Request) messagesR
 	for _, tool := range request.Tools {
 		value.Tools = append(value.Tools, anthropicTool{Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema})
 	}
+	switch strings.ToLower(strings.TrimSpace(request.ToolChoice)) {
+	case "", "auto":
+		// default; omit field
+	case "required", "any":
+		// Anthropic spells "must call some tool" as "any".
+		value.ToolChoice = &anthropicToolChoice{Type: "any"}
+	case "none":
+		value.ToolChoice = &anthropicToolChoice{Type: "none"}
+	default:
+		// Caller passed a tool name → force that tool.
+		value.ToolChoice = &anthropicToolChoice{Type: "tool", Name: request.ToolChoice}
+	}
 	return value
+}
+
+// toSDKParams converts our internal messagesRequest into anthropic-sdk-go
+// typed params. The SDK marshals these to the same JSON wire format.
+func (r messagesRequest) toSDKParams() anthropic.MessageNewParams {
+	params := anthropic.MessageNewParams{
+		Model:     anthropic.Model(r.Model),
+		MaxTokens: int64(r.MaxTokens),
+	}
+	if r.System != "" {
+		params.System = []anthropic.TextBlockParam{{Text: string(r.System)}}
+	}
+	for _, msg := range r.Messages {
+		mp := anthropic.MessageParam{
+			Role: anthropic.MessageParamRole(msg.Role),
+		}
+		for _, block := range msg.Content {
+			mp.Content = append(mp.Content, blockToParam(block))
+		}
+		params.Messages = append(params.Messages, mp)
+	}
+	for _, tool := range r.Tools {
+		schema := anthropic.ToolInputSchemaParam{}
+		if tool.InputSchema != nil {
+			if props, ok := tool.InputSchema["properties"]; ok {
+				schema.Properties = props
+			}
+			if req, ok := tool.InputSchema["required"].([]string); ok {
+				schema.Required = req
+			}
+			extras := map[string]any{}
+			for k, v := range tool.InputSchema {
+				if k == "type" || k == "properties" || k == "required" {
+					continue
+				}
+				extras[k] = v
+			}
+			if len(extras) > 0 {
+				schema.ExtraFields = extras
+			}
+		}
+		params.Tools = append(params.Tools, anthropic.ToolUnionParam{
+			OfTool: &anthropic.ToolParam{
+				Name:        tool.Name,
+				Description: param.NewOpt(tool.Description),
+				InputSchema: schema,
+			},
+		})
+	}
+	if r.ToolChoice != nil {
+		switch r.ToolChoice.Type {
+		case "auto":
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{OfAuto: &anthropic.ToolChoiceAutoParam{}}
+		case "any":
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
+		case "tool":
+			params.ToolChoice = anthropic.ToolChoiceParamOfTool(r.ToolChoice.Name)
+		case "none":
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{OfNone: &anthropic.ToolChoiceNoneParam{}}
+		}
+	}
+	return params
+}
+
+func blockToParam(block contentBlock) anthropic.ContentBlockParamUnion {
+	switch block.Type {
+	case "text":
+		return anthropic.NewTextBlock(block.Text)
+	case "tool_use":
+		var input any
+		if len(block.Input) > 0 {
+			_ = json.Unmarshal(block.Input, &input)
+		}
+		return anthropic.NewToolUseBlock(block.ID, input, block.Name)
+	case "tool_result":
+		result := anthropic.NewToolResultBlock(block.ToolUseID)
+		if block.Content != "" && result.OfToolResult != nil {
+			result.OfToolResult.Content = []anthropic.ToolResultBlockParamContentUnion{{
+				OfText: &anthropic.TextBlockParam{Text: string(block.Content)},
+			}}
+		}
+		return result
+	}
+	return anthropic.ContentBlockParamUnion{}
 }
 
 func textBlocks(message model.Message) []contentBlock {
@@ -319,47 +650,6 @@ func normalizeArguments(raw string) json.RawMessage {
 	return data
 }
 
-type toolBlock struct {
-	ID        string
-	Name      string
-	arguments strings.Builder
-}
-
-type streamEvent struct {
-	Type         string        `json:"type"`
-	Index        int           `json:"index"`
-	Delta        streamDelta   `json:"delta"`
-	ContentBlock contentBlock  `json:"content_block"`
-	Usage        usagePayload  `json:"usage"`
-	Error        *errorPayload `json:"error"`
-}
-
-type streamDelta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text"`
-	PartialJSON string `json:"partial_json"`
-}
-
-type messagesResponse struct {
-	Content []contentBlock `json:"content"`
-	Usage   usagePayload   `json:"usage"`
-	Error   *errorPayload  `json:"error"`
-}
-
-type usagePayload struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-}
-
-func (u usagePayload) toModelUsage() model.Usage {
-	return model.Usage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, TotalTokens: u.InputTokens + u.OutputTokens}
-}
-
-type errorPayload struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-}
-
 type ClientError struct {
 	Endpoint   string
 	StatusCode int
@@ -384,40 +674,13 @@ func (e *ClientError) Error() string {
 	return prefix
 }
 
-func readErrorBody(body io.Reader) string {
-	data, err := io.ReadAll(io.LimitReader(body, 4096))
-	if err != nil {
-		return ""
+func (e *ClientError) Unwrap() error {
+	if e == nil {
+		return nil
 	}
-	return strings.TrimSpace(string(data))
+	return e.Err
 }
 
-func scanServerSentEvents(r io.Reader, handle func(string) error) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	var data []string
-	flush := func() error {
-		if len(data) == 0 {
-			return nil
-		}
-		payload := strings.Join(data, "\n")
-		data = nil
-		return handle(payload)
-	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			if err := flush(); err != nil {
-				return err
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return flush()
-}
+// messagesStream is a tiny alias so internal functions can take the
+// concrete generic stream type without re-stating it everywhere.
+type messagesStream = ssestream.Stream[anthropic.MessageStreamEventUnion]

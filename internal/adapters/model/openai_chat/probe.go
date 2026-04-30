@@ -166,14 +166,6 @@ type chatCompletionsProbeRequest struct {
 	Stream    bool          `json:"stream"`
 }
 
-type chatMessage struct {
-	Role       string         `json:"role"`
-	Name       string         `json:"name,omitempty"`
-	Content    string         `json:"content,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
-}
-
 type streamChunk struct {
 	Choices []json.RawMessage `json:"choices"`
 }

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/Luew2/FreeCode/internal/adapters/model/transport"
 	"github.com/Luew2/FreeCode/internal/core/model"
 	"github.com/Luew2/FreeCode/internal/ports"
 )
@@ -63,7 +64,7 @@ func (p *Probe) Probe(ctx context.Context, provider model.Provider, candidate mo
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ports.ProbeResult{}, &ProbeError{Protocol: Protocol, Endpoint: endpoint, StatusCode: resp.StatusCode, Body: readErrorBody(resp.Body)}
+		return ports.ProbeResult{}, &ProbeError{Protocol: Protocol, Endpoint: endpoint, StatusCode: resp.StatusCode, Body: transport.DrainBody(resp.Body, 4096)}
 	}
 	configured := model.NewModel(provider.ID, candidate)
 	configured.Capabilities.Tools = true

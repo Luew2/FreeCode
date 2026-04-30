@@ -614,6 +614,71 @@ func TestTranscriptRendersCompactMessages(t *testing.T) {
 	}
 }
 
+func TestMouseToggleFullscreensFocusedPane(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Commands: workbench.DefaultCommands(),
+		Transcript: []workbench.TranscriptItem{
+			{ID: "m1", Kind: workbench.TranscriptUser, Actor: "user", Text: "hello chat content"},
+		},
+		Agents: []workbench.AgentItem{
+			{ID: "a1", Name: "worker", Role: "worker", Status: "running"},
+		},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.width = 140
+	m.height = 30
+	m.resize()
+	m.focus = focusAgents
+
+	// Multi-pane view: agents pane is on screen so its content should appear.
+	multi := stripANSI(m.bodyView())
+	if !strings.Contains(multi, "worker") {
+		t.Fatalf("multi-pane view missing agents content:\n%s", multi)
+	}
+	if !strings.Contains(multi, "hello chat content") {
+		t.Fatalf("multi-pane view missing chat content:\n%s", multi)
+	}
+
+	// Re-focus the transcript pane for the fullscreen check.
+	m.focus = focusTranscript
+
+	// Toggle mouse off → should fullscreen the focused (transcript) pane.
+	next, _ := m.toggleMouseCapture()
+	m = next.(model)
+	if m.mouseCaptured {
+		t.Fatalf("mouseCaptured = true after toggle, want false")
+	}
+	body := stripANSI(m.bodyView())
+	if !strings.Contains(body, "hello chat content") {
+		t.Fatalf("fullscreen view missing focused pane content:\n%s", body)
+	}
+	if strings.Contains(body, "a1 worker") {
+		t.Fatalf("fullscreen view should hide non-focused panes, but agents content is visible:\n%s", body)
+	}
+
+	// Switching focus while in copy mode should fullscreen the new focus.
+	m.focus = focusAgents
+	body = stripANSI(m.bodyView())
+	if !strings.Contains(body, "worker") {
+		t.Fatalf("focusAgents fullscreen missing agents content:\n%s", body)
+	}
+	if strings.Contains(body, "hello chat content") {
+		t.Fatalf("focusAgents fullscreen leaked chat content:\n%s", body)
+	}
+
+	// Toggle back: multi-pane returns.
+	m.focus = focusTranscript
+	next, _ = m.toggleMouseCapture()
+	m = next.(model)
+	if !m.mouseCaptured {
+		t.Fatalf("mouseCaptured = false after second toggle, want true")
+	}
+	multi = stripANSI(m.bodyView())
+	if !strings.Contains(multi, "worker") || !strings.Contains(multi, "hello chat content") {
+		t.Fatalf("multi-pane view did not return:\n%s", multi)
+	}
+}
+
 func TestComposerSanitizesTerminalJunkWhileTyping(t *testing.T) {
 	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)

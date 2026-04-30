@@ -53,7 +53,7 @@ func (r AgentRunner) RunAgent(ctx context.Context, task agent.Task) (agent.Resul
 	}.Run(ctx, Request{
 		SessionID:      r.taskSession(task),
 		Model:          r.Model,
-		UserRequest:    "Execute this task packet and return the required handoff.",
+		UserRequest:    subagentUserRequest(task),
 		Environment:    r.Environment,
 		MaxSteps:       task.Budget.MaxSteps,
 		ContextBudget:  budget,
@@ -95,16 +95,34 @@ func (r AgentRunner) toolsFor(task agent.Task) ports.ToolRegistry {
 func rolePrompt(task agent.Task) string {
 	switch task.Role {
 	case agent.RoleOrchestrator:
-		return "You are an orchestrator for a FreeCode swarm run. Produce a concise plan, use spawn_agent when available for separable child tasks, synthesize child handoffs, and identify blockers. You may create nested orchestration only when a subproblem itself needs coordination."
+		return "You are an orchestrator for a FreeCode swarm run. Produce a concise plan, use spawn_agent when available for separable child tasks, synthesize child handoffs, and identify blockers. You may create nested orchestration only when a subproblem itself needs coordination. Use tools — do not answer with prose alone."
+	case agent.RoleExplorer:
+		return "You are an explorer for a FreeCode swarm run. Your job is to actually read the codebase: call read_file, search, and other available tools to gather concrete findings. Do not summarize from memory or guess — every claim in your handoff must be backed by something you read in this session."
 	case agent.RoleWorker:
-		return "You are the worker for a FreeCode swarm run. Implement only the assigned goal and report changed files."
+		return "You are the worker for a FreeCode swarm run. Implement only the assigned goal and report changed files. Make edits with the patch tool when allowed; do not just describe changes you would make."
 	case agent.RoleVerifier:
-		return "You are the verifier for a FreeCode swarm run. Run or recommend focused checks and report tests."
+		return "You are the verifier for a FreeCode swarm run. Run or recommend focused checks and report tests. When run_check is available, actually invoke it — do not narrate what running tests would do."
 	case agent.RoleReviewer:
-		return "You are the reviewer for a FreeCode swarm run. Lead with findings by severity; block on correctness risks."
+		return "You are the reviewer for a FreeCode swarm run. Lead with findings by severity; block on correctness risks. Read the relevant files with the available tools before offering judgments."
 	default:
-		return "You are a bounded FreeCode subagent. Stay within the task packet."
+		return "You are a bounded FreeCode subagent. Stay within the task packet. Use the available tools to do real work — do not answer with prose alone."
 	}
+}
+
+// subagentUserRequest produces the user-role message a subagent receives.
+// The orchestrator's previous design sent a generic "Execute this task
+// packet" string here, which weaker / instruction-following models
+// interpreted as conversational chit-chat rather than a directive — they
+// would acknowledge the request without calling any tools. Putting the
+// concrete goal in the user message gives the model an actual question to
+// answer and matches how interactive agents like opencode/Claude shape
+// their delegated work.
+func subagentUserRequest(task agent.Task) string {
+	goal := strings.TrimSpace(task.Goal)
+	if goal == "" {
+		return "Execute the task packet in the developer message and return the required JSON handoff."
+	}
+	return goal + "\n\nUse the available tools to do this work concretely — read, search, edit, run, or delegate as appropriate. When done, return the JSON handoff specified in the task packet."
 }
 
 func promptForTask(task agent.Task) prompt.Builder {

@@ -724,18 +724,29 @@ func runMainOwnedSwarm(ctx context.Context, configPath string, bundle runtimeBun
 	}
 	spawnBefore := countToolEvents(ctx, service.Log, sessionID, "spawn_agent")
 	prompt := swarmDelegationPrompt(request.Text, request.Approval, bundle.Git)
-	response, err := commands.AskWithResponse(ctx, io.Discard, deps, commands.AskOptions{Question: prompt, SessionID: string(sessionID), TurnContext: request.TurnContext, MaxSteps: 16})
+	response, err := commands.AskWithResponse(ctx, io.Discard, deps, commands.AskOptions{
+		Question:       prompt,
+		SessionID:      string(sessionID),
+		TurnContext:    request.TurnContext,
+		MaxSteps:       16,
+		IncludeHistory: true,
+	})
 	if err != nil {
 		_ = logSwarmLifecycle(ctx, service.Log, sessionID, agent.StatusFailed, err.Error())
 		return err
 	}
 	spawnAfter := countToolEvents(ctx, service.Log, sessionID, "spawn_agent")
+	// If the orchestrator decided no delegation was needed, treat that as a
+	// completed run with a notice rather than a failure. The previous
+	// behaviour surfaced as "swarm doesn't work" any time the model decided
+	// to answer directly — even when the answer was correct.
+	status := agent.StatusCompleted
+	notice := "swarm completed"
 	if spawnAfter <= spawnBefore {
-		err := fmt.Errorf("swarm completed without spawning any agents; retry with :s and a concrete task or ask the main chat normally")
-		_ = logSwarmLifecycle(ctx, service.Log, sessionID, agent.StatusFailed, err.Error())
-		return fmt.Errorf("%w (model response: %s)", err, strings.TrimSpace(response.Text))
+		notice = "swarm completed without spawning any agents (model answered directly)"
 	}
-	return logSwarmLifecycle(ctx, service.Log, sessionID, agent.StatusCompleted, "swarm completed")
+	_ = response // response text is already streamed into the session log via the orchestrator
+	return logSwarmLifecycle(ctx, service.Log, sessionID, status, notice)
 }
 
 func countToolEvents(ctx context.Context, log ports.EventLog, sessionID session.ID, name string) int {
@@ -939,7 +950,12 @@ func runTUI(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) 
 			if err != nil {
 				return err
 			}
-			return commands.Ask(ctx, io.Discard, deps, commands.AskOptions{Question: request.Text, SessionID: string(activeSessionID), TurnContext: request.TurnContext})
+			return commands.Ask(ctx, io.Discard, deps, commands.AskOptions{
+				Question:       request.Text,
+				SessionID:      string(activeSessionID),
+				TurnContext:    request.TurnContext,
+				IncludeHistory: true,
+			})
 		},
 	}
 

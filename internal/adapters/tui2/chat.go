@@ -166,7 +166,11 @@ func (c *chatRenderer) renderCell(item workbench.TranscriptItem, selected bool) 
 	if cached, ok := c.cache[key]; ok {
 		return append([]string(nil), cached...)
 	}
-	bodyWidth := max(10, c.width-2)
+	// Reserve cells for the 2-cell gutter and the 2-cell outer truncate
+	// margin that fitLines applies in View(). Wrapping to c.width-2 alone
+	// would still get clipped by fitLines and lose visible characters with a
+	// "..." tail on every long line.
+	bodyWidth := max(10, c.width-4)
 	lines := []string{c.renderHeader(item, selected)}
 	if !chatBodyCollapsed(item, selected) {
 		for _, line := range c.renderBody(item, bodyWidth) {
@@ -235,15 +239,54 @@ func (c *chatRenderer) renderBody(item workbench.TranscriptItem, width int) []st
 	var lines []string
 	for _, line := range strings.Split(rendered, "\n") {
 		line = strings.TrimRight(line, " ")
-		if xansi.StringWidth(line) > width {
-			for _, wrapped := range strings.Split(xansi.Wordwrap(line, width, " /"), "\n") {
-				lines = append(lines, xansi.Truncate(wrapped, width, "…"))
-			}
-			continue
-		}
-		lines = append(lines, xansi.Truncate(line, width, "…"))
+		lines = append(lines, hardWrapToWidth(line, width)...)
 	}
 	return trimOuterBlankLines(lines)
+}
+
+// hardWrapToWidth wraps a single line to width, falling back to a hard break
+// inside long unbreakable runs (URLs, file paths, JSON). Wordwrap alone keeps
+// such tokens whole and lets them overflow off the right edge — those bytes
+// would then be lost to truncation. We word-wrap first to preserve nice
+// boundaries, then split any over-wide leftover at exact width measured in
+// terminal cells. ANSI control sequences are stripped from width measurements
+// via xansi.StringWidth.
+func hardWrapToWidth(line string, width int) []string {
+	if width <= 0 {
+		return []string{line}
+	}
+	if xansi.StringWidth(line) <= width {
+		return []string{line}
+	}
+	// First pass: word-wrap on whitespace so paragraphs of regular text still
+	// look natural.
+	wrapped := xansi.Wordwrap(line, width, " /")
+	var out []string
+	for _, candidate := range strings.Split(wrapped, "\n") {
+		out = append(out, breakOversizedLine(candidate, width)...)
+	}
+	return out
+}
+
+// breakOversizedLine takes a line that has already been word-wrapped and
+// emits one or more sub-lines none of which exceed width. It uses the
+// xansi-aware wrapper to split exactly on cell width so multi-byte characters
+// stay intact.
+func breakOversizedLine(line string, width int) []string {
+	if xansi.StringWidth(line) <= width || width <= 0 {
+		return []string{line}
+	}
+	wrapped := xansi.Wrap(line, width, "")
+	parts := strings.Split(wrapped, "\n")
+	for i := range parts {
+		// xansi.Wrap can still leave a trailing remainder if the total length
+		// is not a clean multiple. Truncate (with no ellipsis) so we never
+		// emit an over-wide line and lose visible text.
+		if xansi.StringWidth(parts[i]) > width {
+			parts[i] = xansi.Truncate(parts[i], width, "")
+		}
+	}
+	return parts
 }
 
 func chatHeaderLabel(item workbench.TranscriptItem) string {

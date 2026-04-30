@@ -222,7 +222,14 @@ func TestClientSerializesToolHistory(t *testing.T) {
 	}
 }
 
-func TestClientStreamsPlainContentFallback(t *testing.T) {
+// TestClientStreamsPlainContentSurfacesParseError covers the case where a
+// misbehaving provider streams non-JSON `data:` frames. The legacy
+// hand-rolled SSE parser silently treated those as plain text deltas, but
+// the openai-go SDK's parser is strict (and, per the OpenAI/SSE-for-LLMs
+// convention, correctly so): non-JSON payloads surface as a parse error
+// instead of being interpreted as user-visible content. We assert that
+// behavior here so a regression to silent acceptance is loud.
+func TestClientStreamsPlainContentSurfacesParseError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: hello\n\n")
@@ -244,12 +251,10 @@ func TestClientStreamsPlainContentFallback(t *testing.T) {
 
 	assertEventTypes(t, gotEvents, []model.EventType{
 		model.EventStarted,
-		model.EventTextDelta,
-		model.EventTextDelta,
-		model.EventCompleted,
+		model.EventError,
 	})
-	if got := gotEvents[1].Text + gotEvents[2].Text; got != "helloworld" {
-		t.Fatalf("plain streamed text = %q, want helloworld", got)
+	if !strings.Contains(gotEvents[1].Error, "invalid") && !strings.Contains(gotEvents[1].Error, "JSON") {
+		t.Fatalf("non-JSON stream payload = %q, want JSON parse error", gotEvents[1].Error)
 	}
 }
 

@@ -152,6 +152,12 @@ type Request struct {
 	Temperature     *float64
 	Stream          bool
 	Metadata        map[string]string
+	// ToolChoice optionally constrains the model's tool use for this turn.
+	// Empty string defers to provider defaults (typically "auto"). "required"
+	// forces the model to call SOME tool — useful as the orchestrator's
+	// follow-through nudge for models like GLM that often promise tool work
+	// in text but do not actually emit a tool_call. "none" disables tools.
+	ToolChoice string
 }
 
 type EventType string

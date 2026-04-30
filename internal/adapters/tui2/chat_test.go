@@ -116,6 +116,41 @@ func TestChatRendererStreamingCacheInvalidatesOnTextChange(t *testing.T) {
 	}
 }
 
+func TestChatRendererHardWrapsLongUnbreakableTokens(t *testing.T) {
+	chat := newChatRenderer(30, 30)
+	longURL := "https://example.com/path/with/no-spaces-at-all/and-a-very-long-segment-that-cannot-wordwrap-cleanly"
+	chat.SetItems([]workbench.TranscriptItem{{
+		ID:    "m1",
+		Kind:  workbench.TranscriptAssistant,
+		Actor: "assistant",
+		Text:  "see " + longURL,
+	}})
+	view := chat.View()
+	for _, line := range strings.Split(view, "\n") {
+		if width := xansi.StringWidth(line); width > 30 {
+			t.Fatalf("line width = %d, want <= 30 for %q\n%s", width, line, view)
+		}
+	}
+	clean := stripANSI(view)
+	// Reassemble the body across wrapped lines, dropping the leading gutter
+	// and the header. We expect every byte of the URL to be preserved.
+	var body strings.Builder
+	for _, line := range strings.Split(clean, "\n") {
+		// Strip the 2-char gutter ("▌ " or "  ") if present.
+		trimmed := strings.TrimLeft(line, " ▌")
+		body.WriteString(strings.TrimSpace(trimmed))
+	}
+	if !strings.Contains(body.String(), longURL) {
+		t.Fatalf("expected full URL preserved across wrapped lines, got:\nbody=%q\nfull view:\n%s", body.String(), clean)
+	}
+	if strings.Contains(clean, "...") {
+		t.Fatalf("expected no truncation ellipsis when wrapping long token, got:\n%s", clean)
+	}
+	if strings.Contains(clean, "…") {
+		t.Fatalf("expected no unicode ellipsis when wrapping long token, got:\n%s", clean)
+	}
+}
+
 func TestChatRendererCollapsesUnselectedToolBodies(t *testing.T) {
 	chat := newChatRenderer(80, 20)
 	chat.SetItems([]workbench.TranscriptItem{

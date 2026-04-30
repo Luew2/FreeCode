@@ -135,21 +135,23 @@ func (t delegatingTools) Tools() []model.ToolSpec {
 		return tools
 	}
 	tools = append(tools, model.ToolSpec{
-		Name:        "spawn_agent",
-		Description: "Spawn one bounded FreeCode subagent for exploration, implementation, verification, review, or nested orchestration. Use this when work can be delegated and then synthesize the returned handoff.",
+		Name: "spawn_agent",
+		Description: "Spawn one bounded FreeCode subagent. The subagent runs with its own tool budget and returns a structured handoff. " +
+			"Use the role to scope its capabilities: 'explorer' (read-only research), 'worker' (read+write+patch within allowed_paths), 'verifier' (run checks), 'reviewer' (read-only review), 'orchestrator' (nested coordination). " +
+			"The task field must be concrete and actionable — include the specific files or directories to look at, the question to answer, and what shape the answer should take. Vague tasks like 'review the codebase' produce empty handoffs.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"role":            map[string]any{"type": "string", "description": "explorer, worker, verifier, reviewer, or orchestrator"},
+				"role":            map[string]any{"type": "string", "enum": []string{"explorer", "worker", "verifier", "reviewer", "orchestrator"}, "description": "Capability profile for the subagent."},
 				"agent":           map[string]any{"type": "string", "description": "Optional configured agent name. Defaults from role."},
-				"task":            map[string]any{"type": "string", "description": "Concrete bounded task packet for the subagent."},
+				"task":            map[string]any{"type": "string", "description": "Concrete bounded task. Name the files/dirs, the specific question, and the expected handoff shape (e.g. 'Read internal/foo/* and report the public API surface as a bulleted list')."},
 				"prompt":          map[string]any{"type": "string", "description": "Alias for task."},
-				"allowed_paths":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"denied_paths":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"max_steps":       map[string]any{"type": "integer"},
+				"allowed_paths":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Paths the subagent may read/write under. Defaults to the workspace root for workers."},
+				"denied_paths":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"max_steps":       map[string]any{"type": "integer", "description": "Override the subagent's per-task step budget."},
 				"parent_agent_id": map[string]any{"type": "string", "description": "Optional UI parent id. Defaults to main."},
 			},
-			"required": []string{"role"},
+			"required": []string{"role", "task"},
 		},
 	})
 	return tools

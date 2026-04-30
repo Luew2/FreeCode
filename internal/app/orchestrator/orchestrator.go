@@ -34,6 +34,13 @@ type Request struct {
 	SessionContext string
 	TurnContext    string
 	ContextBudget  contextmgr.Budget
+	// PriorMessages is the canonical chat history from previous turns: user
+	// prompts, assistant replies, tool calls, and tool results in order. When
+	// non-empty it replaces the textual SessionContext as the source of
+	// continuity, giving the model real tool_call_id pairings instead of a
+	// flattened summary. SessionContext can still be supplied for terminal
+	// snapshots and other supplementary context.
+	PriorMessages []model.Message
 }
 
 type Response struct {
@@ -62,13 +69,27 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 	if builder == (prompt.Builder{}) {
 		builder = prompt.NewBuilder()
 	}
-	messages := withSessionContext(builder.Build(request.Environment, request.UserRequest), combinedContext(request.SessionContext, request.TurnContext))
+	messages := buildInitialMessages(builder, request)
 	sequence := 0
 	if err := r.append(ctx, request.SessionID, &sequence, session.EventUserMessage, "user", request.UserRequest, nil); err != nil {
 		return Response{}, err
 	}
 
 	var totalToolCalls int
+	// Tool-followthrough can only fire once per Run. The heuristic is a
+	// nudge, not a contract: if the model produces a "I'll check..." style
+	// response without calling a tool we ask it once more. If the second
+	// response is also tool-less, we accept it as the final answer rather
+	// than spinning the loop until max_steps and surfacing a confusing
+	// "agent stopped" error to the user.
+	followThroughFired := false
+	// forceToolNextTurn is set after the followthrough heuristic fires so the
+	// next request goes out with tool_choice="required". Models like GLM
+	// happily promise "I'll check the README" but never emit a tool_call
+	// even after the orchestrator's polite nudge developer message — forcing
+	// tool_choice=required gives them no escape hatch on the retry turn.
+	// After the forced turn we drop back to default (auto) regardless.
+	forceToolNextTurn := false
 	for step := 1; step <= maxSteps; step++ {
 		tools := r.toolSpecs()
 		prepared, err := contextmgr.Prepare(messages, tools, request.ContextBudget)
@@ -87,16 +108,23 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 				return Response{}, err
 			}
 		}
+		toolChoice := ""
+		if forceToolNextTurn && len(tools) > 0 {
+			toolChoice = "required"
+		}
 		modelEvents, err := r.Model.Stream(ctx, model.Request{
 			Model:           request.Model,
 			Messages:        prepared.Messages,
 			Tools:           tools,
 			MaxOutputTokens: prepared.MaxOutputTokens,
 			Stream:          true,
+			ToolChoice:      toolChoice,
 			Metadata: map[string]string{
 				"estimated_input_tokens": fmt.Sprintf("%d", prepared.InputTokens),
 			},
 		})
+		// Single-shot: only force on the immediate retry, not subsequent turns.
+		forceToolNextTurn = false
 		if err != nil {
 			_ = r.append(ctx, request.SessionID, &sequence, session.EventError, "model", err.Error(), map[string]any{"step": step})
 			return Response{}, err
@@ -108,15 +136,17 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 		}
 		if len(turn.toolCalls) == 0 {
 			text := strings.TrimSpace(turn.text)
-			if needsToolFollowThrough(text, tools) && step < maxSteps {
-				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", text, map[string]any{"step": step, "status": "needs_tool_followthrough"}); err != nil {
+			if !followThroughFired && needsToolFollowThrough(text, tools) && step < maxSteps {
+				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", text, assistantMessagePayload(step, "needs_tool_followthrough", nil)); err != nil {
 					return Response{}, err
 				}
 				messages = append(messages, model.TextMessage(model.RoleAssistant, text))
 				messages = append(messages, model.TextMessage(model.RoleDeveloper, toolFollowThroughPrompt(tools)))
+				followThroughFired = true
+				forceToolNextTurn = true
 				continue
 			}
-			if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", text, map[string]any{"step": step}); err != nil {
+			if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", text, assistantMessagePayload(step, "final", nil)); err != nil {
 				return Response{}, err
 			}
 			return Response{Text: text, Steps: step, ToolCalls: totalToolCalls}, nil
@@ -128,6 +158,9 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 			assistant.Content = []model.ContentPart{{Type: model.ContentText, Text: turn.text}}
 		}
 		messages = append(messages, assistant)
+		if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", strings.TrimSpace(turn.text), assistantMessagePayload(step, "tool_calls", turn.toolCalls)); err != nil {
+			return Response{}, err
+		}
 
 		for _, toolCall := range turn.toolCalls {
 			resultText, err := r.runTool(ctx, request.SessionID, &sequence, toolCall)
@@ -182,7 +215,16 @@ func toolFollowThroughPrompt(tools []model.ToolSpec) string {
 			names = append(names, tool.Name)
 		}
 	}
-	return "You described tool-backed work but did not call a tool. Continue now by calling the available tool(s) needed for the work before giving a final answer. Do not ask the user to wait and do not only describe the next step. Available tools: " + strings.Join(names, ", ")
+	// Give the model an explicit out: tool-call OR commit to the answer it
+	// already produced. The earlier wording ("Continue now by calling the
+	// available tool(s)") sometimes pushed the model into a stuck pattern
+	// where it acknowledged the request but still refused to tool-call,
+	// then the heuristic fired again next turn and the run timed out at
+	// max_steps. Now we make the second turn the last word either way.
+	return "Your last reply described tool-backed work but did not call a tool. " +
+		"Either call the appropriate tool now (available: " + strings.Join(names, ", ") + ") " +
+		"or treat your previous reply as the final answer if you no longer need a tool. " +
+		"Do not write another \"I'll check...\" message — the next response will end the turn."
 }
 
 func containsAny(text string, needles []string) bool {
@@ -300,6 +342,50 @@ func (r Runner) append(ctx context.Context, sessionID session.ID, sequence *int,
 		return fmt.Errorf("append session event: %w", err)
 	}
 	return nil
+}
+
+func buildInitialMessages(builder prompt.Builder, request Request) []model.Message {
+	scaffold := builder.Build(request.Environment, request.UserRequest)
+	combined := combinedContext(request.SessionContext, request.TurnContext)
+	if len(request.PriorMessages) == 0 {
+		return withSessionContext(scaffold, combined)
+	}
+	// scaffold ends with the new user message; insert prior messages before it.
+	if len(scaffold) == 0 {
+		return append(append([]model.Message(nil), request.PriorMessages...), model.TextMessage(model.RoleUser, request.UserRequest))
+	}
+	insertAt := len(scaffold) - 1
+	if scaffold[insertAt].Role != model.RoleUser {
+		insertAt = len(scaffold)
+	}
+	merged := make([]model.Message, 0, len(scaffold)+len(request.PriorMessages)+1)
+	merged = append(merged, scaffold[:insertAt]...)
+	merged = append(merged, request.PriorMessages...)
+	merged = append(merged, scaffold[insertAt:]...)
+	return withSessionContext(merged, combined)
+}
+
+func assistantMessagePayload(step int, status string, toolCalls []model.ToolCall) map[string]any {
+	payload := map[string]any{"step": step}
+	if status != "" {
+		payload["status"] = status
+	}
+	if len(toolCalls) == 0 {
+		return payload
+	}
+	calls := make([]map[string]any, 0, len(toolCalls))
+	for _, call := range toolCalls {
+		entry := map[string]any{
+			"id":   call.ID,
+			"name": call.Name,
+		}
+		if len(call.Arguments) > 0 {
+			entry["arguments"] = string(call.Arguments)
+		}
+		calls = append(calls, entry)
+	}
+	payload["tool_calls"] = calls
+	return payload
 }
 
 func withSessionContext(messages []model.Message, sessionContext string) []model.Message {

@@ -169,6 +169,12 @@ type model struct {
 	followTranscript bool
 	forceRepaint     bool
 	streamLoading    bool
+	// mouseCaptured tracks whether the terminal is forwarding mouse events
+	// to the program (1002-style cell motion). When false the terminal does
+	// native click-drag text selection, which is what you want for copying
+	// from chat. The `m` key in normal mode toggles this; the existing copy
+	// overlay also flips it on entry/exit.
+	mouseCaptured bool
 }
 
 type actionMsg struct {
@@ -237,6 +243,7 @@ func newModel(ctx context.Context, controller Controller, state workbench.State)
 		command:        command,
 		palette:        palette,
 		sharedTermSlot: -1,
+		mouseCaptured:  true,
 		expandedFolders: map[string]bool{
 			"": true,
 		},
@@ -523,6 +530,8 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.copySelected(true)
 	case "v", "C":
 		return m.openCopyMode()
+	case "m":
+		return m.toggleMouseCapture()
 	case "a":
 		if m.focus != focusContext {
 			m.state.Notice = "focus the right pane to approve"
@@ -740,7 +749,13 @@ func (m model) handleDetailOverlayKey(key string) (tea.Model, tea.Cmd) {
 	case "esc", "q":
 		m.overlay = overlayNone
 		m.mode = modeNormal
-		return m, tea.EnableMouseCellMotion
+		// Restore whatever the user's last mouse-capture preference was,
+		// rather than always re-enabling capture and surprising users who
+		// turned it off.
+		if m.mouseCaptured {
+			return m, tea.EnableMouseCellMotion
+		}
+		return m, tea.DisableMouse
 	case "ctrl+f", "pgdown":
 		m.detail.ViewDown()
 		return m, nil
@@ -936,8 +951,36 @@ func (m model) headerView() string {
 	return headerStyle.Width(m.width).Render(truncate(status, m.width-2))
 }
 
+// focusedPaneView renders only the focused pane at full body width. Used
+// when mouse capture is released so the user can mouse-select cleanly
+// without accidentally grabbing content from other panes. The selected
+// pane gets full width so wrapped lines are not cramped.
+func (m model) focusedPaneView(width int, height int) string {
+	width = max(10, width)
+	height = max(1, height)
+	switch {
+	case m.terminalExpanded():
+		return paneStyle(true).Width(width).Height(height).Render(m.expandedTerminalView(width, height))
+	case m.focus == focusAgents:
+		return paneStyle(true).Width(width).Height(height).Render(m.leftView(width, height))
+	case m.focus == focusContext:
+		return paneStyle(true).Width(width).Height(height).Render(m.rightView(width, height))
+	default:
+		return paneStyle(true).Width(width).Height(height).Render(m.centerView(width, height))
+	}
+}
+
 func (m model) bodyView() string {
 	bodyH := m.bodyHeight()
+	// When mouse capture is off the user is trying to mouse-select. Render
+	// only the focused pane fullscreen so terminal selection is naturally
+	// constrained to that pane's content — left/right panes never appear on
+	// the screen so the drag rectangle can't accidentally pick up agent
+	// names or right-pane file lists. Re-enabling mouse with `m` restores
+	// the multi-pane layout.
+	if !m.mouseCaptured {
+		return m.focusedPaneView(m.width, bodyH)
+	}
 	leftW, centerW, rightW := m.paneWidths()
 	var panes []string
 	if leftW > 0 {
@@ -973,7 +1016,7 @@ func (m model) composerView() string {
 	case modeInsert:
 		return composerStyle.Width(width).Render("INSERT  Enter send  Esc normal\n" + m.composer.View())
 	default:
-		status := "NORMAL  i prompt  : command  ! shell  :term terminal  :st share  Ctrl+K palette  Ctrl+H/L panes  h/l left/right local  j/k select  Enter activate  y copy  v select"
+		status := "NORMAL  i prompt  : command  ! shell  :term terminal  :st share  Ctrl+K palette  Ctrl+H/L panes  h/l left/right local  j/k select  Enter activate  y copy  v select  m mouse"
 		if m.busy {
 			status += "  running"
 		}
@@ -991,7 +1034,7 @@ func (m model) noticeView() string {
 		notice = "editor unavailable: " + detail
 	}
 	if notice == "" {
-		notice = "j/k move  Ctrl+H/L panes  h/l left/right local  Enter activate  :s swarm  :! shell  :term terminal  d detail  y copy  v select  q quit"
+		notice = "j/k move  Ctrl+H/L panes  h/l left/right local  Enter activate  :s swarm  :! shell  :term terminal  d detail  y copy  v select  m mouse  q quit"
 	}
 	return noticeStyle.Width(m.width).Render(truncate(notice, m.width-2))
 }
@@ -1487,6 +1530,8 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m.copySelected(true)
 	case "item.copy.select":
 		return m.openCopyMode()
+	case "mouse.toggle":
+		return m.toggleMouseCapture()
 	case "approval.approve":
 		return m.approveSelected()
 	case "approval.reject":
@@ -2473,6 +2518,24 @@ func (m model) openCopyMode() (tea.Model, tea.Cmd) {
 	m.overlay = overlayCopy
 	m.mode = modeNormal
 	m.state.Notice = "copy mode: select text with mouse and press Cmd+C, Esc returns"
+	m.mouseCaptured = false
+	return m, tea.DisableMouse
+}
+
+// toggleMouseCapture flips terminal mouse capture. With capture off the
+// terminal does native click-drag selection AND we fullscreen the focused
+// pane so the selection is constrained to that pane's content (the user
+// asked for "select only within the focused panel not everywhere"). With
+// capture on, scroll wheel scrolls panes and the multi-pane layout returns.
+// Default is on; pressing `m` flips it. Hgh/Ctrl+H/L still moves focus
+// while in copy mode if the user wants a different pane fullscreened.
+func (m model) toggleMouseCapture() (tea.Model, tea.Cmd) {
+	m.mouseCaptured = !m.mouseCaptured
+	if m.mouseCaptured {
+		m.state.Notice = "mouse capture on: multi-pane layout; scroll wheel scrolls; press m to copy a single pane"
+		return m, tea.EnableMouseCellMotion
+	}
+	m.state.Notice = "copy mode: focused pane is fullscreen; click-drag to select, Cmd/Ctrl+C to copy; press m to return"
 	return m, tea.DisableMouse
 }
 

@@ -1512,6 +1512,7 @@ func DefaultCommands() []Command {
 		command("item.copy", "Copy selected item", "Files", "Copy the selected message, code block, or artifact.", "y", "copy", "clipboard"),
 		command("item.copy.full", "Copy with fences", "Files", "Copy the full selected code artifact, preserving code fences when available.", "Y", "copy", "fences", "clipboard"),
 		command("item.copy.select", "Copy selection mode", "Files", "Temporarily release mouse capture so terminal selection and Cmd+C can copy visible text.", "v", "copy", "mouse", "selection", "cmd+c"),
+		command("mouse.toggle", "Toggle mouse capture", "Files", "Toggle terminal mouse capture. Off = native click-drag selection works in chat. On = scroll wheel scrolls panes.", "m", "mouse", "scroll", "select", "copy"),
 		command("approval.approve", "Approve selected action", "Approvals", "Approve and apply the selected pending tool, patch, or write action.", "a", "approve", "apply", "permission"),
 		command("approval.reject", "Reject selected action", "Approvals", "Reject the selected pending tool, patch, or write action.", "r", "reject", "permission"),
 		command("approval.cycle", "Cycle approval mode", "Approvals", "Cycle read-only -> ask -> auto.", "Ctrl+A", "approval", "auto approve", "permissions"),

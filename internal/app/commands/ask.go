@@ -22,6 +22,12 @@ type AskOptions struct {
 	MaxSteps        int
 	MaxInputTokens  int
 	MaxOutputTokens int
+	// IncludeHistory replays prior user/assistant/tool messages from the
+	// session log as real chat messages instead of folding them into a
+	// textual SessionContext blob. This is what the interactive workbench
+	// wants — so the agent sees its own prior tool_call_ids and can
+	// reference them. Default is false to keep the headless `ask` CLI lean.
+	IncludeHistory bool
 }
 
 type AskDependencies struct {
@@ -75,9 +81,29 @@ func AskWithResponse(ctx context.Context, w io.Writer, deps AskDependencies, opt
 	if sessionContextMax <= 0 {
 		sessionContextMax = 4096
 	}
-	sessionContext, _, err := contextmgr.BuildSessionContext(ctx, deps.Log, sessionID, sessionContextMax)
-	if err != nil {
-		return orchestrator.Response{}, err
+
+	var priorMessages []model.Message
+	var sessionContext string
+	if opts.IncludeHistory {
+		messages, err := contextmgr.LoadMessageHistory(ctx, deps.Log, sessionID)
+		if err != nil {
+			return orchestrator.Response{}, err
+		}
+		// Cap the replayed history at half the input budget so we leave
+		// headroom for tools, the system prompt, and the new user turn.
+		historyBudget := sessionContextMax * 4
+		if budget.MaxInputTokens > 0 {
+			if half := budget.MaxInputTokens / 2; half > historyBudget {
+				historyBudget = half
+			}
+		}
+		priorMessages = contextmgr.HistoryWithBudget(messages, historyBudget)
+	} else {
+		ctxText, _, err := contextmgr.BuildSessionContext(ctx, deps.Log, sessionID, sessionContextMax)
+		if err != nil {
+			return orchestrator.Response{}, err
+		}
+		sessionContext = ctxText
 	}
 
 	response, err := orchestrator.Runner{
@@ -94,6 +120,7 @@ func AskWithResponse(ctx context.Context, w io.Writer, deps AskDependencies, opt
 		SessionContext: sessionContext,
 		TurnContext:    opts.TurnContext,
 		ContextBudget:  budget,
+		PriorMessages:  priorMessages,
 	})
 	if err != nil {
 		return orchestrator.Response{}, err

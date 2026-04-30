@@ -209,8 +209,10 @@ func TestAskUsesConfiguredAnthropicCompatibleProvider(t *testing.T) {
 			t.Fatalf("Decode request body: %v", err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSEEvent(t, w, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
 		writeSSEEvent(t, w, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "anthropic ok"}})
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		writeSSEEvent(t, w, map[string]any{"type": "content_block_stop", "index": 0})
+		writeSSEEvent(t, w, map[string]any{"type": "message_stop"})
 	}))
 	defer server.Close()
 
@@ -1059,15 +1061,39 @@ func withChdir(t *testing.T, dir string) {
 	})
 }
 
+// writeSSEEvent emits a server-sent event. When the value carries a
+// top-level "type" field (Anthropic stream events), we mirror it as the
+// SSE `event:` field so the SDK's typed dispatcher can route it.
 func writeSSEEvent(t *testing.T, w io.Writer, value any) {
 	t.Helper()
 	data, err := json.Marshal(value)
 	if err != nil {
 		t.Fatalf("Marshal SSE event: %v", err)
 	}
+	if eventType, ok := extractSSEEventType(value); ok {
+		_, _ = io.WriteString(w, "event: ")
+		_, _ = io.WriteString(w, eventType)
+		_, _ = io.WriteString(w, "\n")
+	}
 	_, _ = io.WriteString(w, "data: ")
 	_, _ = w.Write(data)
 	_, _ = io.WriteString(w, "\n\n")
+}
+
+func extractSSEEventType(value any) (string, bool) {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	t, ok := m["type"].(string)
+	if !ok || t == "" {
+		return "", false
+	}
+	switch t {
+	case "message_start", "message_delta", "message_stop", "content_block_start", "content_block_delta", "content_block_stop", "ping", "completion":
+		return t, true
+	}
+	return "", false
 }
 
 func writeTextSSE(t *testing.T, w io.Writer, text string) {
