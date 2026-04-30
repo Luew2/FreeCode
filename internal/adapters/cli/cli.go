@@ -1142,6 +1142,8 @@ func runProvider(args []string, stdout io.Writer, stderr io.Writer) int {
 		return runProviderAdd(args[1:], stdout, stderr)
 	case "list":
 		return runProviderList(args[1:], stdout, stderr)
+	case "use":
+		return runProviderUse(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		_ = printProviderUsage(stdout)
 		return 0
@@ -1150,6 +1152,26 @@ func runProvider(args []string, stdout io.Writer, stderr io.Writer) int {
 		_ = printProviderUsage(stderr)
 		return 2
 	}
+}
+
+func runProviderUse(args []string, stdout io.Writer, stderr io.Writer) int {
+	var configPath string
+	fs := flag.NewFlagSet("provider use", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&configPath, "config", tomlconfig.DefaultPath, "config path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(stderr, "usage: provider use <name|provider/model>\n")
+		return 2
+	}
+	store := tomlconfig.New(configPath)
+	if err := commands.UseProvider(context.Background(), stdout, store, fs.Arg(0)); err != nil {
+		fmt.Fprintf(stderr, "provider use: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func runProviderAdd(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -1208,7 +1230,8 @@ func printProviderUsage(w io.Writer) error {
 	_, err := fmt.Fprintf(w, `Usage:
   %s provider add --name NAME --base-url URL --api-key-env ENV --model MODEL --protocol openai-chat|anthropic-messages|auto [--context-window N] [--max-output-tokens N] [--config PATH] [--skip-probe]
   %s provider list [--config PATH]
-`, commands.AppName, commands.AppName)
+  %s provider use NAME|PROVIDER/MODEL [--config PATH]
+`, commands.AppName, commands.AppName, commands.AppName)
 	return err
 }
 

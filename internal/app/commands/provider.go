@@ -10,6 +10,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/Luew2/FreeCode/internal/core/config"
 	"github.com/Luew2/FreeCode/internal/core/model"
 	"github.com/Luew2/FreeCode/internal/ports"
 )
@@ -105,6 +106,54 @@ func AddProvider(ctx context.Context, w io.Writer, store ports.ConfigStore, prob
 	}
 	_, err = fmt.Fprintf(w, "added provider %s model %s using %s\n", opts.Name, opts.Model, provider.Protocol)
 	return err
+}
+
+// UseProvider swaps the active model to the given provider/model pair so the
+// next ask / TUI submit talks to that endpoint. Accepts either "provider"
+// (uses the provider's default_model) or "provider/model" for an explicit
+// pick. Side-effect-only: writes the updated active_model into config and
+// echoes confirmation to w.
+func UseProvider(ctx context.Context, w io.Writer, store ports.ConfigStore, ref string) error {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return errors.New("provider name (or provider/model) is required")
+	}
+	settings, err := store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	parsed, err := resolveActiveRef(settings, ref)
+	if err != nil {
+		return err
+	}
+	settings.ActiveModel = parsed
+	if err := store.Save(ctx, settings); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "active model set to %s\n", parsed.String())
+	return err
+}
+
+func resolveActiveRef(settings config.Settings, ref string) (model.Ref, error) {
+	if strings.Contains(ref, "/") {
+		parsed, err := model.ParseRef(ref)
+		if err != nil {
+			return model.Ref{}, err
+		}
+		if _, ok := settings.Models[parsed]; !ok {
+			return model.Ref{}, fmt.Errorf("model %q is not configured (run `provider list` to see available models)", parsed.String())
+		}
+		return parsed, nil
+	}
+	providerID := model.ProviderID(ref)
+	provider, ok := settings.Providers[providerID]
+	if !ok {
+		return model.Ref{}, fmt.Errorf("provider %q is not configured", ref)
+	}
+	if provider.DefaultModel == "" {
+		return model.Ref{}, fmt.Errorf("provider %q has no default_model; specify provider/model explicitly", ref)
+	}
+	return model.NewRef(providerID, provider.DefaultModel), nil
 }
 
 func ListProviders(ctx context.Context, w io.Writer, store ports.ConfigStore) error {
