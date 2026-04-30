@@ -92,6 +92,81 @@ func TestColonSSubmitsSwarmThroughMain(t *testing.T) {
 	}
 }
 
+func TestColonAgentTargetsSelectedAgent(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Approval: permission.ModeAuto,
+		Commands: workbench.DefaultCommands(),
+		Agents: []workbench.AgentItem{
+			{ID: "a1", Name: "worker", Role: "worker", Status: "running", TaskID: "task-1"},
+		},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.focus = focusAgents
+	m.leftCursor = 1 // first agent row (index 0 is the orchestrator)
+
+	next, cmd := m.executeLine(":agent investigate the bug")
+	if cmd == nil {
+		t.Fatalf(":agent returned nil cmd, want submit")
+	}
+	msg := firstActionMsg(t, cmd)
+	next, _ = next.(model).Update(msg)
+	if controller.submitted.Text != "investigate the bug" {
+		t.Fatalf("submitted = %#v, want investigate the bug", controller.submitted)
+	}
+	if controller.submitted.Target.Kind != "agent" || controller.submitted.Target.ID != "a1" {
+		t.Fatalf("target = %#v, want agent a1", controller.submitted.Target)
+	}
+	_ = next
+}
+
+func TestColonAgentRefusesWhenNothingSelected(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Approval: permission.ModeAuto,
+		Commands: workbench.DefaultCommands(),
+		Agents: []workbench.AgentItem{
+			{ID: "a1", Name: "worker", Role: "worker", Status: "running", TaskID: "task-1"},
+		},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	// leftCursor stays at 0 (the orchestrator), and ActiveConversation
+	// defaults to main — neither resolves to an agent target.
+
+	next, cmd := m.executeLine(":agent investigate the bug")
+	if cmd != nil {
+		t.Fatalf(":agent without selection returned cmd, want notice only")
+	}
+	m = next.(model)
+	if controller.submitted.Text != "" {
+		t.Fatalf("submitted = %#v, want no submission", controller.submitted)
+	}
+	if !strings.Contains(m.state.Notice, "select an agent first") {
+		t.Fatalf("notice = %q, want 'select an agent first'", m.state.Notice)
+	}
+}
+
+func TestColonAgentRoutesToActiveAgentConversation(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Approval: permission.ModeAuto,
+		Commands: workbench.DefaultCommands(),
+		Agents: []workbench.AgentItem{
+			{ID: "a2", Name: "explorer", Role: "explorer", Status: "running", TaskID: "task-2"},
+		},
+		ActiveConversation: workbench.ConversationTarget{Kind: "agent", ID: "a2", Title: "explorer"},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+
+	next, cmd := m.executeLine(":agent dig deeper")
+	if cmd == nil {
+		t.Fatalf(":agent returned nil cmd, want submit")
+	}
+	msg := firstActionMsg(t, cmd)
+	next, _ = next.(model).Update(msg)
+	if controller.submitted.Target.Kind != "agent" || controller.submitted.Target.ID != "a2" {
+		t.Fatalf("target = %#v, want active agent a2", controller.submitted.Target)
+	}
+	_ = next
+}
+
 func TestInsertLeadingColonCommandRunsCommandInsteadOfChat(t *testing.T) {
 	controller := &fakeController{state: workbench.State{Approval: permission.ModeAuto, Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)

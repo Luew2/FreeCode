@@ -77,7 +77,11 @@ func TestWorkbenchApprovalModeIsPassedToSubmit(t *testing.T) {
 }
 
 func TestWorkbenchAcceptsColonSendAgentAndOpenAliases(t *testing.T) {
-	controller := &fakeController{state: workbench.State{Approval: permission.ModeAsk, Mode: "NORMAL"}}
+	controller := &fakeController{state: workbench.State{
+		Approval:           permission.ModeAsk,
+		Mode:               "NORMAL",
+		ActiveConversation: workbench.ConversationTarget{Kind: "agent", ID: "a1", Title: "worker"},
+	}}
 	var out bytes.Buffer
 
 	err := Run(context.Background(), Options{
@@ -95,6 +99,9 @@ func TestWorkbenchAcceptsColonSendAgentAndOpenAliases(t *testing.T) {
 	if controller.submissions[1].Text != "implement thing" || controller.submissions[1].Swarm {
 		t.Fatalf("second submission = %#v, want directed non-swarm prompt", controller.submissions[1])
 	}
+	if controller.submissions[1].Target.Kind != "agent" || controller.submissions[1].Target.ID != "a1" {
+		t.Fatalf("second submission target = %#v, want agent a1", controller.submissions[1].Target)
+	}
 	if controller.submissions[2].Text != "ship it" || !controller.submissions[2].Swarm {
 		t.Fatalf("third submission = %#v, want swarm prompt", controller.submissions[2])
 	}
@@ -103,6 +110,27 @@ func TestWorkbenchAcceptsColonSendAgentAndOpenAliases(t *testing.T) {
 	}
 	if controller.opened != "m1" {
 		t.Fatalf("opened = %q, want m1", controller.opened)
+	}
+}
+
+func TestWorkbenchColonAgentRefusesWithoutActiveAgentConversation(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Approval: permission.ModeAsk, Mode: "NORMAL"}}
+	var out bytes.Buffer
+
+	err := Run(context.Background(), Options{
+		In:        strings.NewReader(":agent implement thing\nq\n"),
+		Out:       &out,
+		Workbench: controller,
+		Width:     90,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(controller.submissions) != 0 {
+		t.Fatalf("submissions = %#v, want no submissions when no agent is active", controller.submissions)
+	}
+	if !strings.Contains(out.String(), "select an agent first") {
+		t.Fatalf("output = %q, want select-an-agent notice", out.String())
 	}
 }
 

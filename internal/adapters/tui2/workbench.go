@@ -1751,8 +1751,7 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		m.composer.SetValue(strings.TrimSpace(strings.TrimPrefix(line, ":s ")))
 		return m.submit(true)
 	case strings.HasPrefix(line, ":agent "):
-		m.composer.SetValue(strings.TrimSpace(strings.TrimPrefix(line, ":agent ")))
-		return m.submit(false)
+		return m.submitToAgent(strings.TrimSpace(strings.TrimPrefix(line, ":agent ")))
 	case line == ":o":
 		return m.openSelected()
 	case strings.HasPrefix(line, ":o "):
@@ -2330,6 +2329,47 @@ func (m model) submit(swarm bool) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(m.actionCmd(runID, func(ctx context.Context) (workbench.State, error) {
 		return m.controller.SubmitPrompt(ctx, request)
 	}), streamTickCmd(runID))
+}
+
+// submitToAgent routes ":agent <prompt>" to the agent the user has currently
+// selected (or, if the active conversation is already an agent, that one).
+// Without an agent target the previous implementation silently fell back to
+// the main orchestrator, which is the wrong default — the user explicitly
+// asked for an agent. Emit a notice instead so the workflow stays explicit.
+func (m model) submitToAgent(text string) (tea.Model, tea.Cmd) {
+	if m.busy {
+		m.state.Notice = "agent is still running; wait for it to finish before sending another prompt"
+		return m, nil
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		m.state.Notice = "prompt is empty"
+		return m, nil
+	}
+	target, ok := m.agentTargetForCommand()
+	if !ok {
+		m.state.Notice = "select an agent first"
+		return m, nil
+	}
+	m.state.ActiveConversation = target
+	m.composer.SetValue(text)
+	return m.submit(false)
+}
+
+// agentTargetForCommand resolves which agent ":agent <prompt>" should
+// address. Preference order: (1) the active conversation if it is an
+// agent, (2) the agent currently highlighted in the agents pane.
+// Returns (zero, false) when neither is an agent — that case is the
+// caller's signal to surface a "select an agent first" notice rather
+// than silently submitting to the main orchestrator.
+func (m model) agentTargetForCommand() (workbench.ConversationTarget, bool) {
+	if m.state.ActiveConversation.Kind == "agent" && strings.TrimSpace(m.state.ActiveConversation.ID) != "" {
+		return m.state.ActiveConversation, true
+	}
+	if target, ok := m.selectedConversationTarget(); ok && target.Kind == "agent" {
+		return target, true
+	}
+	return workbench.ConversationTarget{}, false
 }
 
 func composerTextIsCommand(text string) bool {

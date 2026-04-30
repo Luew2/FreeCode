@@ -202,7 +202,7 @@ func handleCommand(ctx context.Context, controller Controller, state workbench.S
 	case strings.HasPrefix(line, "swarm "):
 		return submit(ctx, controller, state.Approval, strings.TrimSpace(strings.TrimPrefix(line, "swarm ")), true)
 	case strings.HasPrefix(line, ":agent "):
-		return submit(ctx, controller, state.Approval, strings.TrimSpace(strings.TrimPrefix(line, ":agent ")), false)
+		return submitToAgent(ctx, controller, state, strings.TrimSpace(strings.TrimPrefix(line, ":agent ")))
 	case strings.HasPrefix(line, "y ") || strings.HasPrefix(line, "Y "):
 		if controller == nil {
 			return state, false, errors.New("workbench controller is required")
@@ -264,6 +264,28 @@ func submit(ctx context.Context, controller Controller, approval permission.Mode
 		return workbench.State{}, false, errors.New("workbench controller is required")
 	}
 	next, err := controller.SubmitPrompt(ctx, workbench.SubmitRequest{Text: text, Approval: approval, Swarm: swarm})
+	return next, false, err
+}
+
+// submitToAgent routes ":agent <prompt>" to the active agent conversation
+// rather than the default main orchestrator. Without an agent target the
+// command is a no-op with a notice — the previous implementation silently
+// fell through to the main orchestrator, which is the wrong default given
+// the user explicitly asked for an agent.
+func submitToAgent(ctx context.Context, controller Controller, state workbench.State, text string) (workbench.State, bool, error) {
+	if controller == nil {
+		return workbench.State{}, false, errors.New("workbench controller is required")
+	}
+	target := state.ActiveConversation
+	if target.Kind != "agent" || strings.TrimSpace(target.ID) == "" {
+		state.Notice = "select an agent first"
+		return state, false, nil
+	}
+	next, err := controller.SubmitPrompt(ctx, workbench.SubmitRequest{
+		Text:     text,
+		Approval: state.Approval,
+		Target:   target,
+	})
 	return next, false, err
 }
 
