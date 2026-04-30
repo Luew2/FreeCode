@@ -16,11 +16,18 @@ import (
 
 type Verify struct {
 	gate    ports.PermissionGate
+	root    string
 	timeout time.Duration
 }
 
-func NewVerify(gate ports.PermissionGate) *Verify {
-	return &Verify{gate: gate, timeout: 2 * time.Minute}
+// NewVerify constructs a verifier that runs allowlisted commands. root is
+// the workspace root: the verifier sets cmd.Dir to root so checks run
+// inside the workspace (not the freecode process cwd) and rejects package
+// arguments that escape root with ".." or absolute paths. An empty root
+// falls back to "." which matches the legacy behavior; pass an explicit
+// root in production.
+func NewVerify(gate ports.PermissionGate, root string) *Verify {
+	return &Verify{gate: gate, root: root, timeout: 2 * time.Minute}
 }
 
 func (t *Verify) ToolSpec() model.ToolSpec {
@@ -78,6 +85,9 @@ func (t *Verify) Run(ctx context.Context, call model.ToolCall) (ports.ToolResult
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
+	if t != nil && strings.TrimSpace(t.root) != "" {
+		cmd.Dir = t.root
+	}
 	output, err := cmd.CombinedOutput()
 	content := strings.TrimSpace(string(output))
 	if content == "" {
@@ -115,6 +125,9 @@ func allowedCheck(command string) ([]string, error) {
 			if strings.Contains(arg, ";") || strings.Contains(arg, "&&") || strings.Contains(arg, "|") {
 				return nil, fmt.Errorf("run_check command %q is not allowed", command)
 			}
+			if err := validatePackageArg(arg); err != nil {
+				return nil, err
+			}
 		}
 		return fields, nil
 	case "vet":
@@ -123,4 +136,34 @@ func allowedCheck(command string) ([]string, error) {
 		}
 	}
 	return nil, fmt.Errorf("run_check command %q is not allowed", command)
+}
+
+// validatePackageArg rejects `go test` package arguments that would leave
+// the workspace. We allow:
+//   - flags ("-race") — caller already enforces the allowlist.
+//   - the canonical `./...` selector and other relative paths under cwd.
+//
+// We reject:
+//   - absolute paths ("/etc", "/tmp/...").
+//   - any path containing a "..": both the dotted parent and any segment
+//     that would walk out of the workspace.
+func validatePackageArg(arg string) error {
+	if strings.HasPrefix(arg, "-") {
+		return nil
+	}
+	if arg == "" {
+		return fmt.Errorf("run_check package arg is empty")
+	}
+	if strings.HasPrefix(arg, "/") {
+		return fmt.Errorf("run_check package %q must stay inside the workspace", arg)
+	}
+	// Reject any segment that is ".." or starts with "../"; this catches
+	// "../...", "../../foo", "foo/../bar" and similar attempts to walk
+	// out of the workspace through an apparently-relative path.
+	for _, segment := range strings.Split(arg, "/") {
+		if segment == ".." {
+			return fmt.Errorf("run_check package %q must stay inside the workspace", arg)
+		}
+	}
+	return nil
 }

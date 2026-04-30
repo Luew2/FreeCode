@@ -21,7 +21,10 @@ func (g StaticPermissionGate) Decide(ctx context.Context, request permission.Req
 		return "", err
 	}
 	decision := g.Policy.DecisionFor(request.Action)
-	if decision == permission.DecisionAllow && request.Action == permission.ActionWrite && !pathPolicyAllows(g.Policy, request.Subject) {
+	// Path scopes apply uniformly to filesystem actions: a session that
+	// restricts AllowedPaths/DeniedPaths must restrict reads as well as
+	// writes, otherwise a "scoped" agent can still exfiltrate everything.
+	if decision == permission.DecisionAllow && (request.Action == permission.ActionWrite || request.Action == permission.ActionRead) && !pathPolicyAllows(g.Policy, request.Subject) {
 		return permission.DecisionDeny, nil
 	}
 	return decision, nil

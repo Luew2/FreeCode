@@ -370,7 +370,7 @@ func buildRuntime(ctx context.Context, configPath string, launch sessionLaunch, 
 	if approvalMode == permission.ModeAuto {
 		verifyPolicy.Shell = permission.DecisionAllow
 	}
-	verifyTools := builtin.NewVerifier(workspace.FileSystem(), builtin.NewStaticPermissionGate(verifyPolicy))
+	verifyTools := builtin.NewVerifier(workspace.FileSystem(), builtin.NewStaticPermissionGate(verifyPolicy), workspace.Root())
 	return runtimeBundle{
 		Workspace:     workspace,
 		Git:           git,
@@ -428,7 +428,7 @@ func buildSwarmUseCase(ctx context.Context, bundle runtimeBundle, log ports.Even
 					if task.Autonomy.Approval == permission.ModeAuto {
 						policy.Shell = permission.DecisionAllow
 					}
-					return builtin.NewVerifier(bundle.Workspace.FileSystem(), builtin.NewStaticPermissionGate(policy))
+					return builtin.NewVerifier(bundle.Workspace.FileSystem(), builtin.NewStaticPermissionGate(policy), bundle.Workspace.Root())
 				}
 				if task.Role != agent.RoleWorker {
 					return bundle.ReadTools
@@ -710,7 +710,11 @@ func runMainOwnedSwarm(ctx context.Context, configPath string, bundle runtimeBun
 	if request.Approval == permission.ModeReadOnly {
 		tools = bundle.ReadTools
 	}
-	tools = mergeToolRegistries(tools, request.TerminalTools)
+	terminalTools := request.TerminalTools
+	if request.Approval == permission.ModeReadOnly {
+		terminalTools = tui2.FilterReadOnlyTerminalTools(terminalTools)
+	}
+	tools = mergeToolRegistries(tools, terminalTools)
 	tools, err := withDelegationTools(ctx, bundle, service.Log, sessionID, request.Approval, "main", tools)
 	if err != nil {
 		return err
@@ -949,7 +953,11 @@ func runTUI(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) 
 			if request.Approval == permission.ModeReadOnly {
 				tools = bundle.ReadTools
 			}
-			tools = mergeToolRegistries(tools, request.TerminalTools)
+			terminalTools := request.TerminalTools
+			if request.Approval == permission.ModeReadOnly {
+				terminalTools = tui2.FilterReadOnlyTerminalTools(terminalTools)
+			}
+			tools = mergeToolRegistries(tools, terminalTools)
 			activeSessionID := workbenchService.SessionID
 			if request.Swarm {
 				return runMainOwnedSwarm(ctx, configPath, bundle, workbenchService, request)

@@ -15,6 +15,10 @@ var _ ports.ToolRegistry = terminalToolRegistry{}
 type terminalToolRegistry struct {
 	term *terminalSession
 	slot int
+	// readOnly drops terminal_write so a read-only session cannot mutate
+	// the user's terminal. It is set by FilterReadOnlyTerminalTools when
+	// the active approval is permission.ModeReadOnly.
+	readOnly bool
 }
 
 type terminalReadArgs struct {
@@ -34,8 +38,23 @@ func newTerminalToolRegistry(term *terminalSession, slot int) ports.ToolRegistry
 	return terminalToolRegistry{term: term, slot: slot}
 }
 
+// FilterReadOnlyTerminalTools strips terminal_write from a terminal tool
+// registry so it can be safely merged into a read-only session. Non-terminal
+// registries pass through unchanged. Returns nil when registry is nil so
+// callers can chain it.
+func FilterReadOnlyTerminalTools(registry ports.ToolRegistry) ports.ToolRegistry {
+	if registry == nil {
+		return nil
+	}
+	if base, ok := registry.(terminalToolRegistry); ok {
+		base.readOnly = true
+		return base
+	}
+	return registry
+}
+
 func (r terminalToolRegistry) Tools() []coremodel.ToolSpec {
-	return []coremodel.ToolSpec{
+	specs := []coremodel.ToolSpec{
 		{
 			Name:        "terminal_read",
 			Description: "Read recent output from the explicitly shared FreeCode terminal. If the user asks whether you can see or use the terminal, call this tool instead of answering from memory.",
@@ -46,7 +65,9 @@ func (r terminalToolRegistry) Tools() []coremodel.ToolSpec {
 				},
 			},
 		},
-		{
+	}
+	if !r.readOnly {
+		specs = append(specs, coremodel.ToolSpec{
 			Name:        "terminal_write",
 			Description: "Write text or a command to the explicitly shared FreeCode terminal. If the user asks you to run a terminal command, call this tool; do not merely say you will run it. Use terminal_read after commands.",
 			InputSchema: map[string]any{
@@ -57,8 +78,9 @@ func (r terminalToolRegistry) Tools() []coremodel.ToolSpec {
 					"enter":   map[string]any{"type": "boolean", "description": "Whether to press Enter after sending text."},
 				},
 			},
-		},
+		})
 	}
+	return specs
 }
 
 func (r terminalToolRegistry) RunTool(ctx context.Context, call coremodel.ToolCall) (ports.ToolResult, error) {
@@ -87,6 +109,9 @@ func (r terminalToolRegistry) RunTool(ctx context.Context, call coremodel.ToolCa
 			},
 		}, nil
 	case "terminal_write":
+		if r.readOnly {
+			return ports.ToolResult{}, fmt.Errorf("terminal_write is not allowed in read-only mode")
+		}
 		var args terminalWriteArgs
 		if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			return ports.ToolResult{}, fmt.Errorf("terminal_write arguments: %w", err)

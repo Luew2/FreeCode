@@ -18,15 +18,15 @@ type Registry struct {
 
 func NewWritable(fs ports.FileSystem, gate ports.PermissionGate) *Registry {
 	return &Registry{
-		read:       NewReadOnly(fs),
+		read:       NewReadOnlyWithGate(fs, gate),
 		applyPatch: NewApplyPatch(fs, gate),
 	}
 }
 
-func NewVerifier(fs ports.FileSystem, gate ports.PermissionGate) *Registry {
+func NewVerifier(fs ports.FileSystem, gate ports.PermissionGate, root string) *Registry {
 	return &Registry{
-		read:   NewReadOnly(fs),
-		verify: NewVerify(gate),
+		read:   NewReadOnlyWithGate(fs, gate),
+		verify: NewVerify(gate, root),
 	}
 }
 

@@ -76,7 +76,7 @@ func withDelegationTools(ctx context.Context, bundle runtimeBundle, log ports.Ev
 				if task.Autonomy.Approval == permission.ModeAuto {
 					policy.Shell = permission.DecisionAllow
 				}
-				roleTools = builtin.NewVerifier(bundle.Workspace.FileSystem(), builtin.NewStaticPermissionGate(policy))
+				roleTools = builtin.NewVerifier(bundle.Workspace.FileSystem(), builtin.NewStaticPermissionGate(policy), bundle.Workspace.Root())
 			} else if task.Role == agent.RoleWorker {
 				policy := permission.MergePolicyWithMode(task.Permissions, task.Autonomy.Approval)
 				policy.AllowedPaths = append([]string(nil), task.AllowedPaths...)
