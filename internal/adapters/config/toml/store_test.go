@@ -135,6 +135,53 @@ func TestStoreRoundTripsEditorSettings(t *testing.T) {
 	}
 }
 
+func TestStoreAtomicWriteRoundTrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".freecode")
+	path := filepath.Join(dir, "config.toml")
+	store := New(path)
+
+	settings := config.DefaultSettings()
+	settings.Providers["local"] = model.Provider{
+		ID:           "local",
+		Name:         "local",
+		Protocol:     "openai-chat",
+		BaseURL:      "https://api.example.test/v1",
+		Secret:       model.SecretRef{Name: "LOCAL_API_KEY", Source: "env"},
+		DefaultModel: "coder",
+		Enabled:      true,
+	}
+	settings.ActiveModel = model.NewRef("local", "coder")
+	settings.Models[settings.ActiveModel] = model.NewModel("local", "coder")
+
+	if err := store.Save(context.Background(), settings); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	// Save again — exercising the rename-over-existing path.
+	if err := store.Save(context.Background(), settings); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+
+	loaded, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.Providers["local"].BaseURL != "https://api.example.test/v1" {
+		t.Fatalf("provider lost across atomic save round trip: %#v", loaded.Providers["local"])
+	}
+
+	// No leftover temp files in the config directory — the rename
+	// should consume the temp and there should be no orphans.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read config dir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp") {
+			t.Fatalf("found leftover temp file %q after atomic save", entry.Name())
+		}
+	}
+}
+
 func TestLoadMissingConfigReturnsDefaults(t *testing.T) {
 	loaded, err := New(filepath.Join(t.TempDir(), ".freecode", "config.toml")).Load(context.Background())
 	if err != nil {

@@ -72,11 +72,50 @@ func (s *Store) Save(ctx context.Context, settings config.Settings) error {
 		return fmt.Errorf("encode config %s: %w", s.path, err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return fmt.Errorf("create config directory %s: %w", filepath.Dir(s.path), err)
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create config directory %s: %w", dir, err)
 	}
-	if err := os.WriteFile(s.path, data, 0o600); err != nil {
-		return fmt.Errorf("write config %s: %w", s.path, err)
+	return atomicWrite(s.path, data, 0o600)
+}
+
+// atomicWrite writes data to a sibling temp file in the target directory,
+// fsyncs it, closes it, then renames over the target. The previous
+// implementation used os.WriteFile which truncates first and writes second
+// — an interrupted save (SIGKILL, power loss, OOM) left the user with an
+// empty or half-written config. Same-directory rename is atomic on POSIX
+// and on NTFS via ReplaceFileW; Go's os.Rename uses the right primitive.
+func atomicWrite(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	// Best-effort cleanup if anything below fails before the rename.
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod temp file %s: %w", tmpPath, err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return fmt.Errorf("write temp file %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("sync temp file %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temp file %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename temp file over %s: %w", path, err)
 	}
 	return nil
 }
