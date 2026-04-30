@@ -86,6 +86,41 @@ func TestLoadMessageHistoryReplaysUserAssistantToolGroup(t *testing.T) {
 	}
 }
 
+func TestLoadMessageHistorySkipsReasoningAssistantEvents(t *testing.T) {
+	log := &fakeLog{}
+	now := time.Now()
+	sessionID := session.ID("s1")
+	events := []session.Event{
+		{ID: "e1", SessionID: sessionID, Type: session.EventUserMessage, At: now, Actor: "user", Text: "find the bug"},
+		{ID: "e2", SessionID: sessionID, Type: session.EventAssistantMessage, At: now, Actor: "assistant", Text: "let me think about this carefully...", Payload: map[string]any{"step": 1, "status": "reasoning"}},
+		{ID: "e3", SessionID: sessionID, Type: session.EventAssistantMessage, At: now, Actor: "assistant", Text: "The bug is in handler.go.", Payload: map[string]any{"step": 2, "status": "final"}},
+	}
+	for _, e := range events {
+		_ = log.Append(context.Background(), e)
+	}
+
+	got, err := LoadMessageHistory(context.Background(), log, sessionID)
+	if err != nil {
+		t.Fatalf("LoadMessageHistory returned error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("messages = %d, want 2 (reasoning event filtered out)", len(got))
+	}
+	for _, message := range got {
+		for _, part := range message.Content {
+			if part.Text == "let me think about this carefully..." {
+				t.Fatalf("messages = %#v, must not include reasoning text", got)
+			}
+		}
+	}
+	if got[0].Role != model.RoleUser || got[0].Content[0].Text != "find the bug" {
+		t.Fatalf("messages[0] = %#v, want user prompt", got[0])
+	}
+	if got[1].Role != model.RoleAssistant || got[1].Content[0].Text != "The bug is in handler.go." {
+		t.Fatalf("messages[1] = %#v, want final assistant reply", got[1])
+	}
+}
+
 func TestLoadMessageHistorySkipsMalformedAssistantPayload(t *testing.T) {
 	log := &fakeLog{}
 	sessionID := session.ID("s1")

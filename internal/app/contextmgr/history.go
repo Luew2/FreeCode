@@ -39,6 +39,14 @@ func LoadMessageHistory(ctx context.Context, log ports.EventLog, sessionID sessi
 			}
 			messages = append(messages, model.TextMessage(model.RoleUser, text))
 		case session.EventAssistantMessage:
+			// Reasoning / chain-of-thought events are diagnostic only.
+			// Replaying them as visible chat history confuses the model
+			// in subsequent turns — they look like prior assistant
+			// answers rather than internal scratch text. Other internal
+			// statuses (empty_retry, etc.) are likewise filtered upstream.
+			if assistantStatus(event) == "reasoning" {
+				continue
+			}
 			msg := assistantFromEvent(event)
 			if isAssistantEmpty(msg) {
 				continue
@@ -141,6 +149,21 @@ func toolFromEvent(event session.Event) (model.Message, bool) {
 	msg := model.TextMessage(model.RoleTool, text)
 	msg.ToolCallID = callID
 	return msg, true
+}
+
+// assistantStatus extracts the "status" field of an assistant event payload
+// when it is a string. Returns "" when the payload is missing the field or
+// the value is not a string. This mirrors the contract orchestrator/Runner
+// uses when emitting events: status is always a string when present.
+func assistantStatus(event session.Event) string {
+	if event.Payload == nil {
+		return ""
+	}
+	value, ok := event.Payload["status"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func isAssistantEmpty(msg model.Message) bool {
