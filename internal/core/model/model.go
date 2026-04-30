@@ -193,6 +193,12 @@ type Event struct {
 	Usage    *Usage
 	Error    string
 	Metadata map[string]string
+	// Reasoning marks an EventTextDelta as model-internal chain-of-thought
+	// (delta.reasoning / reasoning_content / thinking) rather than the
+	// user-facing answer. The orchestrator renders these as a separate
+	// transcript kind so the chat does not read like a stream of
+	// consciousness with reasoning concatenated to the final text.
+	Reasoning bool
 	// Diagnostics is populated on EventCompleted to surface what the model
 	// actually returned: finish_reason, chunk count, the count of tool
 	// calls dropped because of missing fields, raw last-chunk JSON when

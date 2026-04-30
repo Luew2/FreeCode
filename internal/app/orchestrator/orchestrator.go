@@ -158,6 +158,15 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 				return Response{}, err
 			}
 		}
+		// Persist reasoning as a separate transcript-friendly event so the
+		// workbench can render it as "thinking" rather than folding it
+		// into the user-facing assistant text. Logged regardless of
+		// whether the turn ends with a tool call or a final answer.
+		if reasoning := strings.TrimSpace(turn.reasoning); reasoning != "" {
+			if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", reasoning, assistantMessagePayload(step, "reasoning", nil)); err != nil {
+				return Response{}, err
+			}
+		}
 		if len(turn.toolCalls) == 0 {
 			text := strings.TrimSpace(turn.text)
 			// Empty-turn retry: a turn with no text AND no tool calls is
@@ -505,12 +514,14 @@ func terminalWriteNeedsRead(calls []model.ToolCall, tools []model.ToolSpec) bool
 
 type modelTurn struct {
 	text        string
+	reasoning   string
 	toolCalls   []model.ToolCall
 	diagnostics *model.Diagnostics
 }
 
 func (r Runner) collectModelTurn(ctx context.Context, sessionID session.ID, sequence *int, step int, events <-chan model.Event) (modelTurn, error) {
 	var text strings.Builder
+	var reasoning strings.Builder
 	var toolCalls []model.ToolCall
 	var diagnostics *model.Diagnostics
 
@@ -520,7 +531,15 @@ func (r Runner) collectModelTurn(ctx context.Context, sessionID session.ID, sequ
 		}
 		switch event.Type {
 		case model.EventTextDelta:
-			text.WriteString(event.Text)
+			// Reasoning chunks are model-internal chain-of-thought; keep
+			// them in their own buffer so the orchestrator can show them
+			// as a "thinking" transcript item without concatenating them
+			// to the user-facing answer.
+			if event.Reasoning {
+				reasoning.WriteString(event.Text)
+			} else {
+				text.WriteString(event.Text)
+			}
 		case model.EventToolCall:
 			if event.ToolCall != nil {
 				toolCalls = append(toolCalls, *event.ToolCall)
@@ -534,7 +553,7 @@ func (r Runner) collectModelTurn(ctx context.Context, sessionID session.ID, sequ
 		}
 	}
 
-	return modelTurn{text: text.String(), toolCalls: toolCalls, diagnostics: diagnostics}, nil
+	return modelTurn{text: text.String(), reasoning: reasoning.String(), toolCalls: toolCalls, diagnostics: diagnostics}, nil
 }
 
 func (r Runner) runTool(ctx context.Context, sessionID session.ID, sequence *int, call model.ToolCall) (string, error) {
@@ -678,6 +697,9 @@ func modelEventPayload(step int, event model.Event) map[string]any {
 	payload := map[string]any{
 		"step":       step,
 		"event_type": string(event.Type),
+	}
+	if event.Reasoning {
+		payload["reasoning"] = true
 	}
 	if event.ToolCall != nil {
 		payload["tool_call"] = map[string]any{

@@ -378,6 +378,14 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 				if event.Type == session.EventAssistantMessage {
 					kind = TranscriptAssistant
 					title = "assistant"
+					// Reasoning turns get their own kind so the chat
+					// renderer can show them muted / collapsed and they
+					// never get folded into the user-facing assistant
+					// answer text.
+					if status := stringValue(event.Payload["status"]); status == "reasoning" {
+						kind = TranscriptThinking
+						title = "thinking"
+					}
 				}
 				appendTranscript(kind, event.Actor, title, text, transcriptEventMeta(event))
 				for _, block := range extractCodeBlocks(text) {
@@ -400,6 +408,16 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 					streamMeta = transcriptEventMeta(event)
 				case string(model.EventTextDelta):
 					if event.Text != "" {
+						// Reasoning deltas are shown as a separate
+						// "thinking" transcript item once the
+						// orchestrator logs them at end-of-turn — do not
+						// fold them into the streaming text buffer or the
+						// chat will show reasoning concatenated with the
+						// final user-facing answer (the doubled-text
+						// effect the user reported).
+						if isReasoningPayload(event.Payload) {
+							break
+						}
 						streaming.WriteString(event.Text)
 					}
 				case string(model.EventToolCall):
@@ -2317,6 +2335,16 @@ func intValue(value any) int {
 		return int(v)
 	}
 	return 0
+}
+
+func isReasoningPayload(payload map[string]any) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	if v, ok := payload["reasoning"].(bool); ok && v {
+		return true
+	}
+	return false
 }
 
 // assistantPayloadHasToolCalls reports whether an EventAssistantMessage

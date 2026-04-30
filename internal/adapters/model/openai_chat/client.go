@@ -215,15 +215,23 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 		// with completion_tokens > 0 but our extracted text+tool_calls is
 		// empty — those tokens lived in a field we did not read.
 		if extra := parseExtendedDelta(chunk.RawJSON()); extra != nil {
+			// Emit reasoning as a TextDelta with Reasoning=true so the
+			// orchestrator/workbench can render it as a separate
+			// "thinking" stream instead of folding it into the
+			// user-facing assistant text. Folding caused the chat to
+			// show reasoning concatenated to the final answer with no
+			// separator, e.g.:
+			//   "Let me check the file. Looks like there is a quote
+			//    issue. Let me fix it..."
+			// where the first sentence is reasoning and the rest is
+			// the final reply.
 			if extra.ReasoningContent != "" {
-				diag.TextDeltaCount++
 				diag.ReasoningTokens += approxTokens(extra.ReasoningContent)
-				events <- model.Event{Type: model.EventTextDelta, Text: extra.ReasoningContent}
+				events <- model.Event{Type: model.EventTextDelta, Text: extra.ReasoningContent, Reasoning: true}
 			}
 			if extra.Thinking != "" {
-				diag.TextDeltaCount++
 				diag.ReasoningTokens += approxTokens(extra.Thinking)
-				events <- model.Event{Type: model.EventTextDelta, Text: extra.Thinking}
+				events <- model.Event{Type: model.EventTextDelta, Text: extra.Thinking, Reasoning: true}
 			}
 			if extra.LegacyFunctionCall != nil {
 				fallbackTools.addLegacy(extra.LegacyFunctionCall)
