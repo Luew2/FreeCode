@@ -97,6 +97,45 @@ func TestAgentRunnerOrchestratorPromptEncouragesChildAgents(t *testing.T) {
 	}
 }
 
+func TestParseAgentResultPreservesStatusWithStructuredFindings(t *testing.T) {
+	task := agent.Task{ID: "task-x", Role: agent.RoleReviewer}
+	text := `{
+		"status": "blocked",
+		"summary": "found two issues",
+		"findings": [
+			{"file": "internal/foo.go", "note": "missing nil check"},
+			"plain string finding"
+		],
+		"changed_files": [
+			{"path": "a.go", "kind": "edit"}
+		],
+		"tests_run": ["go test ./..."],
+		"open_questions": []
+	}`
+	result := parseAgentResult(task, text)
+	if result.Status != agent.StatusBlocked {
+		t.Fatalf("status = %q, want blocked", result.Status)
+	}
+	if result.Summary != "found two issues" {
+		t.Fatalf("summary = %q, want found two issues", result.Summary)
+	}
+	if len(result.Findings) != 2 {
+		t.Fatalf("findings = %#v, want 2 entries", result.Findings)
+	}
+	if !strings.Contains(result.Findings[0], "missing nil check") || !strings.Contains(result.Findings[0], "internal/foo.go") {
+		t.Fatalf("findings[0] = %q, want stringified structured finding", result.Findings[0])
+	}
+	if result.Findings[1] != "plain string finding" {
+		t.Fatalf("findings[1] = %q, want plain string preserved", result.Findings[1])
+	}
+	if len(result.ChangedFiles) != 1 || !strings.Contains(result.ChangedFiles[0], "a.go") {
+		t.Fatalf("changed_files = %#v, want stringified entry", result.ChangedFiles)
+	}
+	if len(result.TestsRun) != 1 || result.TestsRun[0] != "go test ./..." {
+		t.Fatalf("tests_run = %#v, want single string entry", result.TestsRun)
+	}
+}
+
 func fmtMessages(messages []model.Message) string {
 	var out strings.Builder
 	for _, message := range messages {

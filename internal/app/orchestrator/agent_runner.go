@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/Luew2/FreeCode/internal/app/contextmgr"
@@ -207,35 +208,73 @@ func parseAgentResult(task agent.Task, text string) agent.Result {
 		Status:  agent.StatusCompleted,
 		Summary: strings.TrimSpace(text),
 	}
-	var payload struct {
-		Status        string   `json:"status"`
-		Summary       string   `json:"summary"`
-		ChangedFiles  []string `json:"changed_files"`
-		TestsRun      []string `json:"tests_run"`
-		Findings      []string `json:"findings"`
-		OpenQuestions []string `json:"open_questions"`
-	}
 	raw := extractJSONObject(text)
 	if raw == "" {
 		return result
 	}
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+	// Tolerant decode: parse into map[string]any so that a single field with
+	// an unexpected shape (e.g. structured finding objects when we expected
+	// strings) does not throw away the whole handoff. We then extract each
+	// known field with a best-effort coercion.
+	var generic map[string]any
+	if err := json.Unmarshal([]byte(raw), &generic); err != nil {
 		return result
 	}
-	if status := agent.Status(strings.TrimSpace(payload.Status)); status != "" {
-		switch status {
+	if status, ok := generic["status"].(string); ok {
+		trimmed := agent.Status(strings.TrimSpace(status))
+		switch trimmed {
 		case agent.StatusCompleted, agent.StatusBlocked, agent.StatusFailed:
-			result.Status = status
+			result.Status = trimmed
 		}
 	}
-	if strings.TrimSpace(payload.Summary) != "" {
-		result.Summary = strings.TrimSpace(payload.Summary)
+	if summary, ok := generic["summary"].(string); ok && strings.TrimSpace(summary) != "" {
+		result.Summary = strings.TrimSpace(summary)
 	}
-	result.ChangedFiles = append([]string(nil), payload.ChangedFiles...)
-	result.TestsRun = append([]string(nil), payload.TestsRun...)
-	result.Findings = append([]string(nil), payload.Findings...)
-	result.OpenQuestions = append([]string(nil), payload.OpenQuestions...)
+	result.ChangedFiles = stringSliceField(generic["changed_files"])
+	result.TestsRun = stringSliceField(generic["tests_run"])
+	result.Findings = stringSliceField(generic["findings"])
+	result.OpenQuestions = stringSliceField(generic["open_questions"])
 	return result
+}
+
+// stringSliceField coerces a JSON-decoded value into []string, tolerating
+// the realistic shapes a subagent might emit:
+//   - already []string (legacy)
+//   - []any with string elements (json.Unmarshal default)
+//   - []any with structured elements ({file: "x", note: "y"}) — each
+//     non-string element is re-encoded as JSON so callers see a stable
+//     textual representation rather than the whole field being lost.
+//
+// Returns nil for nil/non-array input so the result mirrors the original
+// "field absent" semantics.
+func stringSliceField(value any) []string {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, raw := range v {
+			out = append(out, stringifyEntry(raw))
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func stringifyEntry(raw any) string {
+	if raw == nil {
+		return ""
+	}
+	if s, ok := raw.(string); ok {
+		return s
+	}
+	if data, err := json.Marshal(raw); err == nil {
+		return string(data)
+	}
+	return fmt.Sprintf("%v", raw)
 }
 
 func extractJSONObject(text string) string {
