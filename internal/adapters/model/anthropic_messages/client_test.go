@@ -201,6 +201,70 @@ func extractEventType(value any) (string, bool) {
 	return t, true
 }
 
+func TestToolInputSchemaCoercesRequiredFromAnySlice(t *testing.T) {
+	// Tools whose InputSchema came from JSON-decoded maps express
+	// "required" as []any. The previous converter only kept []string,
+	// silently dropping the field and accepting invalid arg combos.
+	requestText := messagesRequest{Tools: []anthropicTool{{
+		Name: "patch",
+		InputSchema: map[string]any{
+			"type":     "object",
+			"required": []any{"path", "mode"},
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string"},
+				"mode": map[string]any{"type": "string"},
+			},
+		},
+	}}}
+	params := requestText.toSDKParams()
+	if len(params.Tools) != 1 {
+		t.Fatalf("tools = %d, want 1", len(params.Tools))
+	}
+	tool := params.Tools[0].OfTool
+	if tool == nil {
+		t.Fatalf("tool union missing OfTool: %#v", params.Tools[0])
+	}
+	required := tool.InputSchema.Required
+	if len(required) != 2 {
+		t.Fatalf("required = %#v, want 2 entries", required)
+	}
+	want := map[string]bool{"path": true, "mode": true}
+	for _, name := range required {
+		if !want[name] {
+			t.Fatalf("unexpected required field %q in %#v", name, required)
+		}
+	}
+
+	// Round-trip through JSON and confirm both names are emitted on the
+	// wire — the bug previously allowed Anthropic to accept arg shapes
+	// missing path or mode without complaint.
+	data, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		t.Fatalf("Marshal schema: %v", err)
+	}
+	if !strings.Contains(string(data), `"path"`) || !strings.Contains(string(data), `"mode"`) {
+		t.Fatalf("schema JSON = %s, want both required names", data)
+	}
+}
+
+func TestToolInputSchemaPreservesRequiredFromStringSlice(t *testing.T) {
+	requestText := messagesRequest{Tools: []anthropicTool{{
+		Name: "patch",
+		InputSchema: map[string]any{
+			"type":     "object",
+			"required": []string{"path"},
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string"},
+			},
+		},
+	}}}
+	params := requestText.toSDKParams()
+	tool := params.Tools[0].OfTool
+	if tool == nil || len(tool.InputSchema.Required) != 1 || tool.InputSchema.Required[0] != "path" {
+		t.Fatalf("required = %#v, want [path]", tool.InputSchema.Required)
+	}
+}
+
 type fakeSecrets map[string]string
 
 func (s fakeSecrets) Get(ctx context.Context, name string) (string, error) {

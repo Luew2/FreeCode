@@ -577,9 +577,7 @@ func (r messagesRequest) toSDKParams() anthropic.MessageNewParams {
 			if props, ok := tool.InputSchema["properties"]; ok {
 				schema.Properties = props
 			}
-			if req, ok := tool.InputSchema["required"].([]string); ok {
-				schema.Required = req
-			}
+			schema.Required = requiredStrings(tool.InputSchema["required"])
 			extras := map[string]any{}
 			for k, v := range tool.InputSchema {
 				if k == "type" || k == "properties" || k == "required" {
@@ -664,6 +662,33 @@ func joinNonEmpty(left string, right string) string {
 		return left
 	}
 	return left + "\n\n" + right
+}
+
+// requiredStrings coerces a JSON-schema "required" field into the
+// []string shape the Anthropic SDK expects. The previous implementation
+// only handled []string values, so tools whose InputSchema was decoded
+// from JSON (where slices arrive as []any) silently dropped the field
+// and let invalid arg combinations through. Accept both shapes and
+// coerce non-string elements via fmt.Sprint as a last resort.
+func requiredStrings(value any) []string {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, raw := range v {
+			if s, ok := raw.(string); ok {
+				out = append(out, s)
+				continue
+			}
+			out = append(out, fmt.Sprint(raw))
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func normalizeArguments(raw string) json.RawMessage {
