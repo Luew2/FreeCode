@@ -139,16 +139,33 @@ func compactMessages(messages []model.Message, maxMessageTokens int) ([]model.Me
 
 	var protected []model.Message
 	var tail []model.Message
-	for i, message := range messages {
+	// Tail selection treats assistant-with-tool_calls and the
+	// matching RoleTool followups as one atomic group. Dropping
+	// only an assistant turn while keeping its tool_result(s)
+	// produces orphan tool messages that fail OpenAI/Anthropic
+	// schema validation ("tool_call_id has no preceding
+	// assistant message"). Building tail as a list of
+	// non-protected message groups and keeping the last few
+	// guarantees the kept window is always self-consistent.
+	groups := nonProtectedGroups(messages)
+	keepGroups := 4
+	if keepGroups > len(groups) {
+		keepGroups = len(groups)
+	}
+	for _, message := range messages {
 		if message.Role == model.RoleSystem || message.Role == model.RoleDeveloper {
 			protected = append(protected, message)
-			continue
 		}
-		if i >= len(messages)-4 {
-			tail = append(tail, message)
+	}
+	if keepGroups > 0 {
+		for _, group := range groups[len(groups)-keepGroups:] {
+			tail = append(tail, group...)
 		}
 	}
 	if len(tail) == 0 && len(messages) > 0 {
+		// Fall back to the very last message even if it's protected,
+		// matching prior behavior for sequences with no non-system
+		// content.
 		tail = append(tail, messages[len(messages)-1])
 	}
 
@@ -167,6 +184,66 @@ func compactMessages(messages []model.Message, maxMessageTokens int) ([]model.Me
 
 	candidate = truncateLargestTextParts(candidate, maxMessageTokens)
 	return candidate, originalTokens - EstimateMessages(candidate)
+}
+
+// nonProtectedGroups partitions the non-system/non-developer messages
+// into atomic groups so compaction never drops half of a tool_call
+// pair. A group is one of:
+//   - one user message
+//   - one assistant message (with no tool_calls)
+//   - one assistant-with-tool_calls plus all immediately-following
+//     RoleTool messages that carry a tool_call_id matching one of the
+//     assistant's tool_calls
+//   - one orphan RoleTool message (only happens with malformed input;
+//     compaction won't manufacture it but we still group defensively)
+//
+// The order of groups is the original source order. Protected messages
+// (system/developer) are not included; they're handled separately.
+func nonProtectedGroups(messages []model.Message) [][]model.Message {
+	var groups [][]model.Message
+	// Track tool_call_ids the most recent assistant turn produced so
+	// we can decide whether a following RoleTool message belongs to
+	// it. Once we open a new group (user or non-tool-call assistant)
+	// we drop the pending IDs.
+	pendingToolIDs := map[string]bool{}
+	currentGroup := -1
+	for _, message := range messages {
+		if message.Role == model.RoleSystem || message.Role == model.RoleDeveloper {
+			continue
+		}
+		switch message.Role {
+		case model.RoleAssistant:
+			if len(message.ToolCalls) > 0 {
+				pendingToolIDs = map[string]bool{}
+				for _, call := range message.ToolCalls {
+					if call.ID != "" {
+						pendingToolIDs[call.ID] = true
+					}
+				}
+			} else {
+				pendingToolIDs = map[string]bool{}
+			}
+			groups = append(groups, []model.Message{message})
+			currentGroup = len(groups) - 1
+		case model.RoleTool:
+			// Attach to the open assistant-with-tool_calls group when
+			// the tool_call_id matches one we expect; otherwise treat
+			// it as its own (orphan) group so we never silently merge.
+			if currentGroup >= 0 && (message.ToolCallID == "" || pendingToolIDs[message.ToolCallID]) && len(groups[currentGroup]) > 0 && groups[currentGroup][0].Role == model.RoleAssistant && len(groups[currentGroup][0].ToolCalls) > 0 {
+				groups[currentGroup] = append(groups[currentGroup], message)
+				delete(pendingToolIDs, message.ToolCallID)
+			} else {
+				groups = append(groups, []model.Message{message})
+				currentGroup = len(groups) - 1
+				pendingToolIDs = map[string]bool{}
+			}
+		default:
+			pendingToolIDs = map[string]bool{}
+			groups = append(groups, []model.Message{message})
+			currentGroup = len(groups) - 1
+		}
+	}
+	return groups
 }
 
 func truncateLargestTextParts(messages []model.Message, maxTokens int) []model.Message {

@@ -525,35 +525,46 @@ func (r Runner) collectModelTurn(ctx context.Context, sessionID session.ID, sequ
 	var toolCalls []model.ToolCall
 	var diagnostics *model.Diagnostics
 
-	for event := range events {
-		if err := r.append(ctx, sessionID, sequence, session.EventModel, "model", event.Text, modelEventPayload(step, event)); err != nil {
-			return modelTurn{}, err
-		}
-		switch event.Type {
-		case model.EventTextDelta:
-			// Reasoning chunks are model-internal chain-of-thought; keep
-			// them in their own buffer so the orchestrator can show them
-			// as a "thinking" transcript item without concatenating them
-			// to the user-facing answer.
-			if event.Reasoning {
-				reasoning.WriteString(event.Text)
-			} else {
-				text.WriteString(event.Text)
+	// Selecting on ctx.Done() alongside the event channel guarantees that a
+	// stuck or never-closing model adapter cannot pin Run forever. When the
+	// caller cancels the context, we surface ctx.Err() immediately rather
+	// than blocking on a goroutine that may never close `events` (network
+	// hang, provider proxy holding the stream open with no termination).
+	for {
+		select {
+		case <-ctx.Done():
+			return modelTurn{}, ctx.Err()
+		case event, ok := <-events:
+			if !ok {
+				return modelTurn{text: text.String(), reasoning: reasoning.String(), toolCalls: toolCalls, diagnostics: diagnostics}, nil
 			}
-		case model.EventToolCall:
-			if event.ToolCall != nil {
-				toolCalls = append(toolCalls, *event.ToolCall)
+			if err := r.append(ctx, sessionID, sequence, session.EventModel, "model", event.Text, modelEventPayload(step, event)); err != nil {
+				return modelTurn{}, err
 			}
-		case model.EventCompleted:
-			if event.Diagnostics != nil {
-				diagnostics = event.Diagnostics
+			switch event.Type {
+			case model.EventTextDelta:
+				// Reasoning chunks are model-internal chain-of-thought; keep
+				// them in their own buffer so the orchestrator can show them
+				// as a "thinking" transcript item without concatenating them
+				// to the user-facing answer.
+				if event.Reasoning {
+					reasoning.WriteString(event.Text)
+				} else {
+					text.WriteString(event.Text)
+				}
+			case model.EventToolCall:
+				if event.ToolCall != nil {
+					toolCalls = append(toolCalls, *event.ToolCall)
+				}
+			case model.EventCompleted:
+				if event.Diagnostics != nil {
+					diagnostics = event.Diagnostics
+				}
+			case model.EventError:
+				return modelTurn{}, errors.New(event.Error)
 			}
-		case model.EventError:
-			return modelTurn{}, errors.New(event.Error)
 		}
 	}
-
-	return modelTurn{text: text.String(), reasoning: reasoning.String(), toolCalls: toolCalls, diagnostics: diagnostics}, nil
 }
 
 func (r Runner) runTool(ctx context.Context, sessionID session.ID, sequence *int, call model.ToolCall) (string, error) {

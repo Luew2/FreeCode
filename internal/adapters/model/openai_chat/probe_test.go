@@ -92,6 +92,94 @@ func TestChatCompletionsEndpointAcceptsExactEndpoint(t *testing.T) {
 	}
 }
 
+// TestChatCompletionsEndpointMatchesSDKBaseURL is the regression net for
+// finding 6: the probe URL and the SDK-driven client URL MUST be the same
+// for every reasonable provider base URL. Previously the two functions had
+// independent path-collapse logic, which sent the probe to
+// "/api/coding/paas/v4/v1/chat/completions" while the SDK client called
+// "/api/coding/paas/v4/chat/completions" — making probe results disagree
+// with live calls for Z.ai-style versioned bases.
+func TestChatCompletionsEndpointMatchesSDKBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		base string
+		want string
+	}{
+		{
+			name: "host_only",
+			base: "https://api.openai.com",
+			want: "https://api.openai.com/v1/chat/completions",
+		},
+		{
+			name: "host_with_trailing_slash",
+			base: "https://api.openai.com/",
+			want: "https://api.openai.com/v1/chat/completions",
+		},
+		{
+			name: "v1_no_trailing_slash",
+			base: "https://api.openai.com/v1",
+			want: "https://api.openai.com/v1/chat/completions",
+		},
+		{
+			name: "v1_with_trailing_slash",
+			base: "https://api.openai.com/v1/",
+			want: "https://api.openai.com/v1/chat/completions",
+		},
+		{
+			name: "exact_endpoint",
+			base: "https://api.openai.com/v1/chat/completions",
+			want: "https://api.openai.com/v1/chat/completions",
+		},
+		{
+			name: "versioned_v4_root",
+			base: "https://api.foo.com/v4",
+			want: "https://api.foo.com/v4/chat/completions",
+		},
+		{
+			name: "versioned_v4_root_with_trailing_slash",
+			base: "https://api.foo.com/v4/",
+			want: "https://api.foo.com/v4/chat/completions",
+		},
+		{
+			name: "z_ai_style_versioned_prefix",
+			base: "https://api.z.ai/api/coding/paas/v4",
+			want: "https://api.z.ai/api/coding/paas/v4/chat/completions",
+		},
+		{
+			name: "z_ai_style_with_trailing_slash",
+			base: "https://api.z.ai/api/coding/paas/v4/",
+			want: "https://api.z.ai/api/coding/paas/v4/chat/completions",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			probeURL, err := ChatCompletionsEndpoint(tc.base)
+			if err != nil {
+				t.Fatalf("ChatCompletionsEndpoint(%q) returned error: %v", tc.base, err)
+			}
+			sdkBase, err := sdkBaseURL(tc.base)
+			if err != nil {
+				t.Fatalf("sdkBaseURL(%q) returned error: %v", tc.base, err)
+			}
+			// The SDK appends the relative path "chat/completions" to the
+			// base URL it was configured with. The base must end with a
+			// trailing slash for that concatenation to land on the right
+			// endpoint.
+			if !strings.HasSuffix(sdkBase, "/") {
+				t.Fatalf("sdkBaseURL(%q) = %q, want trailing slash", tc.base, sdkBase)
+			}
+			sdkEffective := sdkBase + "chat/completions"
+			if probeURL != sdkEffective {
+				t.Fatalf("base %q: probe URL = %q, SDK-effective URL = %q (must match)", tc.base, probeURL, sdkEffective)
+			}
+			if probeURL != tc.want {
+				t.Fatalf("base %q: probe URL = %q, want %q", tc.base, probeURL, tc.want)
+			}
+		})
+	}
+}
+
 func TestProbeRejectsEmptySuccessBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

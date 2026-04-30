@@ -264,6 +264,61 @@ func TestRunnerLogsToolArtifactPayload(t *testing.T) {
 	t.Fatalf("events = %#v, want tool event", log.events)
 }
 
+// TestRunnerReturnsContextErrorWhenModelStreamHangs simulates a model
+// adapter whose event channel never closes (network hang, proxy holding
+// the stream open). The collectModelTurn loop must select on ctx.Done()
+// so the orchestrator surfaces ctx.Err() promptly when the caller
+// cancels — otherwise Run blocks forever on `for event := range events`.
+func TestRunnerReturnsContextErrorWhenModelStreamHangs(t *testing.T) {
+	never := make(chan model.Event)
+	// Drain on cleanup; nothing ever sends so close just signals the
+	// background "deadline" goroutine that the test is over.
+	t.Cleanup(func() { close(never) })
+
+	client := &hangingModelClient{events: never}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := Runner{
+			Model: client,
+			Tools: &fakeTools{result: "ignored"},
+		}.Run(ctx, Request{
+			SessionID:   "s1",
+			Model:       model.NewRef("local", "coder"),
+			UserRequest: "hang please",
+			MaxSteps:    1,
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("Run returned nil error after context timeout")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context error", err)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("Run took %v, want quick return after 50ms timeout", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s after 50ms context timeout — collectModelTurn is still blocking on the channel")
+	}
+}
+
+type hangingModelClient struct {
+	events chan model.Event
+}
+
+func (c *hangingModelClient) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	return c.events, nil
+}
+
 func TestRunnerReturnsLogAppendError(t *testing.T) {
 	_, err := Runner{
 		Model: &scriptedModelClient{

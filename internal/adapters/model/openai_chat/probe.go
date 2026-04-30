@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/Luew2/FreeCode/internal/core/model"
@@ -99,32 +98,21 @@ func (p *Probe) Probe(ctx context.Context, provider model.Provider, candidate mo
 	}, nil
 }
 
+// ChatCompletionsEndpoint derives the absolute URL the probe should POST
+// against. It MUST agree with sdkBaseURL+"chat/completions" so the probe and
+// the live client cannot diverge — that previously caused versioned custom
+// base URLs (e.g. "/api/coding/paas/v4") to be probed at "/v1/chat/completions"
+// while the SDK called "/chat/completions" against the same root, hiding
+// real auth/model failures behind shape-mismatch errors.
 func ChatCompletionsEndpoint(baseURL string) (string, error) {
-	if strings.TrimSpace(baseURL) == "" {
-		return "", errors.New("base url is empty")
-	}
-	parsed, err := url.Parse(baseURL)
+	base, err := sdkBaseURL(baseURL)
 	if err != nil {
 		return "", err
 	}
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("base url must include scheme and host")
-	}
-
-	path := strings.TrimRight(parsed.Path, "/")
-	switch {
-	case path == "":
-		parsed.Path = "/v1/chat/completions"
-	case strings.HasSuffix(path, "/chat/completions"):
-		parsed.Path = path
-	case strings.HasSuffix(path, "/v1"):
-		parsed.Path = path + "/chat/completions"
-	default:
-		parsed.Path = path + "/v1/chat/completions"
-	}
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String(), nil
+	// sdkBaseURL guarantees a trailing slash; concatenating "chat/completions"
+	// gives the final endpoint without re-introducing the path-collapse logic
+	// in two places.
+	return base + "chat/completions", nil
 }
 
 type ProbeError struct {

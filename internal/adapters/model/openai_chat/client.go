@@ -296,34 +296,44 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 		diag.RejectedChunks = diag.ChunkCount - sdkAcceptedChunks
 	}
 
-	// Prefer SDK-accumulated calls when present (they round-trip
-	// arguments correctly through partial JSON deltas). Fall back to our
-	// own accumulator when the SDK produced nothing — that's the
-	// id-mismatch / wire-format-quirk case.
-	emitted := false
+	// Always pick up finish_reason from the accumulated view when none of
+	// the streamed deltas carried one (some providers only attach it to
+	// the [DONE] marker). Done before tool-call emission so the diagnostic
+	// is right regardless of which accumulator wins.
 	for _, choice := range acc.Choices {
-		// Pick up finish_reason from the accumulated final-chunk view
-		// when none of the streamed deltas carried one (some providers
-		// only attach it to the [DONE] marker).
 		if diag.FinishReason == "" {
 			if reason := string(choice.FinishReason); reason != "" {
 				diag.FinishReason = reason
 			}
 		}
-		for _, call := range choice.Message.ToolCalls {
-			if call.ID == "" && call.Function.Name == "" && call.Function.Arguments == "" {
-				diag.DroppedCalls++
-				continue
-			}
-			diag.ToolCallCount++
-			emitted = true
-			events <- model.Event{
-				Type: model.EventToolCall,
-				ToolCall: &model.ToolCall{
-					ID:        call.ID,
-					Name:      call.Function.Name,
-					Arguments: []byte(call.Function.Arguments),
-				},
+	}
+	// Choose the source for tool-call emission. Prefer the fallback
+	// accumulator when:
+	//   * the SDK rejected one or more chunks (envelope id rotation,
+	//     mid-stream id flap, etc) — its view of the call is partial,
+	//   * the SDK accumulated nothing at all — same root cause.
+	// Otherwise prefer the SDK's view: it round-trips arguments through
+	// partial JSON deltas correctly and is what most providers expect to
+	// drive.
+	useFallback := diag.RejectedChunks > 0
+	emitted := false
+	if !useFallback {
+		for _, choice := range acc.Choices {
+			for _, call := range choice.Message.ToolCalls {
+				if call.ID == "" && call.Function.Name == "" && call.Function.Arguments == "" {
+					diag.DroppedCalls++
+					continue
+				}
+				diag.ToolCallCount++
+				emitted = true
+				events <- model.Event{
+					Type: model.EventToolCall,
+					ToolCall: &model.ToolCall{
+						ID:        call.ID,
+						Name:      call.Function.Name,
+						Arguments: []byte(call.Function.Arguments),
+					},
+				}
 			}
 		}
 	}
@@ -458,7 +468,11 @@ func (a *toolCallAccumulator) add(call openai.ChatCompletionChunkChoiceDeltaTool
 		a.bySlot[key] = partial
 		a.order = append(a.order, key)
 	}
-	if call.ID != "" {
+	// Keep the FIRST non-empty id we ever see for this slot. Some compat
+	// providers regenerate the id on every chunk; locking the id once
+	// stops the emitted ToolCall.ID from flapping based on which chunk
+	// happened to be processed last.
+	if call.ID != "" && partial.id == "" {
 		partial.id = call.ID
 	}
 	if call.Function.Name != "" {
@@ -469,21 +483,43 @@ func (a *toolCallAccumulator) add(call openai.ChatCompletionChunkChoiceDeltaTool
 	}
 }
 
+// keyFor picks (or invents) the accumulator slot for a streamed
+// tool_call delta. The cardinal rule: the chunk's `index` is the
+// authoritative grouping key, NOT its id. Some compat providers
+// (vLLM, certain OpenAI proxies) regenerate the tool_call id on every
+// chunk for a single call — preferring the id over the index would
+// split one logical call into multiple partial entries (e.g. a
+// name-only entry and an arguments-only entry, neither well-formed).
+//
+// Decision rule:
+//  1. If we already have a slot with this index, ALWAYS reuse it
+//     (regardless of whether the chunk's id matches the slot's, or even
+//     whether the chunk has an id at all). The first non-empty id we
+//     see wins for the slot's id field; later differing ids are
+//     ignored for keying purposes but harmless because the slot's
+//     stored id is set only once.
+//  2. Otherwise the index is genuinely new: open a fresh slot keyed
+//     on (index, id). The id-in-key disambiguates only when the same
+//     index hasn't been opened yet — a non-issue in normal streams.
 func (a *toolCallAccumulator) keyFor(call openai.ChatCompletionChunkChoiceDeltaToolCall) accumulatorKey {
 	idx := int(call.Index)
 	if idx < 0 {
 		idx = -1
 	}
-	if call.ID != "" {
-		return accumulatorKey{index: idx, id: call.ID}
-	}
-	// Without an id, match against any existing slot with the same index;
-	// this is what OpenAI does on follow-up deltas (id only in the opening
-	// chunk, subsequent chunks repeat the index).
+	// Look for an existing slot with this index first; the index is the
+	// stable identifier across chunks for both well-behaved providers
+	// (id only in the opening chunk) and id-quirk providers (different
+	// id on every chunk).
 	for _, key := range a.order {
 		if key.index == idx {
 			return key
 		}
+	}
+	// Index is new: open a fresh slot. Preserve the id in the key to
+	// avoid colliding with a later "no id, reuse by index" lookup that
+	// shouldn't be possible at this point but is cheap insurance.
+	if call.ID != "" {
+		return accumulatorKey{index: idx, id: call.ID}
 	}
 	return accumulatorKey{index: idx}
 }

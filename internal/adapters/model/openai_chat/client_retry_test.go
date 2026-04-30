@@ -142,6 +142,110 @@ func TestClientStreamsToolCallsWhenIndexOmittedOnFollowupDeltas(t *testing.T) {
 	}
 }
 
+// TestClientMergesToolCallChunksWhenProviderRotatesID covers a class of
+// compat providers (some vLLM front-ends, certain proxies) that change the
+// streamed tool_call `id` between chunks within ONE logical call. The
+// fallback accumulator must key on `index` rather than `(index, id)` so it
+// doesn't split one call into two partial entries — which would either
+// emit half-formed ToolCalls (no args) or drop the call entirely.
+//
+// To trigger the fallback path (rather than the SDK's own accumulator we
+// run alongside), we also rotate the outer chat-completion `id` per chunk
+// — the SDK rejects mismatched chunk envelopes (streamaccumulator.go:108),
+// so all calls must come from our fallback. This is the smoking-gun case
+// the original bug report describes.
+//
+// Deterministic id rule: the FIRST non-empty id seen for a given index
+// wins. Providers that flap the id are signaling proxy noise; locking the
+// id stops the emitted ToolCall.ID from depending on which chunk happened
+// to be the last to land.
+func TestClientMergesToolCallChunksWhenProviderRotatesID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// First chunk: outer id "envelope-1", opens tool index 0 with
+		// id "a" and the function name.
+		writeSSEJSON(t, w, map[string]any{
+			"id": "envelope-1",
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"id":    "a",
+								"function": map[string]any{
+									"name": "foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+		// Second chunk: outer id "envelope-2" (forces SDK acc to reject
+		// this chunk, exercising the fallback), same tool index, DIFFERENT
+		// tool id, carries the arguments. Without index-first keying in
+		// the fallback this would land in a separate slot and the merged
+		// call would be lost.
+		writeSSEJSON(t, w, map[string]any{
+			"id": "envelope-2",
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"id":    "b",
+								"function": map[string]any{
+									"arguments": `{"path":"README.md"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server, model.Provider{ID: "local", BaseURL: server.URL, DefaultModel: "coder"}, nil)
+	events, err := client.Stream(context.Background(), model.Request{
+		Model:    model.NewRef("local", "coder"),
+		Messages: []model.Message{model.TextMessage(model.RoleUser, "merge it")},
+		Stream:   true,
+	})
+	if err != nil {
+		t.Fatalf("Stream returned error: %v", err)
+	}
+	gotEvents := collectEvents(t, events)
+
+	// Count tool-call events. Splitting the call across slots would
+	// produce two events with partial fields each.
+	var toolCalls []model.ToolCall
+	for _, e := range gotEvents {
+		if e.Type == model.EventToolCall && e.ToolCall != nil {
+			toolCalls = append(toolCalls, *e.ToolCall)
+		}
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1 (provider id flap should not split a single logical call). events: %#v", len(toolCalls), toolCalls)
+	}
+	call := toolCalls[0]
+	if call.Name != "foo" {
+		t.Fatalf("tool name = %q, want foo", call.Name)
+	}
+	if string(call.Arguments) != `{"path":"README.md"}` {
+		t.Fatalf("tool arguments = %q, want merged arguments JSON", string(call.Arguments))
+	}
+	// Deterministic id rule: keep the FIRST non-empty id ("a"). Locking
+	// the id avoids flapping based on chunk arrival order. Tests assert
+	// the rule explicitly so a regression to "last id wins" is loud.
+	if call.ID != "a" {
+		t.Fatalf("tool id = %q, want %q (first non-empty id wins for id-rotating providers)", call.ID, "a")
+	}
+}
+
 func TestClientStreamsTwoConcurrentToolCallsOnSeparateIndexes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

@@ -185,6 +185,80 @@ func TestPrepareDoesNotTruncateDeveloperPolicyOrCurrentUserRequest(t *testing.T)
 	}
 }
 
+// TestCompactionPreservesAssistantToolPairs exercises the atomic
+// grouping logic in compactMessages. A naive tail-keep would happily
+// drop the older assistant-with-tool_calls turn while keeping its
+// matching RoleTool result, producing an orphan tool message that
+// providers reject ("tool_call_id has no preceding assistant
+// message"). The fix groups assistant_with_tool_calls and its
+// followups together so they're either both kept or both dropped.
+func TestCompactionPreservesAssistantToolPairs(t *testing.T) {
+	makeAssistantToolCall := func(id, name string) model.Message {
+		return model.Message{
+			Role: model.RoleAssistant,
+			ToolCalls: []model.ToolCall{
+				{ID: id, Name: name, Arguments: []byte(`{}`)},
+			},
+		}
+	}
+	makeToolResult := func(id, text string) model.Message {
+		msg := model.TextMessage(model.RoleTool, text)
+		msg.ToolCallID = id
+		return msg
+	}
+	messages := []model.Message{
+		model.TextMessage(model.RoleSystem, "system"),
+		model.TextMessage(model.RoleDeveloper, "developer"),
+		model.TextMessage(model.RoleUser, strings.Repeat("ancient context that must be evicted ", 80)),
+		makeAssistantToolCall("call_1", "old_tool"),
+		makeToolResult("call_1", strings.Repeat("old tool output text ", 80)),
+		makeAssistantToolCall("call_2", "newer_tool"),
+		makeToolResult("call_2", "newer tool output"),
+		model.TextMessage(model.RoleUser, "current request"),
+	}
+	prepared, err := Prepare(messages, nil, Budget{MaxInputTokens: 220, MaxOutputTokens: 32})
+	if err != nil {
+		t.Fatalf("Prepare returned error: %v", err)
+	}
+	if !prepared.Compacted {
+		t.Fatalf("Compacted = false, want true (forcing compaction)")
+	}
+
+	// Build a quick lookup of every assistant-tool-call id seen so far at each
+	// position. Walking forward, every RoleTool message must reference an id
+	// from a preceding assistant message — otherwise it's an orphan that the
+	// model client will reject.
+	seenToolCallIDs := map[string]bool{}
+	orphanFound := false
+	var firstOrphan model.Message
+	for _, msg := range prepared.Messages {
+		if msg.Role == model.RoleAssistant {
+			for _, call := range msg.ToolCalls {
+				if call.ID != "" {
+					seenToolCallIDs[call.ID] = true
+				}
+			}
+		}
+		if msg.Role == model.RoleTool {
+			if msg.ToolCallID == "" || !seenToolCallIDs[msg.ToolCallID] {
+				orphanFound = true
+				firstOrphan = msg
+				break
+			}
+		}
+	}
+	if orphanFound {
+		t.Fatalf("compaction left an orphan RoleTool message: %#v\nfull prepared messages: %#v", firstOrphan, prepared.Messages)
+	}
+
+	// Sanity: the most recent assistant-tool-call pair should still be
+	// reachable so the model can see the most recent state.
+	joined := joinMessages(prepared.Messages)
+	if !strings.Contains(joined, "current request") {
+		t.Fatalf("prepared messages = %q, want current user request", joined)
+	}
+}
+
 func TestPrepareErrorsWhenProtectedPromptExceedsBudget(t *testing.T) {
 	messages := []model.Message{
 		model.TextMessage(model.RoleSystem, strings.Repeat("system ", 100)),
