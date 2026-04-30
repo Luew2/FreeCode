@@ -98,15 +98,12 @@ func AskWithResponse(ctx context.Context, w io.Writer, deps AskDependencies, opt
 			}
 		}
 		priorMessages = contextmgr.HistoryWithBudget(messages, historyBudget)
-		// Defensive: drop any tool message whose tool_call_id is not
-		// claimed by a preceding assistant tool_calls in the replay.
-		// OpenAI rejects orphan tool messages with status 400 ("messages
-		// with role 'tool' must be a response to a preceeding message
-		// with 'tool_calls'"), and that error blocks the entire next
-		// turn. Orphans can creep in when an assistant turn was logged
-		// without its tool_calls payload (older log format, partial
-		// crash, etc.).
-		priorMessages = pruneOrphanToolMessages(priorMessages)
+		// Defensive: OpenAI requires every assistant tool_calls message
+		// to be followed immediately by one tool result per tool_call_id.
+		// Partial logs, cancellation, crashes, or history clipping can
+		// leave either orphan tool messages or incomplete assistant tool
+		// groups. Sanitize both directions before replay.
+		priorMessages = sanitizeToolCallHistory(priorMessages)
 	} else {
 		ctxText, _, err := contextmgr.BuildSessionContext(ctx, deps.Log, sessionID, sessionContextMax)
 		if err != nil {
@@ -144,31 +141,55 @@ func AskWithResponse(ctx context.Context, w io.Writer, deps AskDependencies, opt
 	return response, nil
 }
 
-// pruneOrphanToolMessages removes RoleTool messages whose tool_call_id is
-// not claimed by a preceding RoleAssistant tool_calls entry. The model
-// providers (OpenAI strictest among them) reject such replays with a 400.
-// Tracking the claimed set as we walk the slice handles partially-logged
-// assistant turns and stale legacy logs without dropping any valid pair.
-func pruneOrphanToolMessages(messages []model.Message) []model.Message {
+// sanitizeToolCallHistory enforces provider replay invariants:
+//   - RoleTool messages must belong to the immediately preceding assistant
+//     tool_calls group.
+//   - Assistant tool_calls groups are kept only when every tool_call_id has
+//     exactly one following tool result before the next non-tool message.
+//
+// OpenAI rejects either broken shape with HTTP 400. Dropping incomplete
+// groups is safer than inventing synthetic tool results because the model
+// would otherwise reason from tool outputs that never existed.
+func sanitizeToolCallHistory(messages []model.Message) []model.Message {
 	if len(messages) == 0 {
 		return messages
 	}
-	claimed := map[string]bool{}
 	out := make([]model.Message, 0, len(messages))
-	for _, m := range messages {
+	for i := 0; i < len(messages); i++ {
+		m := messages[i]
 		switch m.Role {
 		case model.RoleAssistant:
-			for _, call := range m.ToolCalls {
-				if call.ID != "" {
-					claimed[call.ID] = true
-				}
-			}
-			out = append(out, m)
-		case model.RoleTool:
-			if m.ToolCallID == "" || !claimed[m.ToolCallID] {
+			if len(m.ToolCalls) == 0 {
+				out = append(out, m)
 				continue
 			}
-			out = append(out, m)
+			expected := map[string]bool{}
+			for _, call := range m.ToolCalls {
+				if call.ID == "" {
+					expected = nil
+					break
+				}
+				expected[call.ID] = true
+			}
+			if len(expected) == 0 {
+				continue
+			}
+			var tools []model.Message
+			j := i + 1
+			for ; j < len(messages) && messages[j].Role == model.RoleTool; j++ {
+				if !expected[messages[j].ToolCallID] {
+					continue
+				}
+				tools = append(tools, messages[j])
+				delete(expected, messages[j].ToolCallID)
+			}
+			if len(expected) == 0 {
+				out = append(out, m)
+				out = append(out, tools...)
+			}
+			i = j - 1
+		case model.RoleTool:
+			continue
 		default:
 			out = append(out, m)
 		}

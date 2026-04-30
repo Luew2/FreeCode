@@ -677,6 +677,25 @@ func buildDoctorStatus(configPath string) (commands.DoctorStatus, error) {
 			Detail: foundDetail(term.IsTerminal(int(os.Stdout.Fd())) || term.IsTerminal(int(os.Stdin.Fd())), "tty available", "not running on a tty"),
 		},
 	}
+	if settings.MCP.Enabled {
+		for name, server := range settings.MCP.Servers {
+			if !server.Enabled {
+				continue
+			}
+			_, err := exec.LookPath(server.Command)
+			detail := "stdio " + server.Command
+			if err != nil {
+				detail = err.Error()
+			}
+			checks = append(checks, commands.DoctorCheck{
+				Name:   "mcp " + name,
+				OK:     err == nil,
+				Detail: detail,
+			})
+		}
+	} else {
+		checks = append(checks, commands.DoctorCheck{Name: "mcp", OK: true, Detail: "disabled"})
+	}
 
 	return commands.DoctorStatus{
 		Version:     commands.DefaultVersionInfo(),

@@ -12,7 +12,7 @@ import (
 	"github.com/Luew2/FreeCode/internal/core/model"
 )
 
-func TestPruneOrphanToolMessagesDropsUnclaimedToolMessages(t *testing.T) {
+func TestSanitizeToolCallHistoryDropsUnclaimedToolMessages(t *testing.T) {
 	// Replays the OpenAI 400 the user just hit: history contains a tool
 	// message with no preceding assistant tool_calls in scope. Without
 	// pruning, the next request fails server-side with status 400.
@@ -29,7 +29,7 @@ func TestPruneOrphanToolMessagesDropsUnclaimedToolMessages(t *testing.T) {
 	orphanTool.ToolCallID = "call_999_dropped"
 	finalUser := model.TextMessage(model.RoleUser, "follow up")
 
-	got := pruneOrphanToolMessages([]model.Message{user, assistantWithCall, tool1, orphanTool, finalUser})
+	got := sanitizeToolCallHistory([]model.Message{user, assistantWithCall, tool1, orphanTool, finalUser})
 	if len(got) != 4 {
 		t.Fatalf("messages = %d, want 4 (orphan dropped)", len(got))
 	}
@@ -73,7 +73,7 @@ func TestDebugBundleRedactsSecrets(t *testing.T) {
 	}
 }
 
-func TestPruneOrphanToolMessagesPreservesClaimedToolGroup(t *testing.T) {
+func TestSanitizeToolCallHistoryPreservesClaimedToolGroup(t *testing.T) {
 	user := model.TextMessage(model.RoleUser, "do two things")
 	assistant := model.Message{
 		Role: model.RoleAssistant,
@@ -87,25 +87,48 @@ func TestPruneOrphanToolMessagesPreservesClaimedToolGroup(t *testing.T) {
 	b := model.TextMessage(model.RoleTool, "result b")
 	b.ToolCallID = "b"
 
-	got := pruneOrphanToolMessages([]model.Message{user, assistant, a, b})
+	got := sanitizeToolCallHistory([]model.Message{user, assistant, a, b})
 	if len(got) != 4 {
 		t.Fatalf("messages = %d, want 4 (none dropped)", len(got))
 	}
 }
 
-func TestPruneOrphanToolMessagesDropsLeadingTool(t *testing.T) {
+func TestSanitizeToolCallHistoryDropsLeadingTool(t *testing.T) {
 	// Pure leading tool message with no preceding assistant — the
 	// HistoryWithBudget already strips this case but defending here too
-	// keeps pruneOrphanToolMessages safe to reuse anywhere.
+	// keeps sanitizeToolCallHistory safe to reuse anywhere.
 	stale := model.TextMessage(model.RoleTool, "stale leading tool")
 	stale.ToolCallID = "old_id"
 	user := model.TextMessage(model.RoleUser, "new question")
-	got := pruneOrphanToolMessages([]model.Message{stale, user})
+	got := sanitizeToolCallHistory([]model.Message{stale, user})
 	if len(got) != 1 {
 		t.Fatalf("messages = %d, want 1 (leading tool dropped)", len(got))
 	}
 	if got[0].Role != model.RoleUser {
 		t.Fatalf("kept message = %#v, want user", got[0])
+	}
+}
+
+func TestSanitizeToolCallHistoryDropsIncompleteAssistantToolGroup(t *testing.T) {
+	user := model.TextMessage(model.RoleUser, "do three things")
+	assistant := model.Message{
+		Role: model.RoleAssistant,
+		ToolCalls: []model.ToolCall{
+			{ID: "call_a", Name: "one"},
+			{ID: "call_b", Name: "two"},
+			{ID: "call_c", Name: "three"},
+		},
+	}
+	a := model.TextMessage(model.RoleTool, "result a")
+	a.ToolCallID = "call_a"
+	nextUser := model.TextMessage(model.RoleUser, "follow up")
+
+	got := sanitizeToolCallHistory([]model.Message{user, assistant, a, nextUser})
+	if len(got) != 2 {
+		t.Fatalf("messages = %d, want only user messages after incomplete group dropped: %#v", len(got), got)
+	}
+	if got[0].Role != model.RoleUser || got[1].Role != model.RoleUser {
+		t.Fatalf("messages = %#v, want assistant/tool group removed", got)
 	}
 }
 

@@ -135,6 +135,102 @@ func TestStoreRoundTripsEditorSettings(t *testing.T) {
 	}
 }
 
+func TestStoreRoundTripsMCPSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".freecode", "config.toml")
+	store := New(path)
+
+	settings := config.DefaultSettings()
+	settings.MCP.Enabled = true
+	settings.MCP.Servers = map[string]config.MCPServer{
+		"exa": {
+			Enabled:          true,
+			Transport:        "stdio",
+			Command:          "npx",
+			Args:             []string{"-y", "exa-mcp-server"},
+			Env:              []string{"EXA_API_KEY"},
+			ToolsPrefix:      "exa",
+			Capabilities:     []string{"network"},
+			ToolCapabilities: map[string][]string{"web_search": []string{"network"}},
+			StartupTimeoutMS: 5000,
+			CallTimeoutMS:    60000,
+			MaxOutputBytes:   32768,
+		},
+	}
+
+	if err := store.Save(context.Background(), settings); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	loaded, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := loaded.MCP.Servers["exa"]
+	if !loaded.MCP.Enabled || got.Command != "npx" || got.Args[1] != "exa-mcp-server" || got.Env[0] != "EXA_API_KEY" {
+		t.Fatalf("MCP settings = %#v", loaded.MCP)
+	}
+	if got.ToolCapabilities["web_search"][0] != "network" {
+		t.Fatalf("tool capabilities = %#v", got.ToolCapabilities)
+	}
+}
+
+func TestStoreRejectsInvalidMCPConfig(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name: "transport",
+			content: `
+[mcp]
+enabled = true
+
+[mcp.servers.bad]
+transport = "http"
+command = "server"
+`,
+			want: "unsupported",
+		},
+		{
+			name: "command",
+			content: `
+[mcp]
+enabled = true
+
+[mcp.servers.bad]
+transport = "stdio"
+`,
+			want: "command is required",
+		},
+		{
+			name: "capability",
+			content: `
+[mcp]
+enabled = true
+
+[mcp.servers.bad]
+transport = "stdio"
+command = "server"
+capabilities = ["telepathy"]
+`,
+			want: "unknown",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name+".toml")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			_, err := New(path).Load(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestStoreAtomicWriteRoundTrip(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), ".freecode")
 	path := filepath.Join(dir, "config.toml")

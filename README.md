@@ -79,6 +79,10 @@ a / r               approve or reject selected pending action
 :memory             inspect remembered structured context
 :doctor             run local diagnostics
 :debug-bundle       show a redacted bug-report bundle
+:mcp status         show configured MCP server status
+:mcp tools          list exposed MCP tools and visibility
+:mcp reload         restart MCP servers and refresh tool lists
+:mcp doctor         show MCP diagnostics
 :main / :back       return to the main orchestrator chat
 :o f1:12            open file id at line 12
 :y c1 / :Y c1       copy item by id without/with fences
@@ -123,6 +127,32 @@ Add an Anthropic-compatible provider:
 
 ```sh
 go run ./cmd/freecode provider add --name anthropic --base-url https://api.anthropic.com/v1 --api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-5 --protocol anthropic-messages
+```
+
+Enable an MCP server by editing `.freecode/config.toml`. MCP is opt-in, stdio-only in this version, and tools are exposed as `mcp_<server>_<tool>` behind FreeCode permissions.
+
+```toml
+[mcp]
+enabled = true
+
+[mcp.servers.exa]
+transport = "stdio"
+command = "npx"
+args = ["-y", "exa-mcp-server"]
+env = ["EXA_API_KEY"]
+tools_prefix = "exa"
+capabilities = ["network"]
+```
+
+For Exa hosted MCP, use a stdio bridge such as `mcp-remote` until native HTTP MCP support lands:
+
+```toml
+[mcp.servers.exa]
+transport = "stdio"
+command = "npx"
+args = ["-y", "mcp-remote", "https://mcp.exa.ai/mcp"]
+tools_prefix = "exa"
+capabilities = ["network"]
 ```
 
 Compact the current session log:

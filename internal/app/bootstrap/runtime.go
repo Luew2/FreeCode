@@ -12,6 +12,7 @@ import (
 
 	localclipboard "github.com/Luew2/FreeCode/internal/adapters/clipboard/local"
 	tomlconfig "github.com/Luew2/FreeCode/internal/adapters/config/toml"
+	mcpadapter "github.com/Luew2/FreeCode/internal/adapters/mcp"
 	anthropic_messages "github.com/Luew2/FreeCode/internal/adapters/model/anthropic_messages"
 	openai_chat "github.com/Luew2/FreeCode/internal/adapters/model/openai_chat"
 	envsecrets "github.com/Luew2/FreeCode/internal/adapters/secrets/env"
@@ -57,6 +58,7 @@ type Runtime struct {
 	WriteTools  ports.ToolRegistry
 	VerifyTools ports.ToolRegistry
 	Approval    *workbench.ApprovalGate
+	MCP         *mcpadapter.Manager
 
 	SessionID   session.ID
 	SessionPath string
@@ -143,7 +145,18 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.ApprovalMode == permission.ModeReadOnly {
 		activeTools = readTools
 	}
-	composite, err := toolregistry.NewCompositeToolRegistry(toolregistry.FromRegistry(activeTools))
+	var mcpManager *mcpadapter.Manager
+	if settings.MCP.Enabled {
+		mcpManager = mcpadapter.NewManager(mcpadapter.Options{
+			Settings:      settings.MCP,
+			WorkspaceRoot: workspace.Root(),
+			Version:       commands.DefaultVersionInfo().Version,
+		})
+		if err := mcpManager.Start(ctx); err != nil {
+			return nil, err
+		}
+	}
+	composite, err := composeActiveTools(activeTools, mcpManager, opts.ApprovalMode, approvalGate)
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +172,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		WriteTools:        writeTools,
 		VerifyTools:       verifyTools,
 		Approval:          approvalGate,
+		MCP:               mcpManager,
 		SessionID:         launch.ID,
 		SessionPath:       launch.Path,
 		SessionsDir:       sessionsDir,
@@ -186,7 +200,12 @@ func (r *Runtime) Close() error {
 		return nil
 	}
 	if closer, ok := r.Tools.(interface{ Close() error }); ok {
-		return closer.Close()
+		if err := closer.Close(); err != nil {
+			return err
+		}
+	}
+	if r.MCP != nil {
+		return r.MCP.Close()
 	}
 	return nil
 }
@@ -233,6 +252,7 @@ func (r *Runtime) Workbench(ctx context.Context) (*workbench.Service, error) {
 		Tools:           r.WriteTools,
 		Approval:        r.Approval,
 		Sessions:        r.Sessions,
+		MCP:             r.MCP,
 		Config:          r.Config,
 		LogForSession:   r.logForSession,
 		SessionID:       r.SessionID,
@@ -352,7 +372,10 @@ func (r *Runtime) askDependencies(ctx context.Context, tools ports.ToolRegistry,
 	if r.ApprovalMode() != permission.ModeReadOnly {
 		writableRoots = []string{r.WorkspaceRoot}
 		builder.Developer = strings.TrimSpace(builder.Developer + "\n\nUse apply_patch for scoped workspace edits and report changed files and verification. First call apply_patch without accepted or with accepted=false to preview the patch; only call it again with accepted=true after the preview is available.")
-		builder.Permissions = fmt.Sprintf("Reads are allowed inside the workspace. Approval mode is %s. apply_patch may write only after the patch preview has been produced, the preview_token is supplied, and the active permission policy allows the write. Do not attempt path traversal. Shell mutation, destructive git operations, and network tools are unavailable.", r.ApprovalMode())
+		builder.Permissions = fmt.Sprintf("Reads are allowed inside the workspace. Approval mode is %s. apply_patch may write only after the patch preview has been produced, the preview_token is supplied, and the active permission policy allows the write. Do not attempt path traversal. Built-in shell mutation, destructive git operations, and network tools are unavailable.", r.ApprovalMode())
+		if r.MCP != nil {
+			builder.Permissions += " Configured MCP tools may expose additional read, write, shell, network, or external-write capabilities; use only exposed tools and expect FreeCode to enforce their approval policy."
+		}
 	}
 	if eventLog == nil {
 		eventLog = r.EventLog
@@ -377,10 +400,17 @@ func (r *Runtime) ApprovalMode() permission.Mode {
 }
 
 func (r *Runtime) currentToolsForApproval(mode permission.Mode) ports.ToolRegistry {
+	var base ports.ToolRegistry
 	if mode == permission.ModeReadOnly {
-		return r.ReadTools
+		base = r.ReadTools
+	} else {
+		base = r.WriteTools
 	}
-	return r.WriteTools
+	tools, err := composeActiveTools(base, r.MCP, mode, r.Approval)
+	if err != nil {
+		return base
+	}
+	return tools
 }
 
 func (r *Runtime) environment(ctx context.Context, writableRoots []string) prompt.Environment {
@@ -504,4 +534,12 @@ func sessionTitle(workspaceRoot string, id session.ID) string {
 
 func composeTools(base ports.ToolRegistry, extra ports.ToolRegistry) (ports.ToolRegistry, error) {
 	return toolregistry.NewCompositeToolRegistry(toolregistry.FromRegistry(base), toolregistry.FromRegistry(extra))
+}
+
+func composeActiveTools(base ports.ToolRegistry, manager *mcpadapter.Manager, mode permission.Mode, gate ports.PermissionGate) (ports.ToolRegistry, error) {
+	providers := []toolregistry.ToolProvider{toolregistry.FromRegistry(base)}
+	if manager != nil {
+		providers = append(providers, manager.Provider(mode, gate))
+	}
+	return toolregistry.NewCompositeToolRegistry(providers...)
 }

@@ -75,6 +75,13 @@ type diagnosticsReporter interface {
 	DebugBundle(ctx context.Context) (workbench.State, error)
 }
 
+type mcpReporter interface {
+	MCPStatus(ctx context.Context) (workbench.State, error)
+	MCPTools(ctx context.Context) (workbench.State, error)
+	MCPReload(ctx context.Context) (workbench.State, error)
+	MCPDoctor(ctx context.Context) (workbench.State, error)
+}
+
 type modelSwitcher interface {
 	ListModels(ctx context.Context) ([]workbench.ModelEntry, error)
 	SetActiveModel(ctx context.Context, ref string) (workbench.State, error)
@@ -1794,6 +1801,14 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		}
 		m.state.Notice = "debug bundle is unavailable"
 		return m, nil
+	case "mcp.status":
+		return m.runMCPAction("status")
+	case "mcp.tools":
+		return m.runMCPAction("tools")
+	case "mcp.reload":
+		return m.runMCPAction("reload")
+	case "mcp.doctor":
+		return m.runMCPAction("doctor")
 	case "debug.toggle":
 		return m.toggleDebugMode()
 	case "debug.on":
@@ -2213,6 +2228,18 @@ func (m model) executeInvocation(invocation workbench.CommandInvocation) (tea.Mo
 		}
 		m.state.Notice = "debug bundle is unavailable"
 		return m, nil, true
+	case "mcp.status":
+		next, cmd := m.runMCPAction("status")
+		return next, cmd, true
+	case "mcp.tools":
+		next, cmd := m.runMCPAction("tools")
+		return next, cmd, true
+	case "mcp.reload":
+		next, cmd := m.runMCPAction("reload")
+		return next, cmd, true
+	case "mcp.doctor":
+		next, cmd := m.runMCPAction("doctor")
+		return next, cmd, true
 	case "debug.toggle":
 		next, cmd := m.toggleDebugMode()
 		return next, cmd, true
@@ -3568,6 +3595,27 @@ func (m model) runAction(fn func(context.Context) (workbench.State, error)) (tea
 	m.overlay = overlayNone
 	m = m.startRun()
 	return m, m.actionCmd(m.activeRun, fn)
+}
+
+func (m model) runMCPAction(action string) (tea.Model, tea.Cmd) {
+	reporter, ok := m.controller.(mcpReporter)
+	if !ok {
+		m.state.Notice = "mcp is unavailable"
+		return m, nil
+	}
+	switch action {
+	case "status":
+		return m.runAction(reporter.MCPStatus)
+	case "tools":
+		return m.runAction(reporter.MCPTools)
+	case "reload":
+		return m.runAction(reporter.MCPReload)
+	case "doctor":
+		return m.runAction(reporter.MCPDoctor)
+	default:
+		m.state.Notice = "unknown mcp action " + action
+		return m, nil
+	}
 }
 
 func (m model) startRun() model {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 
@@ -127,6 +128,7 @@ type settingsDTO struct {
 	EditorCommand   string                 `toml:"editor_command,omitempty"`
 	EditorDoubleEsc bool                   `toml:"editor_double_esc,omitempty"`
 	Permissions     *permissionDTO         `toml:"permissions,omitempty"`
+	MCP             *mcpDTO                `toml:"mcp,omitempty"`
 	Providers       map[string]providerDTO `toml:"providers,omitempty"`
 	Models          map[string]modelDTO    `toml:"models,omitempty"`
 	Agents          []agentDTO             `toml:"agents,omitempty"`
@@ -180,6 +182,26 @@ type permissionDTO struct {
 	DeniedPaths    []string `toml:"denied_paths,omitempty"`
 }
 
+type mcpDTO struct {
+	Enabled bool                    `toml:"enabled,omitempty"`
+	Servers map[string]mcpServerDTO `toml:"servers,omitempty"`
+}
+
+type mcpServerDTO struct {
+	Enabled          *bool               `toml:"enabled,omitempty"`
+	Transport        string              `toml:"transport,omitempty"`
+	Command          string              `toml:"command,omitempty"`
+	Args             []string            `toml:"args,omitempty"`
+	Env              []string            `toml:"env,omitempty"`
+	WorkDir          string              `toml:"work_dir,omitempty"`
+	ToolsPrefix      string              `toml:"tools_prefix,omitempty"`
+	Capabilities     []string            `toml:"capabilities,omitempty"`
+	ToolCapabilities map[string][]string `toml:"tool_capabilities,omitempty"`
+	StartupTimeoutMS int                 `toml:"startup_timeout_ms,omitempty"`
+	CallTimeoutMS    int                 `toml:"call_timeout_ms,omitempty"`
+	MaxOutputBytes   int                 `toml:"max_output_bytes,omitempty"`
+}
+
 func settingsDTOFromCore(settings config.Settings) settingsDTO {
 	dto := settingsDTO{
 		Version:         settings.Version,
@@ -206,6 +228,10 @@ func settingsDTOFromCore(settings config.Settings) settingsDTO {
 	if !reflect.DeepEqual(settings.Agents, agent.DefaultDefinitions()) {
 		dto.Agents = agentsDTOFromCore(settings.Agents)
 	}
+	if settings.MCP.Enabled || len(settings.MCP.Servers) > 0 {
+		mcp := mcpDTOFromCore(settings.MCP)
+		dto.MCP = &mcp
+	}
 	return dto
 }
 
@@ -226,6 +252,13 @@ func (dto settingsDTO) toCore() (config.Settings, error) {
 	settings.EditorDoubleEsc = dto.EditorDoubleEsc
 	if dto.Permissions != nil {
 		settings.Permissions = dto.Permissions.toCore()
+	}
+	if dto.MCP != nil {
+		mcp, err := dto.MCP.toCore()
+		if err != nil {
+			return config.Settings{}, err
+		}
+		settings.MCP = mcp
 	}
 
 	providers, err := dto.providersToCore()
@@ -478,6 +511,134 @@ func (dto permissionDTO) toCore() permission.Policy {
 	}
 }
 
+func mcpDTOFromCore(settings config.MCPSettings) mcpDTO {
+	dto := mcpDTO{
+		Enabled: settings.Enabled,
+		Servers: map[string]mcpServerDTO{},
+	}
+	for name, server := range settings.Servers {
+		enabled := server.Enabled
+		value := mcpServerDTO{
+			Transport:        server.Transport,
+			Command:          server.Command,
+			Args:             append([]string(nil), server.Args...),
+			Env:              append([]string(nil), server.Env...),
+			WorkDir:          server.WorkDir,
+			ToolsPrefix:      server.ToolsPrefix,
+			Capabilities:     append([]string(nil), server.Capabilities...),
+			ToolCapabilities: copyStringSliceMap(server.ToolCapabilities),
+			StartupTimeoutMS: server.StartupTimeoutMS,
+			CallTimeoutMS:    server.CallTimeoutMS,
+			MaxOutputBytes:   server.MaxOutputBytes,
+		}
+		if !enabled {
+			value.Enabled = &enabled
+		}
+		dto.Servers[name] = value
+	}
+	return dto
+}
+
+func (dto mcpDTO) toCore() (config.MCPSettings, error) {
+	settings := config.MCPSettings{
+		Enabled: dto.Enabled,
+		Servers: map[string]config.MCPServer{},
+	}
+	for name, value := range dto.Servers {
+		if name == "" {
+			return config.MCPSettings{}, errors.New("mcp.servers contains empty key")
+		}
+		enabled := true
+		if value.Enabled != nil {
+			enabled = *value.Enabled
+		}
+		server := config.MCPServer{
+			Enabled:          enabled,
+			Transport:        value.Transport,
+			Command:          value.Command,
+			Args:             append([]string(nil), value.Args...),
+			Env:              append([]string(nil), value.Env...),
+			WorkDir:          value.WorkDir,
+			ToolsPrefix:      value.ToolsPrefix,
+			Capabilities:     append([]string(nil), value.Capabilities...),
+			ToolCapabilities: copyStringSliceMap(value.ToolCapabilities),
+			StartupTimeoutMS: value.StartupTimeoutMS,
+			CallTimeoutMS:    value.CallTimeoutMS,
+			MaxOutputBytes:   value.MaxOutputBytes,
+		}
+		if server.Transport == "" {
+			server.Transport = "stdio"
+		}
+		if err := validateMCPServer(name, server); err != nil {
+			return config.MCPSettings{}, err
+		}
+		settings.Servers[name] = server
+	}
+	return settings, nil
+}
+
+func validateMCPServer(name string, server config.MCPServer) error {
+	if !server.Enabled {
+		return nil
+	}
+	if server.Transport != "stdio" {
+		return fmt.Errorf("mcp.servers.%s transport %q is unsupported; only stdio is supported", name, server.Transport)
+	}
+	if server.Command == "" {
+		return fmt.Errorf("mcp.servers.%s command is required", name)
+	}
+	if sanitizeMCPName(firstNonEmpty(server.ToolsPrefix, name)) == "" {
+		return fmt.Errorf("mcp.servers.%s tools_prefix must contain at least one letter or digit", name)
+	}
+	for _, capability := range server.Capabilities {
+		if !knownMCPCapability(capability) {
+			return fmt.Errorf("mcp.servers.%s capability %q is unknown", name, capability)
+		}
+	}
+	for tool, capabilities := range server.ToolCapabilities {
+		if tool == "" {
+			return fmt.Errorf("mcp.servers.%s tool_capabilities contains empty tool name", name)
+		}
+		for _, capability := range capabilities {
+			if !knownMCPCapability(capability) {
+				return fmt.Errorf("mcp.servers.%s tool %s capability %q is unknown", name, tool, capability)
+			}
+		}
+	}
+	return nil
+}
+
+func knownMCPCapability(value string) bool {
+	switch value {
+	case "read_workspace", "write_workspace", "shell", "network", "destructive_git", "external_write":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeMCPName(value string) string {
+	var builder strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '_' || r == '-':
+			builder.WriteByte('_')
+		}
+	}
+	return builder.String()
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func copyStringMap(values map[string]string) map[string]string {
 	if len(values) == 0 {
 		return nil
@@ -485,6 +646,17 @@ func copyStringMap(values map[string]string) map[string]string {
 	copied := make(map[string]string, len(values))
 	for key, value := range values {
 		copied[key] = value
+	}
+	return copied
+}
+
+func copyStringSliceMap(values map[string][]string) map[string][]string {
+	if len(values) == 0 {
+		return nil
+	}
+	copied := make(map[string][]string, len(values))
+	for key, value := range values {
+		copied[key] = append([]string(nil), value...)
 	}
 	return copied
 }

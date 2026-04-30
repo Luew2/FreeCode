@@ -584,7 +584,7 @@ func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
 	for _, command := range registry.Palette("") {
 		seen[command.ID] = command
 	}
-	for _, id := range []string{"item.copy", "item.copy.full", "item.copy.select", "mouse.toggle", "tab.ops", "terminal.share_output", "buffer.list", "model.list"} {
+	for _, id := range []string{"item.copy", "item.copy.full", "item.copy.select", "mouse.toggle", "tab.ops", "terminal.share_output", "buffer.list", "model.list", "mcp.status", "mcp.tools", "mcp.reload", "mcp.doctor"} {
 		if _, ok := seen[id]; !ok {
 			t.Fatalf("palette missing %s", id)
 		}
@@ -612,6 +612,44 @@ func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
 	}
 	if got, ok := registry.Complete("b wor", state); !ok || got != "b worker" {
 		t.Fatalf("Complete buffer = %q/%v", got, ok)
+	}
+	if invocation, ok := registry.ResolveLine(":mcp tools"); !ok || invocation.ID != "mcp.tools" {
+		t.Fatalf("ResolveLine :mcp tools = %#v/%v", invocation, ok)
+	}
+}
+
+func TestServiceMCPStatusToolsAndReload(t *testing.T) {
+	mcp := &fakeMCPController{status: ports.MCPStatus{
+		Enabled: true,
+		Servers: []ports.MCPServerStatus{{Name: "exa", State: "ready", Command: "npx -y exa-mcp-server", ToolCount: 1}},
+		Tools: []ports.MCPToolStatus{{
+			PublicName:   "mcp_exa_web_search",
+			ServerName:   "exa",
+			OriginalName: "web_search",
+			Visible:      true,
+			Capabilities: []string{"network"},
+		}},
+	}}
+	service := &Service{SessionID: "s1", MCP: mcp, Approval: NewApprovalGate(permission.ModeAsk)}
+	status, err := service.MCPStatus(context.Background())
+	if err != nil {
+		t.Fatalf("MCPStatus: %v", err)
+	}
+	if !strings.Contains(status.Detail.Body, "exa") {
+		t.Fatalf("status body = %s", status.Detail.Body)
+	}
+	tools, err := service.MCPTools(context.Background())
+	if err != nil {
+		t.Fatalf("MCPTools: %v", err)
+	}
+	if !strings.Contains(tools.Detail.Body, "mcp_exa_web_search") {
+		t.Fatalf("tools body = %s", tools.Detail.Body)
+	}
+	if _, err := service.MCPReload(context.Background()); err != nil {
+		t.Fatalf("MCPReload: %v", err)
+	}
+	if mcp.reloads != 1 {
+		t.Fatalf("reloads = %d, want 1", mcp.reloads)
 	}
 }
 
@@ -1454,4 +1492,21 @@ func (t failingTools) Tools() []model.ToolSpec {
 
 func (t failingTools) RunTool(ctx context.Context, call model.ToolCall) (ports.ToolResult, error) {
 	return ports.ToolResult{}, errors.New(t.err)
+}
+
+type fakeMCPController struct {
+	status  ports.MCPStatus
+	reloads int
+}
+
+func (m *fakeMCPController) Status(mode permission.Mode) ports.MCPStatus {
+	return m.status
+}
+
+func (m *fakeMCPController) Reload(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.reloads++
+	return nil
 }

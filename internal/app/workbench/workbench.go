@@ -52,6 +52,7 @@ type Service struct {
 	Submit    Submitter
 	Approval  *ApprovalGate
 	Sessions  SessionIndex
+	MCP       ports.MCPController
 	// Config powers the :models modal — listing every configured provider
 	// and switching the active model without dropping back to the CLI.
 	// Optional; nil disables the swap UI but everything else still works.
@@ -1583,6 +1584,28 @@ func (s *Service) Doctor(ctx context.Context) (State, error) {
 			checks = append(checks, "config: "+err.Error())
 		}
 	}
+	if s.MCP != nil {
+		status := s.MCP.Status(s.approvalMode())
+		ready := 0
+		failed := 0
+		visibleTools := 0
+		for _, server := range status.Servers {
+			switch server.State {
+			case "ready":
+				ready++
+			case "failed":
+				failed++
+			}
+		}
+		for _, tool := range status.Tools {
+			if tool.Visible {
+				visibleTools++
+			}
+		}
+		checks = append(checks, fmt.Sprintf("mcp: enabled=%t ready=%d failed=%d visible_tools=%d", status.Enabled, ready, failed, visibleTools))
+	} else {
+		checks = append(checks, "mcp: disabled")
+	}
 	state.Detail = Item{
 		ID:       "doctor",
 		Kind:     "diagnostics",
@@ -1591,6 +1614,81 @@ func (s *Service) Doctor(ctx context.Context) (State, error) {
 		MIMEType: "text/plain",
 	}
 	state.Notice = "doctor ready"
+	return state, nil
+}
+
+func (s *Service) MCPStatus(ctx context.Context) (State, error) {
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	state.Detail = Item{
+		ID:       "mcp-status",
+		Kind:     "mcp",
+		Title:    "MCP status",
+		Body:     renderMCPStatus(s.mcpStatus(), false),
+		MIMEType: "text/plain",
+	}
+	state.Notice = "mcp status"
+	return state, nil
+}
+
+func (s *Service) MCPTools(ctx context.Context) (State, error) {
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	state.Detail = Item{
+		ID:       "mcp-tools",
+		Kind:     "mcp",
+		Title:    "MCP tools",
+		Body:     renderMCPStatus(s.mcpStatus(), true),
+		MIMEType: "text/plain",
+	}
+	state.Notice = "mcp tools"
+	return state, nil
+}
+
+func (s *Service) MCPDoctor(ctx context.Context) (State, error) {
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	state.Detail = Item{
+		ID:       "mcp-doctor",
+		Kind:     "mcp",
+		Title:    "MCP doctor",
+		Body:     renderMCPStatus(s.mcpStatus(), true),
+		MIMEType: "text/plain",
+	}
+	state.Notice = "mcp doctor"
+	return state, nil
+}
+
+func (s *Service) MCPReload(ctx context.Context) (State, error) {
+	if s.MCP == nil {
+		state, err := s.Load(ctx)
+		if err != nil {
+			return State{}, err
+		}
+		state.Notice = "mcp is disabled"
+		return state, nil
+	}
+	if err := s.MCP.Reload(ctx); err != nil {
+		return State{}, err
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	state.Detail = Item{
+		ID:       "mcp-status",
+		Kind:     "mcp",
+		Title:    "MCP status",
+		Body:     renderMCPStatus(s.mcpStatus(), true),
+		MIMEType: "text/plain",
+	}
+	state.Notice = "mcp reloaded"
 	return state, nil
 }
 
@@ -1622,6 +1720,60 @@ func (s *Service) DebugBundle(ctx context.Context) (State, error) {
 	}
 	state.Notice = "debug bundle ready"
 	return state, nil
+}
+
+func (s *Service) mcpStatus() ports.MCPStatus {
+	if s == nil || s.MCP == nil {
+		return ports.MCPStatus{}
+	}
+	return s.MCP.Status(s.approvalMode())
+}
+
+func renderMCPStatus(status ports.MCPStatus, includeTools bool) string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("enabled: %t", status.Enabled))
+	if len(status.Servers) == 0 {
+		lines = append(lines, "servers: none")
+	} else {
+		lines = append(lines, "", "servers:")
+		for _, server := range status.Servers {
+			line := fmt.Sprintf("  - %s [%s] tools=%d command=%s", server.Name, firstNonEmpty(server.State, "configured"), server.ToolCount, firstNonEmpty(server.Command, "-"))
+			lines = append(lines, line)
+			if server.ServerInfo != "" {
+				lines = append(lines, "    server: "+server.ServerInfo)
+			}
+			if server.LastError != "" {
+				lines = append(lines, "    error: "+server.LastError)
+			}
+			if server.Stderr != "" {
+				lines = append(lines, "    stderr: "+server.Stderr)
+			}
+			if server.Instruction != "" {
+				lines = append(lines, "    instructions: "+server.Instruction)
+			}
+		}
+	}
+	if includeTools {
+		lines = append(lines, "", "tools:")
+		if len(status.Tools) == 0 {
+			lines = append(lines, "  none")
+		}
+		for _, tool := range status.Tools {
+			visibility := "visible"
+			if !tool.Visible {
+				visibility = "hidden: " + tool.HiddenReason
+			}
+			capabilities := strings.Join(tool.Capabilities, ",")
+			if capabilities == "" {
+				capabilities = "-"
+			}
+			if tool.Unclassified {
+				capabilities += " (unclassified)"
+			}
+			lines = append(lines, fmt.Sprintf("  - %s -> %s/%s [%s] caps=%s", tool.PublicName, tool.ServerName, tool.OriginalName, visibility, capabilities))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (s *Service) Palette(ctx context.Context) (State, error) {
@@ -2069,6 +2221,10 @@ func DefaultCommands() []Command {
 		command("context.noqueue", "Clear queued prompts", "Context", "Drop queued follow-up prompts without cancelling the active run.", ":noqueue", "queue", "clear", "drop"),
 		command("diagnostics.doctor", "Run doctor", "Diagnostics", "Check config, workspace, git, editor, terminal, and provider setup.", ":doctor", "doctor", "diagnostics", "health"),
 		command("diagnostics.debug_bundle", "Create debug bundle", "Diagnostics", "Show a redacted diagnostic bundle for bug reports.", ":debug-bundle", "debug", "bundle", "redact", "diagnostics"),
+		command("mcp.status", "MCP status", "Tools", "Show MCP server state and exposed tool counts.", ":mcp status", "mcp", "tools", "status"),
+		command("mcp.tools", "MCP tools", "Tools", "List MCP tools, mappings, visibility, and capabilities.", ":mcp tools", "mcp", "tools", "capabilities"),
+		command("mcp.reload", "Reload MCP servers", "Tools", "Restart configured MCP servers and refresh their tool lists.", ":mcp reload", "mcp", "reload", "restart"),
+		command("mcp.doctor", "MCP doctor", "Tools", "Show MCP configuration, startup, and permission diagnostics.", ":mcp doctor", "mcp", "doctor", "diagnostics"),
 		command("debug.toggle", "Toggle debug mode", "Diagnostics", "Toggle raw model chunk diagnostics.", ":debug", "debug", "diagnostics", "chunks"),
 		command("debug.on", "Enable debug mode", "Diagnostics", "Enable raw model chunk diagnostics.", ":debug on", "debug", "diagnostics", "chunks"),
 		command("debug.off", "Disable debug mode", "Diagnostics", "Disable raw model chunk diagnostics.", ":debug off", "debug", "diagnostics", "chunks"),

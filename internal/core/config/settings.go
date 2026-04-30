@@ -15,9 +15,30 @@ type Settings struct {
 	ActiveModel     model.Ref
 	Agents          []agent.Definition
 	Permissions     permission.Policy
+	MCP             MCPSettings
 	SessionsDir     string
 	EditorCommand   string
 	EditorDoubleEsc bool
+}
+
+type MCPSettings struct {
+	Enabled bool
+	Servers map[string]MCPServer
+}
+
+type MCPServer struct {
+	Enabled          bool
+	Transport        string
+	Command          string
+	Args             []string
+	Env              []string
+	WorkDir          string
+	ToolsPrefix      string
+	Capabilities     []string
+	ToolCapabilities map[string][]string
+	StartupTimeoutMS int
+	CallTimeoutMS    int
+	MaxOutputBytes   int
 }
 
 func DefaultSettings() Settings {
@@ -27,6 +48,7 @@ func DefaultSettings() Settings {
 		Models:        map[model.Ref]model.Model{},
 		Agents:        agent.DefaultDefinitions(),
 		Permissions:   permission.DefaultPolicy(),
+		MCP:           MCPSettings{Servers: map[string]MCPServer{}},
 		SessionsDir:   ".freecode/sessions",
 		EditorCommand: "nvim",
 	}
