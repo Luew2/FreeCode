@@ -98,6 +98,15 @@ func AskWithResponse(ctx context.Context, w io.Writer, deps AskDependencies, opt
 			}
 		}
 		priorMessages = contextmgr.HistoryWithBudget(messages, historyBudget)
+		// Defensive: drop any tool message whose tool_call_id is not
+		// claimed by a preceding assistant tool_calls in the replay.
+		// OpenAI rejects orphan tool messages with status 400 ("messages
+		// with role 'tool' must be a response to a preceeding message
+		// with 'tool_calls'"), and that error blocks the entire next
+		// turn. Orphans can creep in when an assistant turn was logged
+		// without its tool_calls payload (older log format, partial
+		// crash, etc.).
+		priorMessages = pruneOrphanToolMessages(priorMessages)
 	} else {
 		ctxText, _, err := contextmgr.BuildSessionContext(ctx, deps.Log, sessionID, sessionContextMax)
 		if err != nil {
@@ -133,4 +142,36 @@ func AskWithResponse(ctx context.Context, w io.Writer, deps AskDependencies, opt
 		}
 	}
 	return response, nil
+}
+
+// pruneOrphanToolMessages removes RoleTool messages whose tool_call_id is
+// not claimed by a preceding RoleAssistant tool_calls entry. The model
+// providers (OpenAI strictest among them) reject such replays with a 400.
+// Tracking the claimed set as we walk the slice handles partially-logged
+// assistant turns and stale legacy logs without dropping any valid pair.
+func pruneOrphanToolMessages(messages []model.Message) []model.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	claimed := map[string]bool{}
+	out := make([]model.Message, 0, len(messages))
+	for _, m := range messages {
+		switch m.Role {
+		case model.RoleAssistant:
+			for _, call := range m.ToolCalls {
+				if call.ID != "" {
+					claimed[call.ID] = true
+				}
+			}
+			out = append(out, m)
+		case model.RoleTool:
+			if m.ToolCallID == "" || !claimed[m.ToolCallID] {
+				continue
+			}
+			out = append(out, m)
+		default:
+			out = append(out, m)
+		}
+	}
+	return out
 }
