@@ -178,6 +178,22 @@ type Event struct {
 	Usage    *Usage
 	Error    string
 	Metadata map[string]string
+	// Diagnostics is populated on EventCompleted to surface what the model
+	// actually returned: finish_reason, chunk count, the count of tool
+	// calls dropped because of missing fields, raw last-chunk JSON when
+	// nothing else useful arrived. Used to debug "model returned nothing"
+	// situations so the orchestrator can show a meaningful error instead
+	// of swallowing them silently.
+	Diagnostics *Diagnostics
+}
+
+type Diagnostics struct {
+	FinishReason   string
+	ChunkCount     int
+	TextDeltaCount int
+	ToolCallCount  int
+	DroppedCalls   int
+	RawLastChunk   string
 }
 
 type ToolCall struct {

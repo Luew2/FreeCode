@@ -146,8 +146,10 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 	events <- model.Event{Type: model.EventStarted}
 	acc := anthropic.Message{}
 	streamErr := false
+	diag := &model.Diagnostics{}
 
 	for stream.Next() {
+		diag.ChunkCount++
 		event := stream.Current()
 		if err := acc.Accumulate(event); err != nil {
 			events <- model.Event{Type: model.EventError, Error: err.Error()}
@@ -158,10 +160,12 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 		case "content_block_start":
 			block := event.ContentBlock
 			if block.Type == "text" && block.Text != "" {
+				diag.TextDeltaCount++
 				events <- model.Event{Type: model.EventTextDelta, Text: block.Text}
 			}
 		case "content_block_delta":
 			if event.Delta.Type == "text_delta" {
+				diag.TextDeltaCount++
 				events <- model.Event{Type: model.EventTextDelta, Text: event.Delta.Text}
 			}
 		case "message_start":
@@ -182,6 +186,9 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 					TotalTokens:  int(usage.InputTokens + usage.OutputTokens),
 				}}
 			}
+			if reason := string(event.Delta.StopReason); reason != "" {
+				diag.FinishReason = reason
+			}
 		}
 	}
 	if err := stream.Err(); err != nil {
@@ -191,9 +198,15 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 	if streamErr {
 		return
 	}
+	if diag.FinishReason == "" {
+		if reason := string(acc.StopReason); reason != "" {
+			diag.FinishReason = reason
+		}
+	}
 	for _, block := range acc.Content {
 		if block.Type == "tool_use" {
 			args := normalizeArguments(string(block.Input))
+			diag.ToolCallCount++
 			events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
@@ -201,21 +214,30 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 			}}
 		}
 	}
-	events <- model.Event{Type: model.EventCompleted}
+	if raw := acc.RawJSON(); raw != "" {
+		if len(raw) > 2048 {
+			raw = raw[:2048] + "...[truncated]"
+		}
+		diag.RawLastChunk = raw
+	}
+	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
 }
 
 func (c *Client) readResponse(message *anthropic.Message, events chan<- model.Event) {
 	defer close(events)
 	events <- model.Event{Type: model.EventStarted}
 
+	diag := &model.Diagnostics{ChunkCount: 1, FinishReason: string(message.StopReason)}
 	for _, block := range message.Content {
 		switch block.Type {
 		case "text":
 			if block.Text != "" {
+				diag.TextDeltaCount++
 				events <- model.Event{Type: model.EventTextDelta, Text: block.Text}
 			}
 		case "tool_use":
 			args := normalizeArguments(string(block.Input))
+			diag.ToolCallCount++
 			events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
@@ -230,7 +252,13 @@ func (c *Client) readResponse(message *anthropic.Message, events chan<- model.Ev
 			TotalTokens:  int(message.Usage.InputTokens + message.Usage.OutputTokens),
 		}}
 	}
-	events <- model.Event{Type: model.EventCompleted}
+	if raw := message.RawJSON(); raw != "" {
+		if len(raw) > 2048 {
+			raw = raw[:2048] + "...[truncated]"
+		}
+		diag.RawLastChunk = raw
+	}
+	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
 }
 
 func (c *Client) toClientError(err error) error {

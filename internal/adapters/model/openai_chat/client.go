@@ -178,12 +178,16 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 
 	events <- model.Event{Type: model.EventStarted}
 	acc := openai.ChatCompletionAccumulator{}
-	seenChunk := false
+	diag := &model.Diagnostics{}
+	var lastChunkJSON string
 
 	for stream.Next() {
-		seenChunk = true
+		diag.ChunkCount++
 		chunk := stream.Current()
 		acc.AddChunk(chunk)
+		if raw := chunk.RawJSON(); raw != "" {
+			lastChunkJSON = raw
+		}
 
 		// Some providers stream a JSON envelope with an `error` field
 		// instead of using HTTP status codes. The SDK's ssestream layer
@@ -197,7 +201,11 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Content != "" {
+				diag.TextDeltaCount++
 				events <- model.Event{Type: model.EventTextDelta, Text: choice.Delta.Content}
+			}
+			if reason := string(choice.FinishReason); reason != "" {
+				diag.FinishReason = reason
 			}
 		}
 		if chunk.Usage.TotalTokens > 0 || chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
@@ -212,16 +220,26 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 		events <- model.Event{Type: model.EventError, Error: classifyStreamError(err)}
 		return
 	}
-	if !seenChunk {
+	if diag.ChunkCount == 0 {
 		events <- model.Event{Type: model.EventError, Error: "stream response did not contain data frames"}
 		return
 	}
 
 	for _, choice := range acc.Choices {
+		// Pick up finish_reason from the accumulated final-chunk view
+		// when none of the streamed deltas carried one (some providers
+		// only attach it to the [DONE] marker).
+		if diag.FinishReason == "" {
+			if reason := string(choice.FinishReason); reason != "" {
+				diag.FinishReason = reason
+			}
+		}
 		for _, call := range choice.Message.ToolCalls {
 			if call.ID == "" && call.Function.Name == "" && call.Function.Arguments == "" {
+				diag.DroppedCalls++
 				continue
 			}
+			diag.ToolCallCount++
 			events <- model.Event{
 				Type: model.EventToolCall,
 				ToolCall: &model.ToolCall{
@@ -232,7 +250,14 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 			}
 		}
 	}
-	events <- model.Event{Type: model.EventCompleted}
+	if diag.ChunkCount > 0 && len(lastChunkJSON) > 0 {
+		// Cap at 2KB so a runaway provider can't blow up our log file.
+		if len(lastChunkJSON) > 2048 {
+			lastChunkJSON = lastChunkJSON[:2048] + "...[truncated]"
+		}
+		diag.RawLastChunk = lastChunkJSON
+	}
+	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
 }
 
 func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- model.Event) {
@@ -248,12 +273,22 @@ func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- 
 		return
 	}
 
+	diag := &model.Diagnostics{ChunkCount: 1}
 	for _, choice := range completion.Choices {
+		if reason := string(choice.FinishReason); reason != "" {
+			diag.FinishReason = reason
+		}
 		if choice.Message.Content != "" {
+			diag.TextDeltaCount = 1
 			events <- model.Event{Type: model.EventTextDelta, Text: choice.Message.Content}
 		}
 		for _, call := range choice.Message.ToolCalls {
 			fn := call.Function
+			if call.ID == "" && fn.Name == "" && fn.Arguments == "" {
+				diag.DroppedCalls++
+				continue
+			}
+			diag.ToolCallCount++
 			events <- model.Event{
 				Type: model.EventToolCall,
 				ToolCall: &model.ToolCall{
@@ -271,7 +306,13 @@ func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- 
 			TotalTokens:  int(completion.Usage.TotalTokens),
 		}}
 	}
-	events <- model.Event{Type: model.EventCompleted}
+	if raw := completion.RawJSON(); raw != "" {
+		if len(raw) > 2048 {
+			raw = raw[:2048] + "...[truncated]"
+		}
+		diag.RawLastChunk = raw
+	}
+	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
 }
 
 // extractInlineError returns the human-readable error message from a

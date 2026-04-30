@@ -156,7 +156,14 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 			if text == "" && emptyRetries < maxEmptyRetries && step < maxSteps {
 				emptyRetries++
 				notice := fmt.Sprintf("model returned empty response, retrying %d/%d", emptyRetries, maxEmptyRetries)
-				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", notice, assistantMessagePayload(step, "empty_retry", nil)); err != nil {
+				if hint := diagnosticHint(turn.diagnostics); hint != "" {
+					notice += " (" + hint + ")"
+				}
+				payload := assistantMessagePayload(step, "empty_retry", nil)
+				if turn.diagnostics != nil {
+					payload["diagnostics"] = diagnosticsPayload(turn.diagnostics)
+				}
+				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", notice, payload); err != nil {
 					return Response{}, err
 				}
 				messages = append(messages, model.TextMessage(model.RoleDeveloper, emptyResponseRetryPrompt(emptyRetries, tools)))
@@ -258,6 +265,56 @@ func emptyResponseRetryPrompt(attempt int, tools []model.ToolSpec) string {
 	return "Your previous response was still empty. This is the last retry — respond with at least one word of text now, even if it is just a short status update like \"done\" or \"unable to proceed because <reason>\". Do not stay silent."
 }
 
+// diagnosticHint summarizes what the model actually returned in a one-line
+// human-readable form for the empty-retry chat notice. Returns "" when the
+// model client did not populate diagnostics or there is nothing useful to
+// say about the failure.
+func diagnosticHint(diag *model.Diagnostics) string {
+	if diag == nil {
+		return ""
+	}
+	var parts []string
+	if diag.FinishReason != "" {
+		parts = append(parts, "finish="+diag.FinishReason)
+	}
+	if diag.ChunkCount > 0 {
+		parts = append(parts, fmt.Sprintf("chunks=%d", diag.ChunkCount))
+	}
+	if diag.DroppedCalls > 0 {
+		parts = append(parts, fmt.Sprintf("dropped_tool_calls=%d", diag.DroppedCalls))
+	}
+	if diag.TextDeltaCount == 0 && diag.ToolCallCount == 0 {
+		parts = append(parts, "no text or tool_calls in response")
+	}
+	return strings.Join(parts, "; ")
+}
+
+func diagnosticsPayload(diag *model.Diagnostics) map[string]any {
+	if diag == nil {
+		return nil
+	}
+	out := map[string]any{
+		"chunk_count":      diag.ChunkCount,
+		"text_delta_count": diag.TextDeltaCount,
+		"tool_call_count":  diag.ToolCallCount,
+		"dropped_calls":    diag.DroppedCalls,
+	}
+	if diag.FinishReason != "" {
+		out["finish_reason"] = diag.FinishReason
+	}
+	if diag.RawLastChunk != "" {
+		// Cap a second time at 1KB for the JSONL log file: the larger raw
+		// response is already capped at 2KB by the client; this is just to
+		// keep individual log lines tractable.
+		raw := diag.RawLastChunk
+		if len(raw) > 1024 {
+			raw = raw[:1024] + "...[truncated]"
+		}
+		out["raw_last_chunk"] = raw
+	}
+	return out
+}
+
 func toolNameList(tools []model.ToolSpec) string {
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {
@@ -316,13 +373,15 @@ func terminalWriteNeedsRead(calls []model.ToolCall, tools []model.ToolSpec) bool
 }
 
 type modelTurn struct {
-	text      string
-	toolCalls []model.ToolCall
+	text        string
+	toolCalls   []model.ToolCall
+	diagnostics *model.Diagnostics
 }
 
 func (r Runner) collectModelTurn(ctx context.Context, sessionID session.ID, sequence *int, step int, events <-chan model.Event) (modelTurn, error) {
 	var text strings.Builder
 	var toolCalls []model.ToolCall
+	var diagnostics *model.Diagnostics
 
 	for event := range events {
 		if err := r.append(ctx, sessionID, sequence, session.EventModel, "model", event.Text, modelEventPayload(step, event)); err != nil {
@@ -335,12 +394,16 @@ func (r Runner) collectModelTurn(ctx context.Context, sessionID session.ID, sequ
 			if event.ToolCall != nil {
 				toolCalls = append(toolCalls, *event.ToolCall)
 			}
+		case model.EventCompleted:
+			if event.Diagnostics != nil {
+				diagnostics = event.Diagnostics
+			}
 		case model.EventError:
 			return modelTurn{}, errors.New(event.Error)
 		}
 	}
 
-	return modelTurn{text: text.String(), toolCalls: toolCalls}, nil
+	return modelTurn{text: text.String(), toolCalls: toolCalls, diagnostics: diagnostics}, nil
 }
 
 func (r Runner) runTool(ctx context.Context, sessionID session.ID, sequence *int, call model.ToolCall) (string, error) {

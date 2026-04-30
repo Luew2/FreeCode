@@ -363,7 +363,11 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 					if event.Type == session.EventAssistantMessage && !assistantPayloadHasToolCalls(event.Payload) {
 						streaming.Reset()
 						modelStarted = false
-						appendTranscript(TranscriptAssistant, event.Actor, "assistant", "(no response)", transcriptEventMeta(event))
+						placeholder := "(no response)"
+						if hint := assistantDiagnosticHint(event.Payload); hint != "" {
+							placeholder = "(no response — " + hint + ")"
+						}
+						appendTranscript(TranscriptAssistant, event.Actor, "assistant", placeholder, transcriptEventMeta(event))
 					}
 					continue
 				}
@@ -2275,6 +2279,44 @@ func stringValue(value any) string {
 	default:
 		return ""
 	}
+}
+
+// assistantDiagnosticHint extracts a human-readable summary from the
+// orchestrator's diagnostics payload (logged on empty / no-response model
+// turns). Returns "" when no diagnostics were attached.
+func assistantDiagnosticHint(payload map[string]any) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	diag, ok := payload["diagnostics"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	if reason := stringValue(diag["finish_reason"]); reason != "" {
+		parts = append(parts, "finish="+reason)
+	}
+	if dropped := intValue(diag["dropped_calls"]); dropped > 0 {
+		parts = append(parts, fmt.Sprintf("dropped %d malformed tool calls", dropped))
+	}
+	if len(parts) == 0 {
+		if chunks := intValue(diag["chunk_count"]); chunks > 0 {
+			parts = append(parts, fmt.Sprintf("got %d chunks but no usable content", chunks))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func intValue(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
 }
 
 // assistantPayloadHasToolCalls reports whether an EventAssistantMessage
