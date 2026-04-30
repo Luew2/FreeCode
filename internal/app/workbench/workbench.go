@@ -1,6 +1,7 @@
 package workbench
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -9,12 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Luew2/FreeCode/internal/app/commands"
 	"github.com/Luew2/FreeCode/internal/app/contextmgr"
 	"github.com/Luew2/FreeCode/internal/core/artifact"
 	"github.com/Luew2/FreeCode/internal/core/config"
@@ -1163,6 +1166,22 @@ func (s *Service) ResumeSession(ctx context.Context, id session.ID) (State, erro
 	return state, nil
 }
 
+func currentSessionSummary(ctx context.Context, index SessionIndex, workspaceRoot string, id session.ID) SessionSummary {
+	if index == nil || id == "" {
+		return SessionSummary{}
+	}
+	sessions, err := index.List(ctx, workspaceRoot)
+	if err != nil {
+		return SessionSummary{}
+	}
+	for _, summary := range sessions {
+		if summary.ID == id {
+			return summary
+		}
+	}
+	return SessionSummary{}
+}
+
 func (s *Service) RenameSession(ctx context.Context, title string) (State, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
@@ -1278,6 +1297,112 @@ func (s *Service) Compact(ctx context.Context) (State, error) {
 	return state, nil
 }
 
+func (s *Service) Memory(ctx context.Context) (State, error) {
+	if s.Log == nil {
+		return State{}, errors.New("event log is not configured")
+	}
+	body, tokens, err := contextmgr.BuildSessionContext(ctx, s.Log, s.SessionID, 4096)
+	if err != nil {
+		return State{}, err
+	}
+	if strings.TrimSpace(body) == "" {
+		body = "No remembered session state yet."
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	state.Detail = Item{
+		ID:       "memory",
+		Kind:     "context",
+		Title:    "Remembered state",
+		Body:     body,
+		MIMEType: "text/plain",
+		Meta: map[string]string{
+			"estimated_tokens": strconv.Itoa(tokens),
+		},
+	}
+	state.Notice = "remembered state ~" + strconv.Itoa(tokens) + " tokens"
+	return state, nil
+}
+
+func (s *Service) Doctor(ctx context.Context) (State, error) {
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	var checks []string
+	checks = append(checks, "go: "+runtime.Version()+" "+runtime.GOOS+"/"+runtime.GOARCH)
+	if s.WorkspaceRoot != "" {
+		checks = append(checks, "workspace: "+s.WorkspaceRoot)
+	}
+	if s.Git != nil {
+		if status, err := s.Git.Status(ctx); err == nil {
+			checks = append(checks, "git: branch "+status.Branch)
+		} else {
+			checks = append(checks, "git: "+err.Error())
+		}
+	}
+	editor := firstNonEmpty(s.EditorCommand, "nvim")
+	editorCommand := "nvim"
+	if fields := strings.Fields(editor); len(fields) > 0 {
+		editorCommand = fields[0]
+	}
+	if _, err := exec.LookPath(editorCommand); err == nil {
+		checks = append(checks, "editor: "+editor)
+	} else {
+		checks = append(checks, "editor: "+err.Error())
+	}
+	if s.Config != nil {
+		if settings, err := s.Config.Load(ctx); err == nil {
+			checks = append(checks, "config: loaded")
+			checks = append(checks, "active model: "+settings.ActiveModel.String())
+			checks = append(checks, "write approval: "+string(settings.Permissions.Write))
+		} else {
+			checks = append(checks, "config: "+err.Error())
+		}
+	}
+	state.Detail = Item{
+		ID:       "doctor",
+		Kind:     "diagnostics",
+		Title:    "Doctor",
+		Body:     strings.Join(checks, "\n"),
+		MIMEType: "text/plain",
+	}
+	state.Notice = "doctor ready"
+	return state, nil
+}
+
+func (s *Service) DebugBundle(ctx context.Context) (State, error) {
+	var buf bytes.Buffer
+	sessionPath := ""
+	if summary := currentSessionSummary(ctx, s.Sessions, s.WorkspaceRoot, s.SessionID); summary.LogPath != "" {
+		sessionPath = summary.LogPath
+	}
+	if err := commands.WriteDebugBundle(ctx, &buf, commands.DebugBundleOptions{
+		WorkDir:     s.WorkspaceRoot,
+		SessionPath: sessionPath,
+		SessionID:   string(s.SessionID),
+		MaxBytes:    128 * 1024,
+		Now:         s.now,
+	}); err != nil {
+		return State{}, err
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	state.Detail = Item{
+		ID:       "debug-bundle",
+		Kind:     "diagnostics",
+		Title:    "Debug bundle",
+		Body:     buf.String(),
+		MIMEType: "text/markdown",
+	}
+	state.Notice = "debug bundle ready"
+	return state, nil
+}
+
 func (s *Service) Palette(ctx context.Context) (State, error) {
 	state, err := s.Load(ctx)
 	if err != nil {
@@ -1366,6 +1491,22 @@ func (s *Service) logPermission(ctx context.Context, action string, id string, r
 	if s.Log == nil {
 		return nil
 	}
+	decision := permission.DecisionDeny
+	if action == "approved" {
+		decision = permission.DecisionAllow
+	}
+	payloadText := strings.Join([]string{string(request.Action), request.Subject, request.Reason, id, action}, "\x00")
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(payloadText)))
+	audit := permission.AuditDecision{
+		Action:   request.Action,
+		Subject:  request.Subject,
+		Reason:   request.Reason,
+		Decision: decision,
+		Actor:    "user",
+		Payload:  payloadText,
+		Digest:   digest,
+		At:       s.now(),
+	}
 	return s.Log.Append(ctx, session.Event{
 		ID:        s.eventID("perm"),
 		SessionID: s.SessionID,
@@ -1379,6 +1520,12 @@ func (s *Service) logPermission(ctx context.Context, action string, id string, r
 			"action":   string(request.Action),
 			"subject":  request.Subject,
 			"reason":   request.Reason,
+			"audit": map[string]any{
+				"actor":    audit.Actor,
+				"decision": string(audit.Decision),
+				"digest":   audit.Digest,
+				"at":       audit.At.Format(time.RFC3339Nano),
+			},
 		},
 	})
 }
@@ -1686,6 +1833,10 @@ func DefaultCommands() []Command {
 		command("approval.auto", "Set approval auto", "Approvals", "Auto-approve normal workspace writes for this session.", ":approval auto", "approval", "auto", "permissions"),
 		command("approval.danger", "Confirm danger mode", "Approvals", "Approve all tool classes for this session after explicit confirmation.", ":danger confirm", "danger", "permissions"),
 		command("context.compact", "Compact context", "Context", "Write a compact summary for the active session.", ":compact", "compact", "context"),
+		command("context.memory", "Show remembered state", "Context", "Show the structured context FreeCode will carry into future turns.", ":memory", "memory", "handoff", "state", "context"),
+		command("context.cancel", "Cancel active run", "Context", "Cancel the active model/tool run and drop queued follow-ups.", ":cancel", "cancel", "interrupt", "stop"),
+		command("diagnostics.doctor", "Run doctor", "Diagnostics", "Check config, workspace, git, editor, terminal, and provider setup.", ":doctor", "doctor", "diagnostics", "health"),
+		command("diagnostics.debug_bundle", "Create debug bundle", "Diagnostics", "Show a redacted diagnostic bundle for bug reports.", ":debug-bundle", "debug", "bundle", "redact", "diagnostics"),
 		command("settings.open", "Settings", "Provider", "Show provider, model, approval, and editor settings.", ":settings", "settings", "provider", "model", "editor"),
 		command("palette.open", "Command palette", "Help", "Open searchable commands and tutorial shortcuts.", "Ctrl+K", "help", "commands", "cheat sheet"),
 		command("quit", "Quit", "Help", "Exit FreeCode.", "q", "quit", "exit"),

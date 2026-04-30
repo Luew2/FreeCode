@@ -5,6 +5,11 @@ import (
 	"io"
 )
 
+type DoctorOptions struct {
+	ConfigPath string
+	WorkDir    string
+}
+
 type RuntimeStatus struct {
 	GoVersion string
 	GOOS      string
@@ -18,10 +23,13 @@ type DoctorCheck struct {
 }
 
 type DoctorStatus struct {
-	Version VersionInfo
-	WorkDir string
-	Runtime RuntimeStatus
-	Checks  []DoctorCheck
+	Version     VersionInfo
+	WorkDir     string
+	ConfigPath  string
+	ActiveModel string
+	Approval    string
+	Runtime     RuntimeStatus
+	Checks      []DoctorCheck
 }
 
 func PrintDoctor(w io.Writer, status DoctorStatus) error {
@@ -34,6 +42,26 @@ func PrintDoctor(w io.Writer, status DoctorStatus) error {
 	}
 	if _, err := fmt.Fprintf(w, "version: %s\n", version.Version); err != nil {
 		return err
+	}
+	if version.Commit != "" && version.Commit != "unknown" {
+		if _, err := fmt.Fprintf(w, "commit: %s\n", version.Commit); err != nil {
+			return err
+		}
+	}
+	if status.ConfigPath != "" {
+		if _, err := fmt.Fprintf(w, "config: %s\n", status.ConfigPath); err != nil {
+			return err
+		}
+	}
+	if status.ActiveModel != "" {
+		if _, err := fmt.Fprintf(w, "active_model: %s\n", status.ActiveModel); err != nil {
+			return err
+		}
+	}
+	if status.Approval != "" {
+		if _, err := fmt.Fprintf(w, "approval: %s\n", status.Approval); err != nil {
+			return err
+		}
 	}
 	if _, err := fmt.Fprintf(w, "go: %s %s/%s\n", status.Runtime.GoVersion, status.Runtime.GOOS, status.Runtime.GOARCH); err != nil {
 		return err

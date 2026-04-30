@@ -184,7 +184,10 @@ func TestInsertLeadingColonCommandRunsCommandInsteadOfChat(t *testing.T) {
 	}
 }
 
-func TestBusyBlocksSecondSubmitAndStaleAction(t *testing.T) {
+func TestBusyQueuesSecondSubmitAndIgnoresStaleAction(t *testing.T) {
+	// User flow: a turn is already running (m.busy=true) and the user types
+	// another prompt. Old behaviour blocked it; new behaviour queues it so
+	// long swarm runs don't make the chat composer unusable.
 	controller := &fakeController{state: workbench.State{Approval: permission.ModeAuto, Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)
 	m.busy = true
@@ -194,20 +197,109 @@ func TestBusyBlocksSecondSubmitAndStaleAction(t *testing.T) {
 
 	next, cmd := m.submit(false)
 	if cmd != nil {
-		t.Fatalf("busy submit returned cmd, want blocked")
+		t.Fatalf("busy submit returned cmd, want queue (no immediate fire)")
 	}
 	m = next.(model)
 	if controller.submitted.Text != "" {
-		t.Fatalf("submitted = %#v, want no second submit", controller.submitted)
+		t.Fatalf("submitted = %#v, want no immediate dispatch while busy", controller.submitted)
 	}
-	if !strings.Contains(m.state.Notice, "still running") {
-		t.Fatalf("notice = %q, want busy notice", m.state.Notice)
+	if len(m.submitQueue) != 1 || m.submitQueue[0].text != "hello" {
+		t.Fatalf("submitQueue = %#v, want one queued prompt 'hello'", m.submitQueue)
+	}
+	if !strings.Contains(m.state.Notice, "queued") {
+		t.Fatalf("notice = %q, want queued notice", m.state.Notice)
 	}
 
 	next, _ = m.Update(actionMsg{runID: 1, state: workbench.State{Notice: "stale"}})
 	m = next.(model)
 	if m.state.Notice == "stale" {
 		t.Fatalf("stale action replaced state")
+	}
+	// Stale runID must not drain the queue either — that prompt belongs to
+	// the still-active activeRun=2.
+	if controller.submitted.Text != "" {
+		t.Fatalf("submitted after stale = %#v, want no dispatch", controller.submitted)
+	}
+	if len(m.submitQueue) != 1 {
+		t.Fatalf("submitQueue after stale = %d, want 1", len(m.submitQueue))
+	}
+}
+
+func TestBusyQueueDrainsAfterCurrentRunCompletes(t *testing.T) {
+	// User types two prompts during a single busy turn; both should queue,
+	// the first should auto-fire when the active run lands, and the second
+	// should still be pending behind it.
+	controller := &fakeController{state: workbench.State{Approval: permission.ModeAuto, Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.busy = true
+	m.activeRun = 5
+	m.actionSeq = 5
+
+	m.composer.SetValue("first")
+	next, _ := m.submit(false)
+	m = next.(model)
+	m.composer.SetValue("second")
+	next, _ = m.submit(false)
+	m = next.(model)
+	if len(m.submitQueue) != 2 {
+		t.Fatalf("submitQueue = %d, want 2", len(m.submitQueue))
+	}
+
+	next, cmd := m.Update(actionMsg{runID: 5, state: workbench.State{Approval: permission.ModeAuto, Notice: "turn done"}})
+	if cmd == nil {
+		t.Fatalf("actionMsg with queued items returned nil cmd, want drain")
+	}
+	m = next.(model)
+	// After the first drain the model has already popped "first" off the
+	// queue and started a new run for it. "second" is still queued behind.
+	// (We don't execute the returned cmd yet — the controller hasn't been
+	// hit, but the queue+busy bookkeeping happens synchronously.)
+	if !m.busy {
+		t.Fatalf("busy = false after drain, want true (queued prompt now running)")
+	}
+	if len(m.submitQueue) != 1 || m.submitQueue[0].text != "second" {
+		t.Fatalf("submitQueue after first drain = %#v, want ['second']", m.submitQueue)
+	}
+	// Executing the cmd is what actually delivers the queued prompt to the
+	// controller — which is the proof "first" went out before "second".
+	msg := firstActionMsg(t, cmd)
+	if controller.submitted.Text != "first" {
+		t.Fatalf("submitted = %#v, want first queued prompt to fire first", controller.submitted)
+	}
+	// And consuming that follow-up actionMsg drains "second" too.
+	next, _ = m.Update(msg)
+	m = next.(model)
+	if len(m.submitQueue) != 0 {
+		t.Fatalf("submitQueue after both drains = %#v, want empty", m.submitQueue)
+	}
+}
+
+func TestCancelClearsQueuedSubmits(t *testing.T) {
+	// :cancel must drop pending queued prompts without disturbing the
+	// in-flight run. We don't try to interrupt the current turn — that
+	// requires Submit-side context plumbing the user hasn't asked for.
+	controller := &fakeController{state: workbench.State{Approval: permission.ModeAuto, Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.busy = true
+	m.activeRun = 7
+	m.submitQueue = []queuedSubmit{
+		{text: "a", approval: permission.ModeAuto},
+		{text: "b", approval: permission.ModeAuto},
+	}
+
+	next, cmd := m.executeLine(":cancel")
+	if cmd != nil {
+		t.Fatalf(":cancel returned cmd, want immediate notice update")
+	}
+	m = next.(model)
+	if len(m.submitQueue) != 0 {
+		t.Fatalf("submitQueue after :cancel = %d, want 0", len(m.submitQueue))
+	}
+	if !strings.Contains(m.state.Notice, "cancelled 2") {
+		t.Fatalf("notice = %q, want cancelled-count message", m.state.Notice)
+	}
+	if !m.busy {
+		t.Fatalf("busy flipped off, want :cancel to leave the in-flight run alone")
 	}
 }
 

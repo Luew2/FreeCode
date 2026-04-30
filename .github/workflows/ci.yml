@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./...
+      - run: go vet ./...
+      - name: targeted race tests
+        run: go test -race ./internal/adapters/tui2 ./internal/app/orchestrator ./internal/adapters/session/jsonl ./internal/adapters/tools/builtin ./internal/app/workbench
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -ldflags "-X github.com/Luew2/FreeCode/internal/app/commands.Version=${GITHUB_REF_NAME:-dev} -X github.com/Luew2/FreeCode/internal/app/commands.Commit=${GITHUB_SHA:-unknown} -X github.com/Luew2/FreeCode/internal/app/commands.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ./cmd/freecode

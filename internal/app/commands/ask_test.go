@@ -3,7 +3,11 @@ package commands
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Luew2/FreeCode/internal/core/model"
 )
@@ -36,6 +40,36 @@ func TestPruneOrphanToolMessagesDropsUnclaimedToolMessages(t *testing.T) {
 	}
 	if got[2].Role != model.RoleTool || got[2].ToolCallID != "call_1" {
 		t.Fatalf("kept-tool message lost: %#v", got[2])
+	}
+}
+
+func TestDebugBundleRedactsSecrets(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.toml")
+	sessionPath := filepath.Join(root, "session.jsonl")
+	if err := os.WriteFile(configPath, []byte("api_key = \"lilac_sk_abc123456789\"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile config: %v", err)
+	}
+	if err := os.WriteFile(sessionPath, []byte("Authorization: Bearer sk-testsecretvalue\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile session: %v", err)
+	}
+	var out bytes.Buffer
+	err := WriteDebugBundle(context.Background(), &out, DebugBundleOptions{
+		WorkDir:     root,
+		ConfigPath:  configPath,
+		SessionPath: sessionPath,
+		SessionID:   "s1",
+		Now:         func() time.Time { return time.Unix(1, 0).UTC() },
+	})
+	if err != nil {
+		t.Fatalf("WriteDebugBundle returned error: %v", err)
+	}
+	text := out.String()
+	if strings.Contains(text, "abc123456789") || strings.Contains(text, "sk-testsecretvalue") {
+		t.Fatalf("bundle leaked secret: %s", text)
+	}
+	if !strings.Contains(text, "[REDACTED]") || !strings.Contains(text, "session_id: s1") {
+		t.Fatalf("bundle = %s, want redacted contents and session metadata", text)
 	}
 }
 

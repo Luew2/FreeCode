@@ -51,6 +51,29 @@ func TestLogStreamSurfacesMalformedLineCount(t *testing.T) {
 	}
 }
 
+func TestLogStreamRecoversTruncatedTrailingRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	contents := `{"ID":"e1","SessionID":"s1","Type":"user_message","Actor":"user","Text":"hello"}
+{"ID":"e2","SessionID":"s1","Type":"assistant_message"`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	stream, err := New(path).Stream(context.Background(), "s1")
+	if err != nil {
+		t.Fatalf("Stream returned error: %v", err)
+	}
+	var got []session.Event
+	for event := range stream {
+		got = append(got, event)
+	}
+	if len(got) != 2 || got[0].Text != "hello" || got[1].Type != session.EventError {
+		t.Fatalf("events = %#v, want valid event plus recovery warning", got)
+	}
+	if got[1].Payload["truncated_tail"] != true {
+		t.Fatalf("payload = %#v, want truncated_tail true", got[1].Payload)
+	}
+}
+
 func TestLogAppendAndStream(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	log := New(path)
@@ -80,5 +103,8 @@ func TestLogAppendAndStream(t *testing.T) {
 	}
 	if got[0].Text != "hello" || got[1].Text != "done" {
 		t.Fatalf("events = %#v, want s1 events", got)
+	}
+	if got[0].Version != session.EventFormatVersion || got[1].Version != session.EventFormatVersion {
+		t.Fatalf("events = %#v, want current event version", got)
 	}
 }

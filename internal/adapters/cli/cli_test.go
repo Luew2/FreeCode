@@ -55,6 +55,49 @@ func TestProviderAddSkipProbeWritesConfigWithoutAPIKeyValue(t *testing.T) {
 	}
 }
 
+func TestDoctorAndDebugBundleCommands(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, ".freecode", "config.toml")
+	sessionPath := filepath.Join(root, "session.jsonl")
+	t.Setenv("LOCAL_API_KEY", "sk-test-secret")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := Run([]string{
+		"provider", "add",
+		"--name", "local",
+		"--base-url", "http://example.test/v1",
+		"--api-key-env", "LOCAL_API_KEY",
+		"--model", "coder",
+		"--protocol", "openai-chat",
+		"--config", configPath,
+		"--skip-probe",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("provider add exit = %d, stderr = %q", code, stderr.String())
+	}
+	if err := os.WriteFile(sessionPath, []byte("Authorization: Bearer sk-test-secret\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile session: %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"doctor", "--config", configPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doctor exit = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "active_model: local/coder") || !strings.Contains(stdout.String(), "api key") {
+		t.Fatalf("doctor output = %q, want active model and api key check", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"debug-bundle", "--config", configPath, "--session", sessionPath, "--session-id", "s1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("debug-bundle exit = %d, stderr = %q", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "sk-test-secret") || !strings.Contains(stdout.String(), "[REDACTED]") {
+		t.Fatalf("debug bundle output = %q, want redacted secret", stdout.String())
+	}
+}
+
 func TestMetadataEventLogTagsDirectedAgentEvents(t *testing.T) {
 	inner := &recordingEventLog{}
 	log := metadataEventLog{

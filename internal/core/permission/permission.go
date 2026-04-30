@@ -1,6 +1,9 @@
 package permission
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Action is a capability FreeCode may need to perform while helping a user.
 type Action string
@@ -32,6 +35,18 @@ type Policy struct {
 	DestructiveGit Decision
 	AllowedPaths   []string
 	DeniedPaths    []string
+}
+
+type AuditDecision struct {
+	Action    Action
+	Subject   string
+	Reason    string
+	Decision  Decision
+	Actor     string
+	Payload   string
+	Digest    string
+	ExpiresAt time.Time
+	At        time.Time
 }
 
 type Mode string
@@ -72,6 +87,31 @@ func DefaultPolicy() Policy {
 		Shell:          DecisionAsk,
 		Network:        DecisionDeny,
 		DestructiveGit: DecisionDeny,
+		DeniedPaths:    DefaultDeniedPaths(),
+	}
+}
+
+func DefaultDeniedPaths() []string {
+	return []string{
+		".env",
+		".env.*",
+		"**/.env",
+		"**/.env.*",
+		".freecode",
+		".ssh",
+		"**/.ssh",
+		"**/*_rsa",
+		"**/*_dsa",
+		"**/*_ecdsa",
+		"**/*_ed25519",
+		"**/id_rsa",
+		"**/id_dsa",
+		"**/id_ecdsa",
+		"**/id_ed25519",
+		"**/*.pem",
+		"**/*.key",
+		"**/*credentials*",
+		"**/*secrets*",
 	}
 }
 
@@ -84,6 +124,7 @@ func PolicyForMode(mode Mode) Policy {
 			Shell:          DecisionDeny,
 			Network:        DecisionDeny,
 			DestructiveGit: DecisionDeny,
+			DeniedPaths:    DefaultDeniedPaths(),
 		}
 	case ModeAsk:
 		return Policy{
@@ -92,6 +133,7 @@ func PolicyForMode(mode Mode) Policy {
 			Shell:          DecisionAsk,
 			Network:        DecisionAsk,
 			DestructiveGit: DecisionDeny,
+			DeniedPaths:    DefaultDeniedPaths(),
 		}
 	case ModeAuto:
 		return Policy{
@@ -100,6 +142,7 @@ func PolicyForMode(mode Mode) Policy {
 			Shell:          DecisionAsk,
 			Network:        DecisionAsk,
 			DestructiveGit: DecisionDeny,
+			DeniedPaths:    DefaultDeniedPaths(),
 		}
 	case ModeDanger:
 		return Policy{
@@ -121,6 +164,10 @@ func MergePolicyWithMode(base Policy, mode Mode) Policy {
 	base.Shell = mergeDecision(base.Shell, modePolicy.Shell)
 	base.Network = mergeDecision(base.Network, modePolicy.Network)
 	base.DestructiveGit = mergeDecision(base.DestructiveGit, modePolicy.DestructiveGit)
+	if mode == ModeDanger {
+		base.AllowedPaths = nil
+		base.DeniedPaths = nil
+	}
 	return base
 }
 

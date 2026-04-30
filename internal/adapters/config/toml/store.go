@@ -211,6 +211,9 @@ func settingsDTOFromCore(settings config.Settings) settingsDTO {
 
 func (dto settingsDTO) toCore() (config.Settings, error) {
 	settings := config.DefaultSettings()
+	if dto.Version > config.CurrentVersion {
+		return config.Settings{}, fmt.Errorf("config version %d is newer than supported version %d", dto.Version, config.CurrentVersion)
+	}
 	if dto.Version != 0 {
 		settings.Version = dto.Version
 	}

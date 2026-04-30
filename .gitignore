@@ -2,4 +2,5 @@
 /freecode
 *.test
 coverage.out
+artifacts/
 docs/*plan*.md

@@ -2,7 +2,7 @@
 
 FreeCode is a Vim-shaped coding CLI: fast, modal, keyboard-first, and built around addressable artifacts. It is intended to make arbitrary inference endpoints boring to configure while keeping every model request, tool call, file edit, patch, and agent trace inspectable.
 
-The current MVP has a provider-neutral Go core, OpenAI-compatible `/v1/chat/completions` and Anthropic-compatible `/v1/messages` support, read tools, preview-gated patch writes, JSONL session logs, Git status/diff commands, context compaction, swarm agents, and a Bubble Tea terminal workbench.
+The current MVP has a provider-neutral Go core, OpenAI-compatible `/v1/chat/completions` and Anthropic-compatible `/v1/messages` support, read tools, preview-gated patch writes, JSONL session logs with recovery, Git status/diff commands, structured context compaction, swarm agents, persistent terminal sharing, diagnostics, and a Bubble Tea terminal workbench.
 
 ## Local Development
 
@@ -68,12 +68,16 @@ Ctrl+A              cycle read-only -> ask -> auto approval
 :st off             revoke direct terminal sharing
 :share-term [n]     long form of :st
 :settings           show provider/model/editor settings
+:memory             inspect remembered structured context
+:doctor             run local diagnostics
+:debug-bundle       show a redacted bug-report bundle
 :main / :back       return to the main orchestrator chat
 :o f1:12            open file id at line 12
 :y c1 / :Y c1       copy item by id without/with fences
 :a p1 / :r p1       approve or reject pending action by id
 :danger confirm     approve all tools for this session
 :compact            write a compact session summary
+:cancel             cancel the active run and clear queued prompts
 q                   quit
 ```
 
@@ -82,7 +86,13 @@ File editing currently uses an external Neovim handoff. Configure `editor_comman
 Check local repo and runtime status:
 
 ```sh
-go run ./cmd/freecode doctor
+go run ./cmd/freecode doctor --config .freecode/config.toml
+```
+
+Export a redacted debug bundle for bug reports:
+
+```sh
+go run ./cmd/freecode debug-bundle --session .freecode/sessions/latest.jsonl --out .freecode/debug-bundle.txt
 ```
 
 Run the local workflow regression harness without provider keys:
@@ -153,3 +163,22 @@ List configured providers and models:
 ```sh
 go run ./cmd/freecode provider list
 ```
+
+## Safety Model
+
+FreeCode treats the workspace as the trust boundary. Tool paths are resolved inside the workspace root, symlinks are checked, and `.git` / `.freecode` internals are not exposed by normal file listing. Default policy also denies common secret paths such as `.env`, SSH keys, PEM/key files, credential files, and secret-looking paths.
+
+Approval modes:
+
+```text
+read-only   allow reads, deny writes/shell/network
+ask         allow reads, ask for writes/shell/network
+auto        allow reads and normal workspace writes, still ask for shell/network
+danger      allow all tool classes after explicit :danger confirm
+```
+
+Patch writes are preview-first. A preview token is bound to the exact patch digest and changed files, expires automatically, and is consumed when applied. Patch application revalidates file contents under a workspace-level lock and rolls back partial writes when possible.
+
+Terminal sharing is local-only until you explicitly run `:st [n]`. Once shared, the agent gets `terminal_read` and `terminal_write` for that terminal only; use `:st off` to revoke access. One-shot `:!` commands are local artifacts and are not sent to the model unless explicitly shared later.
+
+Context compaction writes a structured handoff snapshot with the active objective, constraints, preferences, touched files, commands, approvals, agent state, pending work, and unresolved risks. Use `:memory` to inspect what FreeCode currently remembers.

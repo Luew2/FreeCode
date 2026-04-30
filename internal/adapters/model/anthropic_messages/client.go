@@ -97,7 +97,7 @@ func (c *Client) Stream(ctx context.Context, request model.Request) (<-chan mode
 			return nil, c.toClientError(streamErr)
 		}
 		events := make(chan model.Event)
-		go c.readStream(stream, events)
+		go c.readStream(ctx, stream, events)
 		return events, nil
 	}
 
@@ -106,7 +106,7 @@ func (c *Client) Stream(ctx context.Context, request model.Request) (<-chan mode
 		return nil, c.toClientError(err)
 	}
 	events := make(chan model.Event)
-	go c.readResponse(message, events)
+	go c.readResponse(ctx, message, events)
 	return events, nil
 }
 
@@ -139,11 +139,13 @@ func (c *Client) resolveAPIKey(ctx context.Context) (string, error) {
 	return c.secrets.Get(ctx, c.provider.Secret.Name)
 }
 
-func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
+func (c *Client) readStream(ctx context.Context, stream *messagesStream, events chan<- model.Event) {
 	defer close(events)
 	defer stream.Close()
 
-	events <- model.Event{Type: model.EventStarted}
+	if !emitModelEvent(ctx, events, model.Event{Type: model.EventStarted}) {
+		return
+	}
 	acc := anthropic.Message{}
 	streamErr := false
 	diag := &model.Diagnostics{}
@@ -152,7 +154,7 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 		diag.ChunkCount++
 		event := stream.Current()
 		if err := acc.Accumulate(event); err != nil {
-			events <- model.Event{Type: model.EventError, Error: err.Error()}
+			emitModelEvent(ctx, events, model.Event{Type: model.EventError, Error: err.Error()})
 			streamErr = true
 			return
 		}
@@ -161,30 +163,38 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 			block := event.ContentBlock
 			if block.Type == "text" && block.Text != "" {
 				diag.TextDeltaCount++
-				events <- model.Event{Type: model.EventTextDelta, Text: block.Text}
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventTextDelta, Text: block.Text}) {
+					return
+				}
 			}
 		case "content_block_delta":
 			if event.Delta.Type == "text_delta" {
 				diag.TextDeltaCount++
-				events <- model.Event{Type: model.EventTextDelta, Text: event.Delta.Text}
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventTextDelta, Text: event.Delta.Text}) {
+					return
+				}
 			}
 		case "message_start":
 			usage := event.Message.Usage
 			if usage.InputTokens > 0 || usage.OutputTokens > 0 {
-				events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventUsage, Usage: &model.Usage{
 					InputTokens:  int(usage.InputTokens),
 					OutputTokens: int(usage.OutputTokens),
 					TotalTokens:  int(usage.InputTokens + usage.OutputTokens),
-				}}
+				}}) {
+					return
+				}
 			}
 		case "message_delta":
 			usage := event.Usage
 			if usage.InputTokens > 0 || usage.OutputTokens > 0 {
-				events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventUsage, Usage: &model.Usage{
 					InputTokens:  int(usage.InputTokens),
 					OutputTokens: int(usage.OutputTokens),
 					TotalTokens:  int(usage.InputTokens + usage.OutputTokens),
-				}}
+				}}) {
+					return
+				}
 			}
 			if reason := string(event.Delta.StopReason); reason != "" {
 				diag.FinishReason = reason
@@ -192,7 +202,7 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 		}
 	}
 	if err := stream.Err(); err != nil {
-		events <- model.Event{Type: model.EventError, Error: classifyStreamError(err)}
+		emitModelEvent(ctx, events, model.Event{Type: model.EventError, Error: classifyStreamError(err)})
 		return
 	}
 	if streamErr {
@@ -207,11 +217,13 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 		if block.Type == "tool_use" {
 			args := normalizeArguments(string(block.Input))
 			diag.ToolCallCount++
-			events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
+			if !emitModelEvent(ctx, events, model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
 				Arguments: args,
-			}}
+			}}) {
+				return
+			}
 		}
 	}
 	if raw := acc.RawJSON(); raw != "" {
@@ -220,12 +232,14 @@ func (c *Client) readStream(stream *messagesStream, events chan<- model.Event) {
 		}
 		diag.RawLastChunk = raw
 	}
-	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
+	emitModelEvent(ctx, events, model.Event{Type: model.EventCompleted, Diagnostics: diag})
 }
 
-func (c *Client) readResponse(message *anthropic.Message, events chan<- model.Event) {
+func (c *Client) readResponse(ctx context.Context, message *anthropic.Message, events chan<- model.Event) {
 	defer close(events)
-	events <- model.Event{Type: model.EventStarted}
+	if !emitModelEvent(ctx, events, model.Event{Type: model.EventStarted}) {
+		return
+	}
 
 	diag := &model.Diagnostics{ChunkCount: 1, FinishReason: string(message.StopReason)}
 	for _, block := range message.Content {
@@ -233,24 +247,30 @@ func (c *Client) readResponse(message *anthropic.Message, events chan<- model.Ev
 		case "text":
 			if block.Text != "" {
 				diag.TextDeltaCount++
-				events <- model.Event{Type: model.EventTextDelta, Text: block.Text}
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventTextDelta, Text: block.Text}) {
+					return
+				}
 			}
 		case "tool_use":
 			args := normalizeArguments(string(block.Input))
 			diag.ToolCallCount++
-			events <- model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
+			if !emitModelEvent(ctx, events, model.Event{Type: model.EventToolCall, ToolCall: &model.ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
 				Arguments: args,
-			}}
+			}}) {
+				return
+			}
 		}
 	}
 	if message.Usage.InputTokens > 0 || message.Usage.OutputTokens > 0 {
-		events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+		if !emitModelEvent(ctx, events, model.Event{Type: model.EventUsage, Usage: &model.Usage{
 			InputTokens:  int(message.Usage.InputTokens),
 			OutputTokens: int(message.Usage.OutputTokens),
 			TotalTokens:  int(message.Usage.InputTokens + message.Usage.OutputTokens),
-		}}
+		}}) {
+			return
+		}
 	}
 	if raw := message.RawJSON(); raw != "" {
 		if len(raw) > 2048 {
@@ -258,7 +278,16 @@ func (c *Client) readResponse(message *anthropic.Message, events chan<- model.Ev
 		}
 		diag.RawLastChunk = raw
 	}
-	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
+	emitModelEvent(ctx, events, model.Event{Type: model.EventCompleted, Diagnostics: diag})
+}
+
+func emitModelEvent(ctx context.Context, events chan<- model.Event, event model.Event) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case events <- event:
+		return true
+	}
 }
 
 func (c *Client) toClientError(err error) error {

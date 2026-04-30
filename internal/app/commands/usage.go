@@ -12,7 +12,8 @@ Usage:
   %s [--plain] [--config PATH] [--session PATH] [--approval read-only|ask|auto|danger]
   %s tui [--plain] [--config PATH] [--session PATH] [--approval read-only|ask|auto|danger]
   %s version
-  %s doctor
+  %s doctor [--config PATH]
+  %s debug-bundle [--config PATH] [--session PATH] [--session-id ID] [--out PATH]
   %s bench [--task all|TASK]
   %s compact [--session PATH] [--session-id ID] [--max-tokens N]
   %s status
@@ -21,6 +22,6 @@ Usage:
   %s swarm [--config PATH] [--session PATH] [--max-steps N] [--max-input-tokens N] [--max-output-tokens N] [--approval read-only|ask|auto|danger] "task"
   %s provider add --name NAME --base-url URL --api-key-env ENV --model MODEL --protocol openai-chat|anthropic-messages|auto [--context-window N] [--max-output-tokens N] [--config PATH] [--skip-probe]
   %s provider list [--config PATH]
-`, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName)
+`, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName, AppName)
 	return err
 }

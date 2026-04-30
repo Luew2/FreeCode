@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Luew2/FreeCode/internal/adapters/workspace/localfs"
 	"github.com/Luew2/FreeCode/internal/core/model"
@@ -135,6 +136,37 @@ func TestApplyPatchRejectsAcceptedPatchThatDiffersFromPreview(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("error = %v, want preview mismatch", err)
+	}
+}
+
+func TestApplyPatchRejectsExpiredPreviewToken(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "README.md", "hello repo\n")
+	workspace, err := localfs.New(root)
+	if err != nil {
+		t.Fatalf("New workspace: %v", err)
+	}
+	now := time.Unix(1, 0).UTC()
+	tool := NewApplyPatch(workspace.FileSystem(), NewStaticPermissionGate(permission.Policy{Write: permission.DecisionAllow}))
+	tool.previews = NewPreviewStore(8, time.Second)
+	tool.now = func() time.Time { return now }
+
+	preview, err := tool.Run(context.Background(), model.ToolCall{
+		ID:        "call_1",
+		Name:      "apply_patch",
+		Arguments: []byte(`{"changes":[{"path":"README.md","old_text":"hello repo\n","new_text":"hello FreeCode\n"}]}`),
+	})
+	if err != nil {
+		t.Fatalf("preview returned error: %v", err)
+	}
+	now = now.Add(2 * time.Second)
+	_, err = tool.Run(context.Background(), model.ToolCall{
+		ID:        "call_2",
+		Name:      "apply_patch",
+		Arguments: []byte(`{"accepted":true,"preview_token":"` + preview.Metadata["preview_token"] + `","changes":[{"path":"README.md","old_text":"hello repo\n","new_text":"hello FreeCode\n"}]}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("err = %v, want expired preview token", err)
 	}
 }
 

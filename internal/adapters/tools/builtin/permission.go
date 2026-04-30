@@ -64,5 +64,23 @@ func pathMatchesScope(path string, scope string) bool {
 	if scope == "." || scope == "" {
 		return true
 	}
+	if strings.HasPrefix(scope, "**/") {
+		tail := strings.TrimPrefix(scope, "**/")
+		if pathMatchesScope(path, tail) {
+			return true
+		}
+		if ok, _ := filepath.Match(tail, filepath.Base(path)); ok {
+			return true
+		}
+		return strings.HasSuffix(path, "/"+tail)
+	}
+	if strings.ContainsAny(scope, "*?[") {
+		if ok, _ := filepath.Match(scope, path); ok {
+			return true
+		}
+		if ok, _ := filepath.Match(scope, filepath.Base(path)); ok {
+			return true
+		}
+	}
 	return path == scope || strings.HasPrefix(path, strings.TrimSuffix(scope, "/")+"/")
 }

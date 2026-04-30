@@ -26,12 +26,14 @@ type ApplyPatch struct {
 	fs       ports.FileSystem
 	gate     ports.PermissionGate
 	mu       sync.Mutex
+	applyMu  sync.Mutex
 	counter  int
-	previews map[string]string
+	previews *PreviewStore
+	now      func() time.Time
 }
 
 func NewApplyPatch(fs ports.FileSystem, gate ports.PermissionGate) *ApplyPatch {
-	return &ApplyPatch{fs: fs, gate: gate, previews: map[string]string{}}
+	return &ApplyPatch{fs: fs, gate: gate, previews: NewPreviewStore(256, 30*time.Minute), now: time.Now}
 }
 
 func (t *ApplyPatch) ToolSpec() model.ToolSpec {
@@ -93,26 +95,32 @@ func (t *ApplyPatch) Run(ctx context.Context, call model.ToolCall) (ports.ToolRe
 	}
 	body := renderPatchArtifact(plan)
 	digest := patchDigest(plan)
+	now := t.clock()
 	state := "preview"
 	if args.Accepted {
 		if err := t.authorize(ctx, plan.files, digest); err != nil {
 			return ports.ToolResult{}, err
 		}
-		if err := t.consumePreview(args.PreviewToken, digest); err != nil {
+		t.applyMu.Lock()
+		defer t.applyMu.Unlock()
+		entry, err := t.consumePreview(args.PreviewToken, digest, plan.files, now)
+		if err != nil {
 			return ports.ToolResult{}, err
 		}
 		if err := t.revalidate(ctx, plan); err != nil {
-			return ports.ToolResult{}, err
+			return ports.ToolResult{}, fmt.Errorf("%w; no files were changed by FreeCode", err)
 		}
 		if err := t.preflightWrites(ctx, plan); err != nil {
-			return ports.ToolResult{}, err
+			return ports.ToolResult{}, fmt.Errorf("%w; no files were changed by FreeCode", err)
 		}
 		if err := t.writePlan(ctx, plan); err != nil {
 			return ports.ToolResult{}, err
 		}
+		args.PreviewToken = entry.Token
 		state = "applied"
 	} else {
-		args.PreviewToken = t.storePreview(digest)
+		entry := t.storePreview(digest, plan.files, call.ID, now)
+		args.PreviewToken = entry.Token
 	}
 
 	content := fmt.Sprintf("%s patch %s\nchanged files:\n%s", state, id.String(), strings.Join(plan.files, "\n"))
@@ -129,6 +137,10 @@ func (t *ApplyPatch) Run(ctx context.Context, call model.ToolCall) (ports.ToolRe
 	}
 	if args.PreviewToken != "" {
 		metadata["preview_token"] = args.PreviewToken
+		if entry, ok := t.preview(args.PreviewToken); ok {
+			metadata["preview_expires_at"] = entry.ExpiresAt.Format(time.RFC3339)
+			metadata["preview_call_id"] = entry.CallID
+		}
 	}
 	return ports.ToolResult{
 		CallID:  call.ID,
@@ -145,6 +157,13 @@ func (t *ApplyPatch) Run(ctx context.Context, call model.ToolCall) (ports.ToolRe
 		},
 		Metadata: metadata,
 	}, nil
+}
+
+func (t *ApplyPatch) clock() time.Time {
+	if t != nil && t.now != nil {
+		return t.now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 type applyPatchArgs struct {
@@ -334,36 +353,136 @@ func (t *ApplyPatch) rollback(ctx context.Context, plan patchPlan, written []str
 	return writeErr
 }
 
-func (t *ApplyPatch) storePreview(digest string) string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.previews == nil {
-		t.previews = map[string]string{}
-	}
-	token := randomPreviewToken()
-	t.previews[token] = digest
-	return token
+type PreviewEntry struct {
+	Token     string
+	Digest    string
+	Files     []string
+	CallID    string
+	CreatedAt time.Time
+	ExpiresAt time.Time
 }
 
-func (t *ApplyPatch) consumePreview(token string, digest string) error {
+type PreviewStore struct {
+	mu      sync.Mutex
+	max     int
+	ttl     time.Duration
+	entries map[string]PreviewEntry
+	order   []string
+}
+
+func NewPreviewStore(max int, ttl time.Duration) *PreviewStore {
+	if max <= 0 {
+		max = 256
+	}
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+	return &PreviewStore{max: max, ttl: ttl, entries: map[string]PreviewEntry{}}
+}
+
+func (s *PreviewStore) Store(digest string, files []string, callID string, now time.Time) PreviewEntry {
+	if s == nil {
+		s = NewPreviewStore(256, 30*time.Minute)
+	}
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now)
+	token := randomPreviewToken()
+	entry := PreviewEntry{
+		Token:     token,
+		Digest:    digest,
+		Files:     append([]string(nil), files...),
+		CallID:    callID,
+		CreatedAt: now,
+		ExpiresAt: now.Add(s.ttl),
+	}
+	s.entries[token] = entry
+	s.order = append(s.order, token)
+	s.pruneLocked(now)
+	return entry
+}
+
+func (s *PreviewStore) Consume(token string, digest string, files []string, now time.Time) (PreviewEntry, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return errors.New("accepted patch requires preview_token from a prior preview")
+		return PreviewEntry{}, errors.New("accepted patch requires preview_token from a prior preview")
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.previews == nil {
-		return errors.New("accepted patch has no prior preview")
+	if s == nil {
+		return PreviewEntry{}, errors.New("accepted patch has no prior preview")
 	}
-	previewDigest, ok := t.previews[token]
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[token]
 	if !ok {
-		return fmt.Errorf("unknown preview_token %q", token)
+		s.pruneLocked(now)
+		return PreviewEntry{}, fmt.Errorf("unknown preview_token %q", token)
 	}
-	if previewDigest != digest {
-		return errors.New("accepted patch does not match preview_token")
+	delete(s.entries, token)
+	s.removeOrderLocked(token)
+	if entry.Digest != digest || !sameStringSet(entry.Files, files) {
+		return PreviewEntry{}, errors.New("accepted patch does not match preview_token")
 	}
-	delete(t.previews, token)
-	return nil
+	if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+		return PreviewEntry{}, fmt.Errorf("preview_token %q expired at %s", token, entry.ExpiresAt.Format(time.RFC3339))
+	}
+	s.pruneLocked(now)
+	return entry, nil
+}
+
+func (s *PreviewStore) Get(token string, now time.Time) (PreviewEntry, bool) {
+	if s == nil {
+		return PreviewEntry{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now.UTC())
+	entry, ok := s.entries[strings.TrimSpace(token)]
+	return entry, ok
+}
+
+func (s *PreviewStore) pruneLocked(now time.Time) {
+	for len(s.order) > 0 {
+		token := s.order[0]
+		entry, ok := s.entries[token]
+		if !ok || (!entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt)) || len(s.order) > s.max {
+			delete(s.entries, token)
+			s.order = s.order[1:]
+			continue
+		}
+		break
+	}
+}
+
+func (s *PreviewStore) removeOrderLocked(token string) {
+	for i, value := range s.order {
+		if value == token {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			return
+		}
+	}
+}
+
+func (t *ApplyPatch) storePreview(digest string, files []string, callID string, now time.Time) PreviewEntry {
+	if t.previews == nil {
+		t.previews = NewPreviewStore(256, 30*time.Minute)
+	}
+	return t.previews.Store(digest, files, callID, now)
+}
+
+func (t *ApplyPatch) consumePreview(token string, digest string, files []string, now time.Time) (PreviewEntry, error) {
+	if t.previews == nil {
+		return PreviewEntry{}, errors.New("accepted patch has no prior preview")
+	}
+	return t.previews.Consume(token, digest, files, now)
+}
+
+func (t *ApplyPatch) preview(token string) (PreviewEntry, bool) {
+	if t == nil || t.previews == nil {
+		return PreviewEntry{}, false
+	}
+	return t.previews.Get(token, t.clock())
 }
 
 func (t *ApplyPatch) authorize(ctx context.Context, files []string, digest string) error {
@@ -427,6 +546,22 @@ func patchDigest(plan patchPlan) string {
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])
+}
+
+func sameStringSet(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	left = append([]string(nil), left...)
+	right = append([]string(nil), right...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func randomPreviewToken() string {

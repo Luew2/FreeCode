@@ -284,8 +284,41 @@ func TestCompactSessionAppendsCheckpoint(t *testing.T) {
 	if event.Type != session.EventContextCompacted || !strings.Contains(event.Text, "hello") {
 		t.Fatalf("event = %#v, want compacted event with summary", event)
 	}
+	if event.Payload["schema_version"] != HandoffSnapshotVersion || event.Payload["handoff_snapshot"] == nil {
+		t.Fatalf("payload = %#v, want structured handoff snapshot", event.Payload)
+	}
 	if len(log.events) != 2 {
 		t.Fatalf("events = %d, want appended checkpoint", len(log.events))
+	}
+}
+
+func TestHandoffSnapshotPreservesImportantLongSessionState(t *testing.T) {
+	log := &memoryLog{}
+	ctx := context.Background()
+	events := []session.Event{
+		{ID: "e1", SessionID: "s1", Type: session.EventUserMessage, Actor: "user", Text: "please harden patch safety"},
+		{ID: "e2", SessionID: "s1", Type: session.EventTool, Actor: "tool", Text: "terminal 1 sent command", Payload: map[string]any{"name": "terminal_write", "arguments": `{"command":"go test ./..."}`}},
+		{ID: "e3", SessionID: "s1", Type: session.EventArtifact, Actor: "tool", Text: "preview patch", Payload: map[string]any{"artifact": map[string]any{"kind": "patch", "title": "edit patch", "metadata": map[string]any{"state": "preview", "changed_files": "internal/a.go,README.md"}}}},
+		{ID: "e4", SessionID: "s1", Type: session.EventPermissionRequested, Actor: "user", Text: "approved p1", Payload: map[string]any{"approval": "approved", "action": "write", "subject": "README.md"}},
+		{ID: "e5", SessionID: "s1", Type: session.EventAgent, Actor: "worker", Text: "worker running", Payload: map[string]any{"agent_id": "a1", "role": "worker", "status": "running", "summary": "patch safety"}},
+		{ID: "e6", SessionID: "s1", Type: session.EventError, Actor: "model", Text: "rate limit"},
+	}
+	for _, event := range events {
+		if err := log.Append(ctx, event); err != nil {
+			t.Fatalf("Append returned error: %v", err)
+		}
+	}
+	if _, err := CompactSession(ctx, log, "s1", 4096, func() time.Time { return time.Unix(10, 0).UTC() }); err != nil {
+		t.Fatalf("CompactSession returned error: %v", err)
+	}
+	summary, _, err := BuildSessionContext(ctx, log, "s1", 4096)
+	if err != nil {
+		t.Fatalf("BuildSessionContext returned error: %v", err)
+	}
+	for _, want := range []string{"active objective", "please harden patch safety", "go test ./...", "README.md", "approved write", "a1 worker running", "rate limit"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary = %q, want %q", summary, want)
+		}
 	}
 }
 

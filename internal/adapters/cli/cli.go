@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -64,19 +65,9 @@ func RunWithIO(args []string, stdin io.Reader, stdout io.Writer, stderr io.Write
 		}
 		return 0
 	case "doctor":
-		if !hasExactArity(args, 1, stderr) {
-			return 2
-		}
-		status, err := buildDoctorStatus()
-		if err != nil {
-			fmt.Fprintf(stderr, "doctor: %v\n", err)
-			return 1
-		}
-		if err := commands.PrintDoctor(stdout, status); err != nil {
-			fmt.Fprintf(stderr, "doctor: %v\n", err)
-			return 1
-		}
-		return 0
+		return runDoctor(args[1:], stdout, stderr)
+	case "debug-bundle":
+		return runDebugBundle(args[1:], stdout, stderr)
 	case "bench":
 		return runBench(args[1:], stdout, stderr)
 	case "compact":
@@ -98,6 +89,80 @@ func RunWithIO(args []string, stdin io.Reader, stdout io.Writer, stderr io.Write
 		_ = commands.PrintUsage(stderr)
 		return 2
 	}
+}
+
+func runDoctor(args []string, stdout io.Writer, stderr io.Writer) int {
+	var configPath string
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&configPath, "config", tomlconfig.DefaultPath, "config path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "doctor accepts flags only\n")
+		return 2
+	}
+	status, err := buildDoctorStatus(configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "doctor: %v\n", err)
+		return 1
+	}
+	if err := commands.PrintDoctor(stdout, status); err != nil {
+		fmt.Fprintf(stderr, "doctor: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runDebugBundle(args []string, stdout io.Writer, stderr io.Writer) int {
+	var configPath string
+	var sessionPath string
+	var sessionID string
+	var outPath string
+	fs := flag.NewFlagSet("debug-bundle", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&configPath, "config", tomlconfig.DefaultPath, "config path")
+	fs.StringVar(&sessionPath, "session", filepath.Join(".freecode", "sessions", "latest.jsonl"), "session JSONL path")
+	fs.StringVar(&sessionID, "session-id", "default", "session id")
+	fs.StringVar(&outPath, "out", "", "write bundle to file instead of stdout")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "debug-bundle accepts flags only\n")
+		return 2
+	}
+	cwd, _ := os.Getwd()
+	var writer io.Writer = stdout
+	var file *os.File
+	if outPath != "" {
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil && filepath.Dir(outPath) != "." {
+			fmt.Fprintf(stderr, "debug-bundle: %v\n", err)
+			return 1
+		}
+		var err error
+		file, err = os.Create(outPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "debug-bundle: %v\n", err)
+			return 1
+		}
+		defer file.Close()
+		writer = file
+	}
+	if err := commands.WriteDebugBundle(context.Background(), writer, commands.DebugBundleOptions{
+		WorkDir:     cwd,
+		ConfigPath:  configPath,
+		SessionPath: sessionPath,
+		SessionID:   sessionID,
+	}); err != nil {
+		fmt.Fprintf(stderr, "debug-bundle: %v\n", err)
+		return 1
+	}
+	if outPath != "" {
+		fmt.Fprintf(stdout, "debug bundle written to %s\n", outPath)
+	}
+	return 0
 }
 
 func runCompact(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -1264,7 +1329,7 @@ func printProviderUsage(w io.Writer) error {
 	return err
 }
 
-func buildDoctorStatus() (commands.DoctorStatus, error) {
+func buildDoctorStatus(configPath string) (commands.DoctorStatus, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return commands.DoctorStatus{}, err
@@ -1276,6 +1341,23 @@ func buildDoctorStatus() (commands.DoctorStatus, error) {
 
 	_, goModOK := findUp(absCWD, "go.mod")
 	gitPath, gitOK := findUp(absCWD, ".git")
+	configStore := tomlconfig.New(configPath)
+	settings, configErr := configStore.Load(context.Background())
+	activeModel := settings.ActiveModel.String()
+	activeProvider, providerOK := settings.Providers[settings.ActiveModel.Provider]
+	apiKeyOK := false
+	if providerOK && activeProvider.Secret.Name != "" {
+		apiKeyOK = os.Getenv(activeProvider.Secret.Name) != ""
+	}
+	editor := settings.EditorCommand
+	if strings.TrimSpace(editor) == "" {
+		editor = "nvim"
+	}
+	editorCommand := "nvim"
+	if fields := strings.Fields(editor); len(fields) > 0 {
+		editorCommand = fields[0]
+	}
+	_, editorErr := exec.LookPath(editorCommand)
 
 	checks := []commands.DoctorCheck{
 		{
@@ -1288,11 +1370,39 @@ func buildDoctorStatus() (commands.DoctorStatus, error) {
 			OK:     gitOK,
 			Detail: foundDetail(gitOK, gitPath, "not found"),
 		},
+		{
+			Name:   "config",
+			OK:     configErr == nil,
+			Detail: doctorErrDetail(configErr, configPath),
+		},
+		{
+			Name:   "active provider",
+			OK:     providerOK && activeModel != "",
+			Detail: foundDetail(providerOK && activeModel != "", activeModel, "not configured"),
+		},
+		{
+			Name:   "api key",
+			OK:     apiKeyOK || (providerOK && activeProvider.Secret.Name == ""),
+			Detail: apiKeyDetail(providerOK, activeProvider.Secret.Name, apiKeyOK),
+		},
+		{
+			Name:   "editor",
+			OK:     editorErr == nil,
+			Detail: doctorErrDetail(editorErr, editor),
+		},
+		{
+			Name:   "terminal",
+			OK:     term.IsTerminal(int(os.Stdout.Fd())) || term.IsTerminal(int(os.Stdin.Fd())),
+			Detail: foundDetail(term.IsTerminal(int(os.Stdout.Fd())) || term.IsTerminal(int(os.Stdin.Fd())), "tty available", "not running on a tty"),
+		},
 	}
 
 	return commands.DoctorStatus{
-		Version: commands.DefaultVersionInfo(),
-		WorkDir: absCWD,
+		Version:     commands.DefaultVersionInfo(),
+		WorkDir:     absCWD,
+		ConfigPath:  configPath,
+		ActiveModel: activeModel,
+		Approval:    string(settings.Permissions.Write),
 		Runtime: commands.RuntimeStatus{
 			GoVersion: runtime.Version(),
 			GOOS:      runtime.GOOS,
@@ -1300,6 +1410,26 @@ func buildDoctorStatus() (commands.DoctorStatus, error) {
 		},
 		Checks: checks,
 	}, nil
+}
+
+func doctorErrDetail(err error, ok string) string {
+	if err == nil {
+		return ok
+	}
+	return err.Error()
+}
+
+func apiKeyDetail(providerOK bool, envName string, ok bool) string {
+	if !providerOK {
+		return "active provider is not configured"
+	}
+	if envName == "" {
+		return "provider does not require an API key"
+	}
+	if ok {
+		return envName + " is set"
+	}
+	return envName + " is not set"
 }
 
 func findUp(start string, name string) (string, bool) {

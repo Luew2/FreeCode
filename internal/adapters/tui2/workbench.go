@@ -66,6 +66,15 @@ type terminalSharer interface {
 	ShareTerminal(ctx context.Context, title string, body string) (workbench.State, error)
 }
 
+type memoryReporter interface {
+	Memory(ctx context.Context) (workbench.State, error)
+}
+
+type diagnosticsReporter interface {
+	Doctor(ctx context.Context) (workbench.State, error)
+	DebugBundle(ctx context.Context) (workbench.State, error)
+}
+
 type modelSwitcher interface {
 	ListModels(ctx context.Context) ([]workbench.ModelEntry, error)
 	SetActiveModel(ctx context.Context, ref string) (workbench.State, error)
@@ -138,19 +147,36 @@ const (
 	overlayCopy
 )
 
+// queuedSubmit captures a user prompt that arrived while a turn was already
+// running. The TUI used to refuse the second submit, but the user wanted to
+// keep typing follow-ups (especially during long swarm runs) without waiting
+// — so we queue them here and auto-fire the next one when the current run
+// completes. We snapshot the small set of inputs that determine routing
+// (text/swarm/approval/target); terminal tools and turn context are rebuilt
+// fresh at dequeue so the queued prompt sees the live shared terminal.
+type queuedSubmit struct {
+	text     string
+	swarm    bool
+	approval permission.Mode
+	target   workbench.ConversationTarget
+}
+
 type model struct {
 	ctx        context.Context
 	controller Controller
 	state      workbench.State
 
-	width      int
-	height     int
-	mode       uiMode
-	focus      focusPane
-	busy       bool
-	pendingKey string
-	actionSeq  int
-	activeRun  int
+	width        int
+	height       int
+	mode         uiMode
+	focus        focusPane
+	busy         bool
+	pendingKey   string
+	actionSeq    int
+	activeRun    int
+	activeCtx    context.Context
+	activeCancel context.CancelFunc
+	submitQueue  []queuedSubmit
 
 	leftCursor      int
 	contextCursor   int
@@ -300,6 +326,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		prevMode, prevOverlay, prevFocus := m.mode, m.overlay, m.focus
 		prevRightTab := m.activeRightTab()
 		m.busy = false
+		m.activeCtx = nil
+		m.activeCancel = nil
 		pendingDetail := m.detailPending
 		m.detailPending = false
 		pendingFollow := m.followTranscript
@@ -308,6 +336,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state.Notice = "error: " + msg.err.Error()
 			m.mode = modeNormal
 			m.overlay = overlayNone
+			// Even on error, keep draining the queue. The user explicitly
+			// queued these follow-ups; silently dropping them just because
+			// one turn failed would be worse than running them and letting
+			// the user see whatever the next turn produces.
+			if drained, fireCmd, ok := m.drainQueue(); ok {
+				m = drained
+				return m, tea.Batch(fireCmd, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus))
+			}
 			return m, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus)
 		}
 		m.state = preserveRightTab(msg.state, prevRightTab)
@@ -330,6 +366,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focus = focusContext
 		}
 		m.syncViewports()
+		// Drain after pending-detail/approval modal handling so a queued
+		// follow-up doesn't run on top of an unresolved approval gate.
+		if len(m.state.Approvals) == 0 {
+			if drained, fireCmd, ok := m.drainQueue(); ok {
+				m = drained
+				return m, tea.Batch(fireCmd, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus))
+			}
+		}
 		return m, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus)
 	case loadMsg:
 		if msg.runID != 0 && msg.runID != m.activeRun {
@@ -978,6 +1022,9 @@ func (m model) headerView() string {
 	if m.busy {
 		status += "  " + spinnerGlyph() + " running"
 	}
+	if len(m.submitQueue) > 0 {
+		status += fmt.Sprintf("  queued:%d", len(m.submitQueue))
+	}
 	return headerStyle.Width(m.width).Render(truncate(status, m.width-2))
 }
 
@@ -1594,6 +1641,26 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "context.compact":
 		return m.runAction(m.controller.Compact)
+	case "context.memory":
+		if reporter, ok := m.controller.(memoryReporter); ok {
+			return m.runAction(reporter.Memory)
+		}
+		m.state.Notice = "memory report is unavailable"
+		return m, nil
+	case "context.cancel":
+		return m.executeLine(":cancel")
+	case "diagnostics.doctor":
+		if reporter, ok := m.controller.(diagnosticsReporter); ok {
+			return m.runAction(reporter.Doctor)
+		}
+		m.state.Notice = "doctor is unavailable"
+		return m, nil
+	case "diagnostics.debug_bundle":
+		if reporter, ok := m.controller.(diagnosticsReporter); ok {
+			return m.runAction(reporter.DebugBundle)
+		}
+		m.state.Notice = "debug bundle is unavailable"
+		return m, nil
 	case "palette.open":
 		return m.openPalette(), nil
 	case "session.list", "workspace.sessions":
@@ -1713,6 +1780,42 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		return m.showSettings()
 	case line == ":compact" || line == "/compact":
 		return m.runAction(m.controller.Compact)
+	case line == ":memory" || line == ":what-state" || line == ":remember":
+		if reporter, ok := m.controller.(memoryReporter); ok {
+			return m.runAction(reporter.Memory)
+		}
+		m.state.Notice = "memory report is unavailable"
+		return m, nil
+	case line == ":doctor":
+		if reporter, ok := m.controller.(diagnosticsReporter); ok {
+			return m.runAction(reporter.Doctor)
+		}
+		m.state.Notice = "doctor is unavailable"
+		return m, nil
+	case line == ":debug-bundle":
+		if reporter, ok := m.controller.(diagnosticsReporter); ok {
+			return m.runAction(reporter.DebugBundle)
+		}
+		m.state.Notice = "debug bundle is unavailable"
+		return m, nil
+	case line == ":cancel" || line == ":noqueue":
+		// :cancel interrupts the active run when possible and also drops
+		// queued follow-ups so stale prompts do not fire after cancellation.
+		dropped := len(m.submitQueue)
+		m.submitQueue = nil
+		cancelled := false
+		if m.busy && m.activeCancel != nil {
+			m.activeCancel()
+			cancelled = true
+		}
+		if dropped == 0 && !cancelled {
+			m.state.Notice = "nothing to cancel"
+		} else if cancelled {
+			m.state.Notice = fmt.Sprintf("cancelled active run and %d queued prompt(s)", dropped)
+		} else {
+			m.state.Notice = fmt.Sprintf("cancelled %d queued prompt(s)", dropped)
+		}
+		return m, nil
 	case line == ":approval auto":
 		return m.runAction(func(ctx context.Context) (workbench.State, error) {
 			return m.controller.SetApproval(ctx, permission.ModeAuto)
@@ -2291,10 +2394,6 @@ func (m model) findWorkspaceFile(ref string) (workbench.WorkspaceFile, bool) {
 }
 
 func (m model) submit(swarm bool) (tea.Model, tea.Cmd) {
-	if m.busy {
-		m.state.Notice = "agent is still running; wait for it to finish before sending another prompt"
-		return m, nil
-	}
 	m.sanitizeComposer()
 	text := strings.TrimSpace(sanitizeTerminalText(m.composer.Value()))
 	if text == "" {
@@ -2314,15 +2413,37 @@ func (m model) submit(swarm bool) (tea.Model, tea.Cmd) {
 		target = workbench.ConversationTarget{Kind: "main", ID: "main", Title: "Main orchestrator"}
 		m.state.ActiveConversation = target
 	}
-	request := workbench.SubmitRequest{Text: text, Approval: m.state.Approval, Swarm: swarm, Target: target}
-	if term, slot := m.sharedTerminal(); term != nil {
-		request.TerminalTools = newTerminalToolRegistry(term, slot+1)
-		request.TurnContext = sharedTerminalAccessContext(term, slot+1)
-	}
 	m.composer.SetValue("")
 	m.composer.Blur()
 	m.mode = modeNormal
 	m.overlay = overlayNone
+	if m.busy {
+		// A turn is already running — queue this prompt instead of refusing.
+		// It auto-fires when the current run completes (see actionMsg
+		// drainQueue). This is what makes long swarms tolerable: the user
+		// can keep typing follow-ups instead of staring at a busy spinner.
+		m.submitQueue = append(m.submitQueue, queuedSubmit{
+			text:     text,
+			swarm:    swarm,
+			approval: m.state.Approval,
+			target:   target,
+		})
+		m.state.Notice = fmt.Sprintf("queued (%d pending) — will send when current run finishes", len(m.submitQueue))
+		return m, nil
+	}
+	mm, cmd := m.fireSubmit(text, swarm, m.state.Approval, target)
+	return mm, cmd
+}
+
+// fireSubmit builds the SubmitRequest fresh from the queued inputs and
+// dispatches it. Terminal tools/context are pulled from the live model so
+// queued prompts see the current shared terminal rather than a snapshot.
+func (m model) fireSubmit(text string, swarm bool, approval permission.Mode, target workbench.ConversationTarget) (model, tea.Cmd) {
+	request := workbench.SubmitRequest{Text: text, Approval: approval, Swarm: swarm, Target: target}
+	if term, slot := m.sharedTerminal(); term != nil {
+		request.TerminalTools = newTerminalToolRegistry(term, slot+1)
+		request.TurnContext = sharedTerminalAccessContext(term, slot+1)
+	}
 	m = m.startRun()
 	m.followTranscript = true
 	runID := m.activeRun
@@ -2331,16 +2452,33 @@ func (m model) submit(swarm bool) (tea.Model, tea.Cmd) {
 	}), streamTickCmd(runID))
 }
 
+// drainQueue pops the next queued prompt and dispatches it. Returns
+// (m, cmd, true) when something was drained, (m, nil, false) when the queue
+// was empty. Callers wire `cmd` into their tea.Batch alongside any repaint.
+func (m model) drainQueue() (model, tea.Cmd, bool) {
+	if len(m.submitQueue) == 0 {
+		return m, nil, false
+	}
+	next := m.submitQueue[0]
+	m.submitQueue = m.submitQueue[1:]
+	if next.swarm {
+		m.state.ActiveConversation = next.target
+	}
+	mm, cmd := m.fireSubmit(next.text, next.swarm, next.approval, next.target)
+	if remaining := len(mm.submitQueue); remaining > 0 {
+		mm.state.Notice = fmt.Sprintf("dispatched queued prompt (%d still pending)", remaining)
+	} else {
+		mm.state.Notice = "dispatched queued prompt"
+	}
+	return mm, cmd, true
+}
+
 // submitToAgent routes ":agent <prompt>" to the agent the user has currently
 // selected (or, if the active conversation is already an agent, that one).
 // Without an agent target the previous implementation silently fell back to
 // the main orchestrator, which is the wrong default — the user explicitly
 // asked for an agent. Emit a notice instead so the workflow stays explicit.
 func (m model) submitToAgent(text string) (tea.Model, tea.Cmd) {
-	if m.busy {
-		m.state.Notice = "agent is still running; wait for it to finish before sending another prompt"
-		return m, nil
-	}
 	text = strings.TrimSpace(text)
 	if text == "" {
 		m.state.Notice = "prompt is empty"
@@ -2353,6 +2491,8 @@ func (m model) submitToAgent(text string) (tea.Model, tea.Cmd) {
 	}
 	m.state.ActiveConversation = target
 	m.composer.SetValue(text)
+	// submit() handles the busy case by queueing instead of refusing,
+	// so :agent <prompt> stays usable mid-run just like Enter does.
 	return m.submit(false)
 }
 
@@ -2870,12 +3010,19 @@ func (m model) startRun() model {
 	m.activeRun = m.actionSeq
 	m.busy = true
 	m.streamLoading = false
+	runCtx, cancel := context.WithCancel(m.ctx)
+	m.activeCtx = runCtx
+	m.activeCancel = cancel
 	return m
 }
 
 func (m model) actionCmd(runID int, fn func(context.Context) (workbench.State, error)) tea.Cmd {
 	return func() tea.Msg {
-		state, err := fn(m.ctx)
+		runCtx := m.activeCtx
+		if runCtx == nil {
+			runCtx = m.ctx
+		}
+		state, err := fn(runCtx)
 		return actionMsg{state: state, err: err, runID: runID}
 	}
 }
@@ -3152,7 +3299,7 @@ func (m model) completeCommandLine(value string) (string, bool) {
 }
 
 func commandNames() []string {
-	return []string{"sessions", "new", "rename", "resume", "files", "artifacts", "git", "term", "terminal", "t", "share-term", "share-terminal", "st", "edit", "e", "agent", "swarm", "s", "settings", "main", "back", "b", "bn", "bnext", "bp", "bprevious", "ls", "buffers", "tabn", "tabnext", "tabp", "tabprevious", "Explore", "Ex", "w", "q", "qa", "quit", "help", "palette", "compact", "approval", "danger", "i", "send", "o", "d", "y", "Y", "a", "r", "!"}
+	return []string{"sessions", "new", "rename", "resume", "files", "artifacts", "git", "term", "terminal", "t", "share-term", "share-terminal", "st", "edit", "e", "agent", "swarm", "s", "settings", "main", "back", "b", "bn", "bnext", "bp", "bprevious", "ls", "buffers", "tabn", "tabnext", "tabp", "tabprevious", "Explore", "Ex", "w", "q", "qa", "quit", "help", "palette", "compact", "memory", "what-state", "remember", "doctor", "debug-bundle", "cancel", "noqueue", "approval", "danger", "i", "send", "o", "d", "y", "Y", "a", "r", "!"}
 }
 
 func commandTakesArgument(command string) bool {

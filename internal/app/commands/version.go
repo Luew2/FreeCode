@@ -7,16 +7,23 @@ import (
 
 const (
 	AppName = "freecode"
+)
+
+var (
 	Version = "0.1.0-dev"
+	Commit  = "unknown"
+	Date    = "unknown"
 )
 
 type VersionInfo struct {
 	Name    string
 	Version string
+	Commit  string
+	Date    string
 }
 
 func DefaultVersionInfo() VersionInfo {
-	return VersionInfo{Name: AppName, Version: Version}
+	return VersionInfo{Name: AppName, Version: Version, Commit: Commit, Date: Date}
 }
 
 func PrintVersion(w io.Writer, info VersionInfo) error {
@@ -31,6 +38,12 @@ func withVersionDefaults(info VersionInfo) VersionInfo {
 	}
 	if info.Version == "" {
 		info.Version = Version
+	}
+	if info.Commit == "" {
+		info.Commit = Commit
+	}
+	if info.Date == "" {
+		info.Date = Date
 	}
 	return info
 }

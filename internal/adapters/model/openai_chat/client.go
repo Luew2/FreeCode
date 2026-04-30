@@ -127,7 +127,7 @@ func (c *Client) Stream(ctx context.Context, request model.Request) (<-chan mode
 			return nil, c.toClientError(streamErr)
 		}
 		events := make(chan model.Event)
-		go c.readStream(stream, events)
+		go c.readStream(ctx, stream, events)
 		return events, nil
 	}
 
@@ -136,7 +136,7 @@ func (c *Client) Stream(ctx context.Context, request model.Request) (<-chan mode
 		return nil, c.toClientError(err)
 	}
 	events := make(chan model.Event)
-	go c.readNonStream(completion, events)
+	go c.readNonStream(ctx, completion, events)
 	return events, nil
 }
 
@@ -172,11 +172,13 @@ func (c *Client) resolveAPIKey(ctx context.Context) (string, error) {
 	return c.secrets.Get(ctx, c.provider.Secret.Name)
 }
 
-func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
+func (c *Client) readStream(ctx context.Context, stream *openaiStream, events chan<- model.Event) {
 	defer close(events)
 	defer stream.Close()
 
-	events <- model.Event{Type: model.EventStarted}
+	if !emitModelEvent(ctx, events, model.Event{Type: model.EventStarted}) {
+		return
+	}
 	acc := openai.ChatCompletionAccumulator{}
 	// fallbackTools accumulates tool calls directly off each chunk's
 	// Delta.ToolCalls regardless of whether the SDK's accumulator accepts
@@ -227,11 +229,15 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 			// the final reply.
 			if extra.ReasoningContent != "" {
 				diag.ReasoningTokens += approxTokens(extra.ReasoningContent)
-				events <- model.Event{Type: model.EventTextDelta, Text: extra.ReasoningContent, Reasoning: true}
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventTextDelta, Text: extra.ReasoningContent, Reasoning: true}) {
+					return
+				}
 			}
 			if extra.Thinking != "" {
 				diag.ReasoningTokens += approxTokens(extra.Thinking)
-				events <- model.Event{Type: model.EventTextDelta, Text: extra.Thinking, Reasoning: true}
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventTextDelta, Text: extra.Thinking, Reasoning: true}) {
+					return
+				}
 			}
 			if extra.LegacyFunctionCall != nil {
 				fallbackTools.addLegacy(extra.LegacyFunctionCall)
@@ -258,14 +264,16 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 		// but a few compat providers nest the error inside an otherwise
 		// normal chunk. Detect that here.
 		if rawErr := extractInlineError(chunk.RawJSON()); rawErr != "" {
-			events <- model.Event{Type: model.EventError, Error: "provider error: " + rawErr}
+			emitModelEvent(ctx, events, model.Event{Type: model.EventError, Error: "provider error: " + rawErr})
 			return
 		}
 
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Content != "" {
 				diag.TextDeltaCount++
-				events <- model.Event{Type: model.EventTextDelta, Text: choice.Delta.Content}
+				if !emitModelEvent(ctx, events, model.Event{Type: model.EventTextDelta, Text: choice.Delta.Content}) {
+					return
+				}
 			}
 			if reason := string(choice.FinishReason); reason != "" {
 				diag.FinishReason = reason
@@ -275,19 +283,21 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 			}
 		}
 		if chunk.Usage.TotalTokens > 0 || chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
-			events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+			if !emitModelEvent(ctx, events, model.Event{Type: model.EventUsage, Usage: &model.Usage{
 				InputTokens:  int(chunk.Usage.PromptTokens),
 				OutputTokens: int(chunk.Usage.CompletionTokens),
 				TotalTokens:  int(chunk.Usage.TotalTokens),
-			}}
+			}}) {
+				return
+			}
 		}
 	}
 	if err := stream.Err(); err != nil {
-		events <- model.Event{Type: model.EventError, Error: classifyStreamError(err)}
+		emitModelEvent(ctx, events, model.Event{Type: model.EventError, Error: classifyStreamError(err)})
 		return
 	}
 	if diag.ChunkCount == 0 {
-		events <- model.Event{Type: model.EventError, Error: "stream response did not contain data frames"}
+		emitModelEvent(ctx, events, model.Event{Type: model.EventError, Error: "stream response did not contain data frames"})
 		return
 	}
 	if sdkAcceptedChunks < diag.ChunkCount {
@@ -326,13 +336,15 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 				}
 				diag.ToolCallCount++
 				emitted = true
-				events <- model.Event{
+				if !emitModelEvent(ctx, events, model.Event{
 					Type: model.EventToolCall,
 					ToolCall: &model.ToolCall{
 						ID:        call.ID,
 						Name:      call.Function.Name,
 						Arguments: []byte(call.Function.Arguments),
 					},
+				}) {
+					return
 				}
 			}
 		}
@@ -345,7 +357,9 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 			}
 			diag.ToolCallCount++
 			diag.FallbackCalls++
-			events <- model.Event{Type: model.EventToolCall, ToolCall: &call}
+			if !emitModelEvent(ctx, events, model.Event{Type: model.EventToolCall, ToolCall: &call}) {
+				return
+			}
 		}
 	}
 	if diag.ChunkCount > 0 && len(lastChunkJSON) > 0 {
@@ -376,19 +390,21 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 	if model.Debug() || suspectMissedContent {
 		diag.RawChunks = capturedChunks
 	}
-	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
+	emitModelEvent(ctx, events, model.Event{Type: model.EventCompleted, Diagnostics: diag})
 }
 
-func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- model.Event) {
+func (c *Client) readNonStream(ctx context.Context, completion *openai.ChatCompletion, events chan<- model.Event) {
 	defer close(events)
-	events <- model.Event{Type: model.EventStarted}
+	if !emitModelEvent(ctx, events, model.Event{Type: model.EventStarted}) {
+		return
+	}
 
 	// Some OpenAI-compatible providers return HTTP 200 with an `error`
 	// envelope in the JSON body instead of a non-2xx status. The SDK
 	// considers the request successful (status was 200), so we have to
 	// detect that ourselves.
 	if rawErr := extractInlineError(completion.RawJSON()); rawErr != "" {
-		events <- model.Event{Type: model.EventError, Error: "provider error: " + rawErr}
+		emitModelEvent(ctx, events, model.Event{Type: model.EventError, Error: "provider error: " + rawErr})
 		return
 	}
 
@@ -399,7 +415,9 @@ func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- 
 		}
 		if choice.Message.Content != "" {
 			diag.TextDeltaCount = 1
-			events <- model.Event{Type: model.EventTextDelta, Text: choice.Message.Content}
+			if !emitModelEvent(ctx, events, model.Event{Type: model.EventTextDelta, Text: choice.Message.Content}) {
+				return
+			}
 		}
 		for _, call := range choice.Message.ToolCalls {
 			fn := call.Function
@@ -408,22 +426,26 @@ func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- 
 				continue
 			}
 			diag.ToolCallCount++
-			events <- model.Event{
+			if !emitModelEvent(ctx, events, model.Event{
 				Type: model.EventToolCall,
 				ToolCall: &model.ToolCall{
 					ID:        call.ID,
 					Name:      fn.Name,
 					Arguments: []byte(fn.Arguments),
 				},
+			}) {
+				return
 			}
 		}
 	}
 	if completion.Usage.TotalTokens > 0 || completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 {
-		events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
+		if !emitModelEvent(ctx, events, model.Event{Type: model.EventUsage, Usage: &model.Usage{
 			InputTokens:  int(completion.Usage.PromptTokens),
 			OutputTokens: int(completion.Usage.CompletionTokens),
 			TotalTokens:  int(completion.Usage.TotalTokens),
-		}}
+		}}) {
+			return
+		}
 	}
 	if raw := completion.RawJSON(); raw != "" {
 		if len(raw) > 2048 {
@@ -431,7 +453,16 @@ func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- 
 		}
 		diag.RawLastChunk = raw
 	}
-	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
+	emitModelEvent(ctx, events, model.Event{Type: model.EventCompleted, Diagnostics: diag})
+}
+
+func emitModelEvent(ctx context.Context, events chan<- model.Event, event model.Event) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case events <- event:
+		return true
+	}
 }
 
 // toolCallAccumulator stitches per-chunk tool_call deltas back into

@@ -46,9 +46,12 @@ func (t *terminalSession) start(root string, width int, height int) error {
 	if t == nil {
 		return errors.New("terminal is unavailable")
 	}
+	t.mu.Lock()
 	if t.active {
+		t.mu.Unlock()
 		return nil
 	}
+	t.mu.Unlock()
 	shell := strings.TrimSpace(os.Getenv("SHELL"))
 	if shell == "" {
 		shell = "/bin/sh"
@@ -65,12 +68,23 @@ func (t *terminalSession) start(root string, width int, height int) error {
 	if err != nil {
 		return err
 	}
+	t.mu.Lock()
+	if t.active {
+		t.mu.Unlock()
+		_ = ptmx.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+		return nil
+	}
 	t.active = true
 	t.shell = shell
 	t.ptmx = ptmx
 	t.cmd = cmd
 	t.output = make(chan terminalOutputMsg, 64)
 	t.lines = append(t.lines, "terminal started: "+shell)
+	t.mu.Unlock()
 	go t.readLoop()
 	return nil
 }
@@ -117,9 +131,15 @@ func terminalEnv(base []string) []string {
 }
 
 func (t *terminalSession) readLoop() {
+	t.mu.Lock()
+	ptmx := t.ptmx
+	t.mu.Unlock()
+	if ptmx == nil {
+		return
+	}
 	buf := make([]byte, 4096)
 	for {
-		n, err := t.ptmx.Read(buf)
+		n, err := ptmx.Read(buf)
 		if n > 0 {
 			t.output <- terminalOutputMsg{text: string(buf[:n])}
 		}
@@ -137,35 +157,56 @@ func (t *terminalSession) stop() {
 	if t == nil {
 		return
 	}
-	if t.ptmx != nil {
-		_ = t.ptmx.Close()
-	}
-	if t.cmd != nil && t.cmd.Process != nil {
-		_ = t.cmd.Process.Kill()
-		_, _ = t.cmd.Process.Wait()
-	}
+	t.mu.Lock()
+	ptmx := t.ptmx
+	cmd := t.cmd
+	t.ptmx = nil
+	t.cmd = nil
 	t.active = false
+	t.reading = false
+	t.mu.Unlock()
+	if ptmx != nil {
+		_ = ptmx.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}
 }
 
 func (t *terminalSession) resize(width int, height int) {
-	if t == nil || t.ptmx == nil || !t.active {
+	if t == nil {
 		return
 	}
-	_ = pty.Setsize(t.ptmx, &pty.Winsize{
+	t.mu.Lock()
+	ptmx := t.ptmx
+	active := t.active
+	t.mu.Unlock()
+	if ptmx == nil || !active {
+		return
+	}
+	_ = pty.Setsize(ptmx, &pty.Winsize{
 		Cols: uint16(clamp(width, 20, 240)),
 		Rows: uint16(clamp(height, 4, 80)),
 	})
 }
 
 func (t *terminalSession) writeKey(msg tea.KeyMsg) {
-	if t == nil || !t.active {
+	if t == nil {
 		return
 	}
 	var text string
+	t.mu.Lock()
+	if !t.active {
+		t.mu.Unlock()
+		return
+	}
 	switch msg.String() {
 	case "enter":
-		if t.shouldClearForInput() {
-			t.clearDisplay()
+		if t.shouldClearForInputLocked() {
+			t.lines = nil
+			t.partial = ""
+			t.carriage = false
 		}
 		t.input = ""
 		text = "\r"
@@ -184,7 +225,9 @@ func (t *terminalSession) writeKey(msg tea.KeyMsg) {
 	case "ctrl+d":
 		text = "\x04"
 	case "ctrl+l":
-		t.clearDisplay()
+		t.lines = nil
+		t.partial = ""
+		t.carriage = false
 		text = "\x0c"
 	case "left":
 		text = "\x1b[D"
@@ -204,12 +247,14 @@ func (t *terminalSession) writeKey(msg tea.KeyMsg) {
 			t.input += text
 		}
 	}
-	if text != "" && t.ptmx != nil {
-		_, _ = t.ptmx.Write([]byte(text))
+	ptmx := t.ptmx
+	t.mu.Unlock()
+	if text != "" && ptmx != nil {
+		_, _ = ptmx.Write([]byte(text))
 	}
 }
 
-func (t *terminalSession) shouldClearForInput() bool {
+func (t *terminalSession) shouldClearForInputLocked() bool {
 	command := strings.TrimSpace(t.input)
 	return command == "clear" || command == "reset"
 }

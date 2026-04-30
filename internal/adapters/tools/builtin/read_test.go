@@ -238,6 +238,29 @@ func TestReadToolsRespectDeniedPaths(t *testing.T) {
 	}
 }
 
+func TestReadToolsDefaultDenySecretPatterns(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, ".env.local", "TOKEN=secret\n")
+	writeTestFile(t, root, "docs/readme.md", "ok\n")
+	workspace, err := localfs.New(root)
+	if err != nil {
+		t.Fatalf("New workspace: %v", err)
+	}
+	gate := NewStaticPermissionGate(permission.DefaultPolicy())
+	tools := NewReadOnlyWithGate(workspace.FileSystem(), gate)
+
+	if _, err := tools.RunTool(context.Background(), model.ToolCall{Name: "read_file", Arguments: []byte(`{"path":".env.local"}`)}); err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf(".env read err = %v, want denied", err)
+	}
+	list, err := tools.RunTool(context.Background(), model.ToolCall{Name: "list_files", Arguments: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("list_files returned error: %v", err)
+	}
+	if strings.Contains(list.Content, ".env.local") || !strings.Contains(list.Content, "docs/readme.md") {
+		t.Fatalf("list = %q, want secret omitted and docs retained", list.Content)
+	}
+}
+
 // TestReadToolsAllowAllWithoutGate makes sure the legacy NewReadOnly
 // constructor (no gate) still allows reads — that is what older sessions
 // rely on, and what registry.go's NewVerifier built before the fix.
