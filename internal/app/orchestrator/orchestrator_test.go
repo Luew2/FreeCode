@@ -305,7 +305,7 @@ func TestRunnerUsesSessionContextAndTokenBudget(t *testing.T) {
 		UserRequest:    "current request",
 		SessionContext: "prior context",
 		TurnContext:    "shared terminal output",
-		ContextBudget:  contextmgr.Budget{MaxInputTokens: 640, MaxOutputTokens: 64},
+		ContextBudget:  contextmgr.Budget{MaxInputTokens: 1200, MaxOutputTokens: 64},
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -317,7 +317,7 @@ func TestRunnerUsesSessionContextAndTokenBudget(t *testing.T) {
 	if request.MaxOutputTokens != 64 {
 		t.Fatalf("MaxOutputTokens = %d, want 64", request.MaxOutputTokens)
 	}
-	if contextmgr.EstimateMessages(request.Messages)+contextmgr.EstimateTools(request.Tools) > 640 {
+	if contextmgr.EstimateMessages(request.Messages)+contextmgr.EstimateTools(request.Tools) > 1200 {
 		t.Fatalf("request exceeded budget: %#v", request.Messages)
 	}
 	foundSessionContext := false

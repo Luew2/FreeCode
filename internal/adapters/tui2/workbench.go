@@ -538,22 +538,34 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		return m.toggleMouseCapture()
 	case "a":
-		if m.focus != focusContext {
-			m.state.Notice = "focus the right pane to approve"
-			return m, nil
+		// Allow approve from any pane: prefer the artifact selected in the
+		// right (context) pane, but fall back to the topmost pending
+		// approval so the user does not have to remember to focus a
+		// different pane just to confirm a write the agent is waiting on.
+		if m.focus == focusContext {
+			return m.approveSelected()
 		}
-		return m.approveSelected()
+		if id, ok := m.firstPendingApprovalID(); ok {
+			return m.runAction(func(ctx context.Context) (workbench.State, error) {
+				return m.controller.Approve(ctx, id)
+			})
+		}
+		m.state.Notice = "no pending approvals"
+		return m, nil
 	case "r":
-		if m.focus != focusContext {
-			m.state.Notice = "focus the right pane to reject"
-			return m, nil
+		if m.focus == focusContext {
+			return m.rejectSelected()
 		}
-		return m.rejectSelected()
+		if id, ok := m.firstPendingApprovalID(); ok {
+			return m.runAction(func(ctx context.Context) (workbench.State, error) {
+				return m.controller.Reject(ctx, id)
+			})
+		}
+		m.state.Notice = "no pending approvals"
+		return m, nil
 	case "A":
-		if m.focus != focusContext {
-			m.state.Notice = "focus the right pane to change approval"
-			return m, nil
-		}
+		// Cycling approval mode is workspace-wide, not pane-bound — no
+		// reason to gate it on context pane focus.
 		return m.runAction(func(ctx context.Context) (workbench.State, error) {
 			return m.controller.SetApproval(ctx, permission.ModeAuto)
 		})
@@ -3061,6 +3073,18 @@ func (m *model) clampCursors() {
 func (m *model) followLatestTranscript() {
 	m.chat.SetItems(m.state.Transcript)
 	m.chat.FollowLatest()
+}
+
+// firstPendingApprovalID returns the id of the topmost pending approval, so
+// `a`/`r` from any pane can act on it without first switching focus to the
+// right context pane. Returns false when nothing is pending.
+func (m model) firstPendingApprovalID() (string, bool) {
+	for _, approval := range m.state.Approvals {
+		if strings.TrimSpace(approval.ID) != "" {
+			return approval.ID, true
+		}
+	}
+	return "", false
 }
 
 func (m *model) moveSelection(delta int) {

@@ -42,7 +42,7 @@ func TestBuilderBuildsDeterministicPromptOrder(t *testing.T) {
 		t.Fatalf("user request = %q, want trimmed request", got)
 	}
 	developer := messages[1].Content[0].Text
-	if !strings.Contains(developer, "call the tool in the same turn") ||
+	if !strings.Contains(developer, "call the tool now") ||
 		!strings.Contains(developer, "nested orchestration tasks") {
 		t.Fatalf("developer prompt = %q, want tool-followthrough and nested delegation guidance", developer)
 	}
