@@ -1,0 +1,5 @@
+.freecode/
+/freecode
+*.test
+coverage.out
+docs/*plan*.md

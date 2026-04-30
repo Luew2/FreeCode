@@ -1,0 +1,149 @@
+package tomlconfig
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Luew2/FreeCode/internal/core/config"
+	"github.com/Luew2/FreeCode/internal/core/model"
+)
+
+func TestStoreRoundTripsProviderConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".freecode", "config.toml")
+	store := New(path)
+
+	settings := config.DefaultSettings()
+	provider := model.Provider{
+		ID:           "lilac",
+		Name:         "lilac",
+		Protocol:     "openai-chat",
+		BaseURL:      "https://api.example.test/v1",
+		Secret:       model.SecretRef{Name: "LILAC_API_KEY", Source: "env"},
+		DefaultModel: "qwen3-coder",
+		Enabled:      true,
+		Metadata:     map[string]string{"probe_endpoint": "https://api.example.test/v1/chat/completions"},
+	}
+	ref := model.NewRef("lilac", "qwen3-coder")
+	configuredModel := model.NewModel("lilac", "qwen3-coder")
+	configuredModel.Capabilities.Streaming = true
+	configuredModel.Capabilities.Tools = true
+	configuredModel.Limits.ContextWindow = 262144
+	configuredModel.Limits.MaxOutputTokens = 32768
+	settings.Providers[provider.ID] = provider
+	settings.Models[ref] = configuredModel
+	settings.ActiveModel = ref
+
+	if err := store.Save(context.Background(), settings); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	loaded, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	gotProvider := loaded.Providers["lilac"]
+	if gotProvider.Protocol != "openai-chat" {
+		t.Fatalf("Protocol = %q, want openai-chat", gotProvider.Protocol)
+	}
+	if gotProvider.Secret.Name != "LILAC_API_KEY" {
+		t.Fatalf("Secret.Name = %q, want LILAC_API_KEY", gotProvider.Secret.Name)
+	}
+	if gotProvider.Secret.Source != "env" {
+		t.Fatalf("Secret.Source = %q, want env", gotProvider.Secret.Source)
+	}
+	if gotProvider.DefaultModel != "qwen3-coder" {
+		t.Fatalf("DefaultModel = %q, want qwen3-coder", gotProvider.DefaultModel)
+	}
+
+	gotModel, ok := loaded.Models[ref]
+	if !ok {
+		t.Fatalf("loaded model missing ref %q", ref.String())
+	}
+	if gotModel.Limits.ContextWindow != 262144 {
+		t.Fatalf("ContextWindow = %d, want 262144", gotModel.Limits.ContextWindow)
+	}
+	if !gotModel.Capabilities.Tools || !gotModel.Capabilities.Streaming {
+		t.Fatalf("Capabilities = %#v, want tools and streaming", gotModel.Capabilities)
+	}
+	if loaded.ActiveModel != ref {
+		t.Fatalf("ActiveModel = %q, want %q", loaded.ActiveModel.String(), ref.String())
+	}
+}
+
+func TestStoreDoesNotWriteAPIKeyValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".freecode", "config.toml")
+	store := New(path)
+
+	settings := config.DefaultSettings()
+	settings.Providers["local"] = model.Provider{
+		ID:       "local",
+		Name:     "local",
+		Protocol: "openai-chat",
+		BaseURL:  "https://api.example.test/v1",
+		Secret:   model.SecretRef{Name: "LOCAL_API_KEY", Source: "env"},
+		Enabled:  true,
+	}
+
+	if err := store.Save(context.Background(), settings); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "LOCAL_API_KEY") {
+		t.Fatalf("config content does not contain env var name: %s", content)
+	}
+	if strings.Contains(content, "sk-test-secret") {
+		t.Fatalf("config content contains API key value: %s", content)
+	}
+	if strings.Contains(content, "[[agents]]") {
+		t.Fatalf("config content contains default agent definitions: %s", content)
+	}
+	if strings.Contains(content, "[permissions]") {
+		t.Fatalf("config content contains default permissions: %s", content)
+	}
+	for _, unexpected := range []string{"sessions_dir", "editor_command", "editor_double_esc", "secret_source", "enabled = true"} {
+		if strings.Contains(content, unexpected) {
+			t.Fatalf("config content contains default noise %q: %s", unexpected, content)
+		}
+	}
+}
+
+func TestStoreRoundTripsEditorSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".freecode", "config.toml")
+	store := New(path)
+
+	settings := config.DefaultSettings()
+	settings.EditorCommand = "nvim --clean"
+	settings.EditorDoubleEsc = true
+
+	if err := store.Save(context.Background(), settings); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	loaded, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if loaded.EditorCommand != "nvim --clean" || !loaded.EditorDoubleEsc {
+		t.Fatalf("editor settings = %q/%v, want nvim --clean/true", loaded.EditorCommand, loaded.EditorDoubleEsc)
+	}
+}
+
+func TestLoadMissingConfigReturnsDefaults(t *testing.T) {
+	loaded, err := New(filepath.Join(t.TempDir(), ".freecode", "config.toml")).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if loaded.Version != config.CurrentVersion {
+		t.Fatalf("Version = %d, want %d", loaded.Version, config.CurrentVersion)
+	}
+	if loaded.Providers == nil {
+		t.Fatal("Providers map is nil")
+	}
+}
