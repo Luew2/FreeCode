@@ -109,7 +109,6 @@ func Run(ctx context.Context, opts Options) error {
 		state = loaded
 	}
 	model := newModel(ctx, opts.Workbench, state)
-	model.forceRepaint = true
 	options := []tea.ProgramOption{tea.WithInput(opts.In), tea.WithOutput(opts.Out), tea.WithMouseCellMotion(), tea.WithANSICompressor()}
 	if opts.AltScreen {
 		options = append(options, tea.WithAltScreen())
@@ -199,7 +198,6 @@ type model struct {
 
 	detailPending    bool
 	followTranscript bool
-	forceRepaint     bool
 	streamLoading    bool
 	// mouseCaptured tracks whether the terminal is forwarding mouse events
 	// to the program (1002-style cell motion). When false the terminal does
@@ -387,6 +385,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = preserveRightTab(msg.state, prevRightTab)
 			if m.busy && m.followTranscript && wasAtBottom {
 				m.followLatestTranscript()
+			} else if m.busy && !wasAtBottom {
+				m.state.Notice = "live output below — press G to follow"
 			}
 			m.clampCursors()
 			m.syncViewports()
@@ -430,9 +430,6 @@ func (m model) repaintCmd(cmds ...tea.Cmd) tea.Cmd {
 		if cmd != nil {
 			batched = append(batched, cmd)
 		}
-	}
-	if m.forceRepaint {
-		batched = append(batched, tea.ClearScreen)
 	}
 	if len(batched) == 0 {
 		return nil
@@ -501,18 +498,37 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	// Mouse wheel always scrolls the transcript regardless of focus. That
-	// matches what users intuit ("the chat is the primary content; my wheel
-	// scrolls the chat") and means scrolling chat doesn't require an extra
-	// keypress to switch focus first. If/when the right pane gains a
-	// genuinely scrollable surface we can route based on cursor X position.
 	switch msg.Type {
 	case tea.MouseWheelUp:
-		m.chat.LineUp(3)
+		m.scrollPaneAt(msg.X, -3)
 	case tea.MouseWheelDown:
-		m.chat.LineDown(3)
+		m.scrollPaneAt(msg.X, 3)
 	}
 	return m, nil
+}
+
+func (m *model) scrollPaneAt(x int, delta int) {
+	if m.terminalExpanded() {
+		if delta > 0 {
+			m.scrollFocused(delta)
+		} else {
+			m.scrollFocused(delta)
+		}
+		return
+	}
+	leftW, centerW, rightW := m.paneWidths()
+	switch {
+	case leftW > 0 && x < leftW:
+		m.leftCursor = clamp(m.leftCursor+delta, 0, len(m.agentDisplayRows()))
+	case centerW > 0 && x < leftW+centerW:
+		if delta > 0 {
+			m.chat.LineDown(delta)
+		} else {
+			m.chat.LineUp(-delta)
+		}
+	case rightW > 0:
+		m.contextCursor = clamp(m.contextCursor+delta, 0, max(0, len(m.contextEntries())-1))
+	}
 }
 
 func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -685,6 +701,34 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.scrollFocused(-6)
+		return m, nil
+	case "ctrl+d":
+		if m.focus == focusTranscript {
+			m.chat.LineDown(max(1, m.chat.height/2))
+			return m, nil
+		}
+		m.scrollFocused(6)
+		return m, nil
+	case "ctrl+u":
+		if m.focus == focusTranscript {
+			m.chat.LineUp(max(1, m.chat.height/2))
+			return m, nil
+		}
+		m.scrollFocused(-6)
+		return m, nil
+	case "ctrl+e":
+		if m.focus == focusTranscript {
+			m.chat.LineDown(1)
+			return m, nil
+		}
+		m.scrollFocused(1)
+		return m, nil
+	case "ctrl+y":
+		if m.focus == focusTranscript {
+			m.chat.LineUp(1)
+			return m, nil
+		}
+		m.scrollFocused(-1)
 		return m, nil
 	case "[", "shift+tab":
 		if m.focus != focusContext {
@@ -1094,12 +1138,52 @@ func (m model) composerView() string {
 	case modeInsert:
 		return composerStyle.Width(width).Render("INSERT  Enter send  Esc normal\n" + m.composer.View())
 	default:
-		status := "NORMAL  i prompt  : command  ! shell  :term terminal  :st live  :sto attach  Ctrl+K palette  Ctrl+H/L panes  h/l local  j/k select  Enter activate  y copy  v copy"
+		status := m.normalStatusHint()
 		if m.busy {
 			status += "  running"
 		}
 		return composerStyle.Width(width).Render(truncate(status, width))
 	}
+}
+
+func (m model) normalStatusHint() string {
+	key := m.commandKey
+	parts := []string{
+		"NORMAL",
+		key("prompt.insert", "i") + " prompt",
+		": command",
+		key("shell.run", "!") + " shell",
+		key("palette.open", "Ctrl+K") + " palette",
+		"Ctrl+H/L panes",
+		"j/k select",
+		"Ctrl+E/Y scroll",
+		key("item.copy", "y") + " copy",
+		key("item.copy.select", "v") + " visual",
+		key("mouse.toggle", "m") + " mouse",
+	}
+	return strings.Join(parts, "  ")
+}
+
+func (m model) commandKey(id string, fallback string) string {
+	commands := m.state.Commands
+	if len(commands) == 0 {
+		commands = workbench.DefaultCommands()
+	}
+	for _, command := range commands {
+		if command.ID != id {
+			continue
+		}
+		for _, key := range command.Keybindings {
+			key = strings.TrimSpace(key)
+			if key != "" && !strings.HasPrefix(key, ":") {
+				return key
+			}
+		}
+		if key := strings.TrimSpace(command.Keybinding); key != "" && !strings.HasPrefix(key, ":") {
+			return key
+		}
+	}
+	return fallback
 }
 
 func (m model) noticeView() string {
@@ -1118,7 +1202,7 @@ func (m model) noticeView() string {
 		notice = pending
 	}
 	if notice == "" {
-		notice = "j/k move  Ctrl+H/L panes  h/l local  Enter activate  :s swarm  :! shell  :term terminal  :ops ops  d detail  y copy  v copy  q quit"
+		notice = "j/k move  Ctrl+E/Y scroll  Ctrl+H/L panes  h/l local  Enter activate  :s swarm  :! shell  :term terminal  :ops ops  d detail  y copy  v visual  m mouse  q quit"
 	}
 	return noticeStyle.Width(m.width).Render(truncate(notice, m.width-2))
 }
@@ -1626,6 +1710,15 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m.submit(false)
 	case "conversation.main":
 		return m.activateMainConversation()
+	case "buffer.list":
+		return m.showBuffers()
+	case "buffer.switch":
+		m.state.Notice = "usage: :b <main|agent>"
+		return m, nil
+	case "buffer.next":
+		return m.activateRelativeConversation(1)
+	case "buffer.previous":
+		return m.activateRelativeConversation(-1)
 	case "agent.followup":
 		return m.startAgentFollowup()
 	case "agent.swarm":
@@ -1701,6 +1794,17 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		}
 		m.state.Notice = "debug bundle is unavailable"
 		return m, nil
+	case "debug.toggle":
+		return m.toggleDebugMode()
+	case "debug.on":
+		return m.setDebugMode(true)
+	case "debug.off":
+		return m.setDebugMode(false)
+	case "model.list":
+		return m.showModels()
+	case "model.use":
+		m.state.Notice = "usage: :use <provider/model>"
+		return m, nil
 	case "palette.open":
 		return m.openPalette(), nil
 	case "session.list", "workspace.sessions":
@@ -1725,6 +1829,12 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 	case "tab.ops":
 		m.setRightTab(workbench.RightTabOps)
 		return m, nil
+	case "tab.next":
+		m.cycleRightTab(1)
+		return m, nil
+	case "tab.previous":
+		m.cycleRightTab(-1)
+		return m, nil
 	case "workspace.term":
 		return m.openNewTerminal(false)
 	case "file.edit":
@@ -1745,6 +1855,11 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 	if line == ":" || line == "" {
 		m.mode = modeNormal
 		return m, nil
+	}
+	if invocation, ok := m.commandRegistry().ResolveLine(line); ok {
+		if next, cmd, handled := m.executeInvocation(invocation); handled {
+			return next, cmd
+		}
 	}
 	switch {
 	case line == ":q" || line == "q" || line == "quit":
@@ -1953,6 +2068,213 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		m.state.Notice = "unknown command " + line
 		return m, nil
 	}
+}
+
+func (m model) executeInvocation(invocation workbench.CommandInvocation) (tea.Model, tea.Cmd, bool) {
+	args := strings.TrimSpace(invocation.Args)
+	switch invocation.ID {
+	case "quit":
+		return m.quitWithHandled()
+	case "shell.run":
+		next, cmd := m.runShell(args)
+		return next, cmd, true
+	case "palette.open":
+		return m.openPalette(), nil, true
+	case "conversation.main":
+		next, cmd := m.activateMainConversation()
+		return next, cmd, true
+	case "buffer.list":
+		next, cmd := m.showBuffers()
+		return next, cmd, true
+	case "buffer.switch":
+		if args == "" {
+			m.state.Notice = "usage: :b <main|agent>"
+			return m, nil, true
+		}
+		next, cmd := m.activateConversationRef(args)
+		return next, cmd, true
+	case "buffer.next":
+		next, cmd := m.activateRelativeConversation(1)
+		return next, cmd, true
+	case "buffer.previous":
+		next, cmd := m.activateRelativeConversation(-1)
+		return next, cmd, true
+	case "session.list":
+		next, cmd := m.showSessions()
+		return next, cmd, true
+	case "session.new":
+		next, cmd := m.newSession(args)
+		return next, cmd, true
+	case "session.rename":
+		if args == "" {
+			m.state.Notice = "usage: :rename <title>"
+			return m, nil, true
+		}
+		next, cmd := m.renameSession(args)
+		return next, cmd, true
+	case "session.resume":
+		if args == "" {
+			m.state.Notice = "usage: :resume <id>"
+			return m, nil, true
+		}
+		next, cmd := m.resumeSession(args)
+		return next, cmd, true
+	case "tab.files":
+		m.setRightTab(workbench.RightTabFiles)
+		return m, nil, true
+	case "tab.artifacts":
+		m.setRightTab(workbench.RightTabArtifacts)
+		return m, nil, true
+	case "tab.git":
+		m.setRightTab(workbench.RightTabGit)
+		return m, nil, true
+	case "tab.term":
+		next, cmd := m.openNewTerminal(false)
+		return next, cmd, true
+	case "tab.ops":
+		m.setRightTab(workbench.RightTabOps)
+		return m, nil, true
+	case "tab.next":
+		m.cycleRightTab(1)
+		return m, nil, true
+	case "tab.previous":
+		m.cycleRightTab(-1)
+		return m, nil, true
+	case "terminal.open":
+		if args == "" {
+			next, cmd := m.openNewTerminal(false)
+			return next, cmd, true
+		}
+		if strings.HasSuffix(invocation.Alias, "term!") || strings.HasSuffix(invocation.Alias, "terminal!") || strings.HasSuffix(invocation.Alias, "t!") {
+			next, cmd := m.openTerminalSlot(parseTerminalSlot(args), true)
+			return next, cmd, true
+		}
+		next, cmd := m.openTerminalSlot(parseTerminalSlot(args), false)
+		return next, cmd, true
+	case "terminal.share":
+		next, cmd := m.shareTerminalDirect(args)
+		return next, cmd, true
+	case "terminal.share_output":
+		next, cmd := m.shareTerminalOutputDirect(args)
+		return next, cmd, true
+	case "file.edit":
+		if args == "" {
+			m.state.Notice = "usage: :edit <file>"
+			return m, nil, true
+		}
+		next, cmd := m.editFile(args)
+		return next, cmd, true
+	case "settings.open":
+		next, cmd := m.showSettings()
+		return next, cmd, true
+	case "context.compact":
+		next, cmd := m.runAction(m.controller.Compact)
+		return next, cmd, true
+	case "context.inspect":
+		next, cmd := m.showContextInspector()
+		return next, cmd, true
+	case "context.memory":
+		if reporter, ok := m.controller.(memoryReporter); ok {
+			next, cmd := m.runAction(reporter.Memory)
+			return next, cmd, true
+		}
+		m.state.Notice = "memory report is unavailable"
+		return m, nil, true
+	case "context.noqueue":
+		return m.clearQueueOnly()
+	case "context.cancel":
+		return m.cancelRunAndQueue()
+	case "approval.auto":
+		next, cmd := m.runAction(func(ctx context.Context) (workbench.State, error) {
+			return m.controller.SetApproval(ctx, permission.ModeAuto)
+		})
+		return next, cmd, true
+	case "approval.ask":
+		next, cmd := m.runAction(func(ctx context.Context) (workbench.State, error) {
+			return m.controller.SetApproval(ctx, permission.ModeAsk)
+		})
+		return next, cmd, true
+	case "approval.read_only":
+		next, cmd := m.runAction(func(ctx context.Context) (workbench.State, error) {
+			return m.controller.SetApproval(ctx, permission.ModeReadOnly)
+		})
+		return next, cmd, true
+	case "diagnostics.doctor":
+		if reporter, ok := m.controller.(diagnosticsReporter); ok {
+			next, cmd := m.runAction(reporter.Doctor)
+			return next, cmd, true
+		}
+		m.state.Notice = "doctor is unavailable"
+		return m, nil, true
+	case "diagnostics.debug_bundle":
+		if reporter, ok := m.controller.(diagnosticsReporter); ok {
+			next, cmd := m.runAction(reporter.DebugBundle)
+			return next, cmd, true
+		}
+		m.state.Notice = "debug bundle is unavailable"
+		return m, nil, true
+	case "debug.toggle":
+		next, cmd := m.toggleDebugMode()
+		return next, cmd, true
+	case "debug.on":
+		next, cmd := m.setDebugMode(true)
+		return next, cmd, true
+	case "debug.off":
+		next, cmd := m.setDebugMode(false)
+		return next, cmd, true
+	case "model.list":
+		if args != "" {
+			next, cmd := m.switchActiveModel(args)
+			return next, cmd, true
+		}
+		next, cmd := m.showModels()
+		return next, cmd, true
+	case "model.use":
+		if args == "" {
+			m.state.Notice = "usage: :use <provider/model>"
+			return m, nil, true
+		}
+		next, cmd := m.switchActiveModel(args)
+		return next, cmd, true
+	case "prompt.insert", "prompt.send", "agent.swarm", "agent.followup", "item.open", "item.detail", "item.copy", "item.copy.full", "approval.approve", "approval.reject":
+		return m, nil, false
+	default:
+		return m, nil, false
+	}
+}
+
+func (m model) quitWithHandled() (tea.Model, tea.Cmd, bool) {
+	next, cmd := m.quit()
+	return next, cmd, true
+}
+
+func (m model) clearQueueOnly() (tea.Model, tea.Cmd, bool) {
+	dropped := len(m.submitQueue)
+	m.submitQueue = nil
+	if dropped == 0 {
+		m.state.Notice = "queue is empty"
+	} else {
+		m.state.Notice = fmt.Sprintf("cleared %d queued prompt(s)", dropped)
+	}
+	return m, nil, true
+}
+
+func (m model) cancelRunAndQueue() (tea.Model, tea.Cmd, bool) {
+	dropped := len(m.submitQueue)
+	m.submitQueue = nil
+	cancelled := false
+	if m.busy && m.activeCancel != nil {
+		m.activeCancel()
+		cancelled = true
+	}
+	if dropped == 0 && !cancelled {
+		m.state.Notice = "nothing to cancel"
+	} else if cancelled {
+		m.state.Notice = fmt.Sprintf("cancelled active run and %d queued prompt(s)", dropped)
+	} else {
+		m.state.Notice = fmt.Sprintf("cancelled %d queued prompt(s)", dropped)
+	}
+	return m, nil, true
 }
 
 func (m model) showSessions() (tea.Model, tea.Cmd) {
@@ -3551,44 +3873,15 @@ func appendFileTreeEntries(node *fileTreeNode, expanded map[string]bool, depth i
 }
 
 func (m model) filteredCommands() []workbench.Command {
+	return m.commandRegistry().Palette(m.palette.Value())
+}
+
+func (m model) commandRegistry() workbench.CommandRegistry {
 	commands := m.state.Commands
 	if len(commands) == 0 {
 		commands = workbench.DefaultCommands()
 	}
-	commands = mergeCommands(commands, workspaceCommands())
-	return workbench.FilterCommands(commands, m.palette.Value())
-}
-
-func workspaceCommands() []workbench.Command {
-	return []workbench.Command{
-		{ID: "session.list", Title: "List sessions", Category: "Workspace", Description: "Inspect saved sessions for this workspace.", Keybinding: ":sessions", Key: ":sessions", Keywords: []string{"sessions", "resume"}, Enabled: true},
-		{ID: "session.new", Title: "New session", Category: "Workspace", Description: "Start a new session in this workspace.", Keybinding: ":new", Key: ":new", Keywords: []string{"session", "new"}, Enabled: true},
-		{ID: "session.rename", Title: "Rename session", Category: "Workspace", Description: "Rename the current session.", Keybinding: ":rename <title>", Key: ":rename <title>", Keywords: []string{"session", "title"}, Enabled: true},
-		{ID: "session.resume", Title: "Resume session", Category: "Workspace", Description: "Resume a saved session by id.", Keybinding: ":resume <id>", Key: ":resume <id>", Keywords: []string{"session", "resume"}, Enabled: true},
-		{ID: "tab.files", Title: "Show files", Category: "Workspace", Description: "Switch the right pane to workspace files.", Keybinding: ":files", Key: ":files", Keywords: []string{"files", "right pane"}, Enabled: true},
-		{ID: "tab.artifacts", Title: "Show artifacts", Category: "Workspace", Description: "Switch the right pane to approvals and artifacts.", Keybinding: ":artifacts", Key: ":artifacts", Keywords: []string{"artifacts", "approvals"}, Enabled: true},
-		{ID: "tab.git", Title: "Show git changes", Category: "Workspace", Description: "Switch the right pane to git changes.", Keybinding: ":git", Key: ":git", Keywords: []string{"git", "diff"}, Enabled: true},
-		{ID: "tab.ops", Title: "Show operations", Category: "Workspace", Description: "Switch the right pane to active runs, queue, approvals, agents, terminal sharing, and context.", Keybinding: ":ops", Key: ":ops", Keywords: []string{"ops", "operations", "jobs", "queue"}, Enabled: true},
-		{ID: "terminal.open", Title: "Open terminal", Category: "Shell", Description: "Open the persistent local terminal.", Keybinding: ":term", Key: ":term", Keywords: []string{"terminal", "shell", "pty"}, Enabled: true},
-		{ID: "terminal.share", Title: "Share terminal with agent", Category: "Shell", Description: "Enable direct terminal_read and terminal_write tools for the selected terminal.", Keybinding: ":st [n]", Key: ":st", Keywords: []string{"terminal", "share", "context", "control"}, Enabled: true},
-		{ID: "terminal.share_output", Title: "Attach terminal output", Category: "Shell", Description: "Attach recent terminal output to the next model turn without live terminal control.", Keybinding: ":sto [n]", Key: ":sto", Keywords: []string{"terminal", "attach", "output", "context"}, Enabled: true},
-		{ID: "settings.open", Title: "Settings", Category: "Workspace", Description: "Show current provider, model, approval, and editor settings.", Keybinding: ":settings", Key: ":settings", Keywords: []string{"settings", "config"}, Enabled: true},
-	}
-}
-
-func mergeCommands(primary []workbench.Command, extra []workbench.Command) []workbench.Command {
-	seen := make(map[string]bool, len(primary)+len(extra))
-	merged := append([]workbench.Command(nil), primary...)
-	for _, command := range primary {
-		seen[command.ID] = true
-	}
-	for _, command := range extra {
-		if seen[command.ID] {
-			continue
-		}
-		merged = append(merged, command)
-	}
-	return merged
+	return workbench.NewCommandRegistry(commands)
 }
 
 func (m *model) completeCommandInput() {
@@ -3601,102 +3894,7 @@ func (m *model) completeCommandInput() {
 }
 
 func (m model) completeCommandLine(value string) (string, bool) {
-	value = strings.TrimLeft(value, ":")
-	trailingSpace := strings.HasSuffix(value, " ")
-	fields := strings.Fields(value)
-	if len(fields) == 0 {
-		return "", false
-	}
-	if len(fields) == 1 && !trailingSpace {
-		if completion, ok := uniqueCompletion(fields[0], commandNames()); ok {
-			if commandTakesArgument(completion) {
-				completion += " "
-			}
-			return completion, true
-		}
-		return value, false
-	}
-	command := fields[0]
-	prefix := ""
-	if !trailingSpace && len(fields) > 1 {
-		prefix = fields[len(fields)-1]
-	}
-	switch command {
-	case "edit", "o", "d":
-		if completion, ok := uniqueCompletion(prefix, m.fileCompletions()); ok {
-			return command + " " + completion, true
-		}
-	case "resume":
-		if completion, ok := uniqueCompletion(prefix, m.sessionCompletions()); ok {
-			return command + " " + completion, true
-		}
-	case "b":
-		if completion, ok := uniqueCompletion(prefix, m.conversationCompletions()); ok {
-			return command + " " + completion, true
-		}
-	}
-	return value, false
-}
-
-func commandNames() []string {
-	return []string{"sessions", "new", "rename", "resume", "files", "artifacts", "git", "ops", "term", "terminal", "t", "share-term", "share-terminal", "st", "sto", "share-output", "edit", "e", "agent", "swarm", "s", "settings", "main", "back", "b", "bn", "bnext", "bp", "bprevious", "ls", "buffers", "tabn", "tabnext", "tabp", "tabprevious", "Explore", "Ex", "w", "q", "qa", "quit", "help", "palette", "compact", "context", "memory", "what-state", "remember", "doctor", "debug-bundle", "cancel", "noqueue", "approval", "danger", "i", "send", "o", "d", "y", "Y", "a", "r", "!"}
-}
-
-func commandTakesArgument(command string) bool {
-	switch command {
-	case "rename", "resume", "edit", "e", "agent", "swarm", "s", "share-term", "share-terminal", "st", "sto", "share-output", "i", "send", "b", "o", "d", "y", "Y", "a", "r", "approval", "!":
-		return true
-	default:
-		return false
-	}
-}
-
-func (m model) fileCompletions() []string {
-	var values []string
-	for _, file := range append(append([]workbench.WorkspaceFile(nil), m.state.Files...), m.state.GitFiles...) {
-		for _, value := range []string{file.ID, file.Path, file.Name} {
-			if strings.TrimSpace(value) != "" {
-				values = append(values, value)
-			}
-		}
-	}
-	return values
-}
-
-func (m model) sessionCompletions() []string {
-	var values []string
-	for _, summary := range m.state.Sessions {
-		if summary.ID != "" {
-			values = append(values, string(summary.ID))
-		}
-	}
-	return values
-}
-
-func (m model) conversationCompletions() []string {
-	values := []string{"main"}
-	for _, agent := range m.state.Agents {
-		for _, value := range []string{agent.ID, agent.TaskID, agent.Name, agent.Role} {
-			if strings.TrimSpace(value) != "" {
-				values = append(values, value)
-			}
-		}
-	}
-	return values
-}
-
-func uniqueCompletion(prefix string, values []string) (string, bool) {
-	prefix = strings.TrimSpace(prefix)
-	var matches []string
-	for _, value := range values {
-		if strings.HasPrefix(strings.ToLower(value), strings.ToLower(prefix)) {
-			matches = append(matches, value)
-		}
-	}
-	if len(matches) != 1 {
-		return "", false
-	}
-	return matches[0], true
+	return m.commandRegistry().Complete(value, m.state)
 }
 
 func (m *model) resize() {

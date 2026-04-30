@@ -1,9 +1,10 @@
-package cli
+package bootstrap
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strings"
@@ -11,8 +12,10 @@ import (
 	"time"
 
 	"github.com/Luew2/FreeCode/internal/adapters/tools/builtin"
+	"github.com/Luew2/FreeCode/internal/app/commands"
 	"github.com/Luew2/FreeCode/internal/app/orchestrator"
 	"github.com/Luew2/FreeCode/internal/app/prompt"
+	"github.com/Luew2/FreeCode/internal/app/workbench"
 	"github.com/Luew2/FreeCode/internal/core/agent"
 	"github.com/Luew2/FreeCode/internal/core/model"
 	"github.com/Luew2/FreeCode/internal/core/permission"
@@ -47,22 +50,22 @@ type spawnAgentArgs struct {
 	ParentAgentID string   `json:"parent_agent_id"`
 }
 
-func withDelegationTools(ctx context.Context, bundle runtimeBundle, log ports.EventLog, sessionID session.ID, approval permission.Mode, parentID string, inner ports.ToolRegistry) (ports.ToolRegistry, error) {
-	client, err := buildModelClient(bundle.Settings.Provider)
+func (r *Runtime) withDelegationTools(ctx context.Context, log ports.EventLog, sessionID session.ID, approval permission.Mode, parentID string, inner ports.ToolRegistry) (ports.ToolRegistry, error) {
+	client, err := buildModelClient(r.Provider)
 	if err != nil {
 		return nil, err
 	}
 	depths := &sync.Map{}
 	var runner orchestrator.AgentRunner
 	runner = orchestrator.AgentRunner{
-		Model:  bundle.Settings.Model,
+		Model:  r.Model,
 		Client: client,
 		ToolsByRole: map[agent.Role]ports.ToolRegistry{
-			agent.RoleOrchestrator: bundle.ReadTools,
-			agent.RoleExplorer:     bundle.ReadTools,
-			agent.RoleWorker:       bundle.WriteTools,
-			agent.RoleVerifier:     bundle.VerifyTools,
-			agent.RoleReviewer:     bundle.ReadTools,
+			agent.RoleOrchestrator: r.ReadTools,
+			agent.RoleExplorer:     r.ReadTools,
+			agent.RoleWorker:       r.WriteTools,
+			agent.RoleVerifier:     r.VerifyTools,
+			agent.RoleReviewer:     r.ReadTools,
 		},
 		Log: log,
 		Trace: agent.Trace{
@@ -76,14 +79,14 @@ func withDelegationTools(ctx context.Context, bundle runtimeBundle, log ports.Ev
 				if task.Autonomy.Approval == permission.ModeAuto {
 					policy.Shell = permission.DecisionAllow
 				}
-				roleTools = builtin.NewVerifier(bundle.Workspace.FileSystem(), builtin.NewStaticPermissionGate(policy), bundle.Workspace.Root())
+				roleTools = builtin.NewVerifier(r.workspace.FileSystem(), builtin.NewStaticPermissionGate(policy), r.workspace.Root())
 			} else if task.Role == agent.RoleWorker {
 				policy := permission.MergePolicyWithMode(task.Permissions, task.Autonomy.Approval)
 				policy.AllowedPaths = append([]string(nil), task.AllowedPaths...)
 				policy.DeniedPaths = append([]string(nil), task.DeniedPaths...)
-				roleTools = builtin.NewWritable(bundle.Workspace.FileSystem(), builtin.NewStaticPermissionGate(policy))
+				roleTools = builtin.NewWritable(r.workspace.FileSystem(), builtin.NewStaticPermissionGate(policy))
 			} else {
-				roleTools = bundle.ReadTools
+				roleTools = r.ReadTools
 			}
 			if task.Role == agent.RoleOrchestrator {
 				return delegatingTools{
@@ -92,7 +95,7 @@ func withDelegationTools(ctx context.Context, bundle runtimeBundle, log ports.Ev
 					log:       log,
 					sessionID: sessionID,
 					approval:  approval,
-					agents:    bundle.Settings.Agents,
+					agents:    r.Agents,
 					parentID:  string(task.ID),
 					depth:     taskDepth,
 					maxDepth:  defaultMaxDelegationDepth,
@@ -103,13 +106,13 @@ func withDelegationTools(ctx context.Context, bundle runtimeBundle, log ports.Ev
 			return roleTools
 		},
 		Environment: prompt.Environment{
-			WorkspaceRoot: bundle.Workspace.Root(),
+			WorkspaceRoot: r.WorkspaceRoot,
 			Shell:         os.Getenv("SHELL"),
-			GitBranch:     gitBranch(ctx, bundle.Git),
+			GitBranch:     gitBranch(ctx, r.Git),
 			Platform:      runtime.GOOS + "/" + runtime.GOARCH,
-			WritableRoots: []string{bundle.Workspace.Root()},
+			WritableRoots: []string{r.WorkspaceRoot},
 		},
-		ContextBudget:           bundle.Settings.ContextBudget,
+		ContextBudget:           r.ContextBudget,
 		SessionContextMaxTokens: 4096,
 	}
 	return delegatingTools{
@@ -118,7 +121,7 @@ func withDelegationTools(ctx context.Context, bundle runtimeBundle, log ports.Ev
 		log:       log,
 		sessionID: sessionID,
 		approval:  approval,
-		agents:    bundle.Settings.Agents,
+		agents:    r.Agents,
 		parentID:  strings.TrimSpace(parentID),
 		maxDepth:  defaultMaxDelegationDepth,
 		depths:    depths,
@@ -147,7 +150,7 @@ func (t delegatingTools) Tools() []model.ToolSpec {
 				"task":            map[string]any{"type": "string", "description": "Concrete bounded task. Name the files/dirs, the specific question, and the expected handoff shape (e.g. 'Read internal/foo/* and report the public API surface as a bulleted list')."},
 				"prompt":          map[string]any{"type": "string", "description": "Alias for task."},
 				"allowed_paths":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Paths the subagent may read/write under. Defaults to the workspace root for workers."},
-				"denied_paths":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"denied_paths":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 				"max_steps":       map[string]any{"type": "integer", "description": "Override the subagent's per-task step budget."},
 				"parent_agent_id": map[string]any{"type": "string", "description": "Optional UI parent id. Defaults to main."},
 			},
@@ -289,11 +292,18 @@ func (t delegatingTools) logAgent(ctx context.Context, task agent.Task, definiti
 }
 
 func (t delegatingTools) canDelegate() bool {
-	maxDepth := t.maxDepth
-	if maxDepth <= 0 {
-		maxDepth = defaultMaxDelegationDepth
+	limit := t.maxDepth
+	if limit <= 0 {
+		limit = defaultMaxDelegationDepth
 	}
-	return t.depth < maxDepth
+	return t.depth < limit
+}
+
+func (t delegatingTools) currentTime() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
 }
 
 func taskDepth(depths *sync.Map, id agent.ID) int {
@@ -309,13 +319,6 @@ func taskDepth(depths *sync.Map, id agent.ID) int {
 		return 1
 	}
 	return depth
-}
-
-func (t delegatingTools) currentTime() time.Time {
-	if t.now != nil {
-		return t.now()
-	}
-	return time.Now()
 }
 
 func selectAgentDefinition(definitions []agent.Definition, roleValue string, nameValue string) (agent.Definition, agent.Role, error) {
@@ -379,4 +382,212 @@ func firstText(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (r *Runtime) runMainOwnedSwarm(ctx context.Context, service *workbench.Service, request workbench.SubmitRequest, baseTools ports.ToolRegistry) error {
+	if service == nil {
+		return fmt.Errorf("workbench service is not configured")
+	}
+	sessionID := service.SessionID
+	tools, err := r.withDelegationTools(ctx, service.Log, sessionID, request.Approval, "main", baseTools)
+	if err != nil {
+		return err
+	}
+	deps, err := r.askDependencies(ctx, tools, service.Log)
+	if err != nil {
+		return err
+	}
+	if err := logSwarmLifecycle(ctx, service.Log, sessionID, agent.StatusRunning, request.Text); err != nil {
+		return err
+	}
+	spawnBefore := countToolEvents(ctx, service.Log, sessionID, "spawn_agent")
+	turnContext := combineTurnContexts(request.TurnContext, swarmDelegationContext(request.Approval, r.Git))
+	response, err := commands.AskWithResponse(ctx, io.Discard, deps, commands.AskOptions{
+		Question:       strings.TrimSpace(request.Text),
+		SessionID:      string(sessionID),
+		TurnContext:    turnContext,
+		MaxSteps:       16,
+		IncludeHistory: true,
+	})
+	if err != nil {
+		_ = logSwarmLifecycle(ctx, service.Log, sessionID, agent.StatusFailed, err.Error())
+		return err
+	}
+	spawnAfter := countToolEvents(ctx, service.Log, sessionID, "spawn_agent")
+	status := agent.StatusCompleted
+	notice := "swarm completed"
+	if spawnAfter <= spawnBefore {
+		notice = "swarm completed without spawning any agents (model answered directly)"
+	}
+	_ = response
+	return logSwarmLifecycle(ctx, service.Log, sessionID, status, notice)
+}
+
+func countToolEvents(ctx context.Context, log ports.EventLog, sessionID session.ID, name string) int {
+	if log == nil {
+		return 0
+	}
+	stream, err := log.Stream(ctx, sessionID)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for event := range stream {
+		if event.Type != session.EventTool || event.Payload == nil {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprint(event.Payload["name"])) == name {
+			count++
+		}
+	}
+	return count
+}
+
+func logSwarmLifecycle(ctx context.Context, log ports.EventLog, sessionID session.ID, status agent.Status, text string) error {
+	if log == nil {
+		return nil
+	}
+	eventText := text
+	payload := map[string]any{
+		"status":          string(status),
+		"role":            string(agent.RoleOrchestrator),
+		"parent_agent_id": "main",
+		"command":         ":s",
+	}
+	if status == agent.StatusRunning {
+		payload["swarm_goal"] = text
+		eventText = "swarm request: " + text
+	}
+	return log.Append(ctx, session.Event{
+		ID:        session.EventID(fmt.Sprintf("swarm-main-%s-%d", status, time.Now().UnixNano())),
+		SessionID: sessionID,
+		Type:      session.EventAgent,
+		At:        time.Now(),
+		Actor:     "swarm",
+		Text:      eventText,
+		Payload:   payload,
+	})
+}
+
+func swarmDelegationContext(approval permission.Mode, git ports.Git) string {
+	lines := []string{
+		"You are the main FreeCode orchestrator for a dynamic swarm run.",
+		"Create a concise plan, then use spawn_agent to delegate as many bounded tasks as the request actually needs.",
+		"Prefer explorer agents for context gathering, worker agents for scoped edits, verifier agents for checks, and reviewer agents for correctness review.",
+		"Use orchestrator child agents only when a subproblem is large enough to need its own child-agent coordination.",
+		"Do not use a fixed agent count. Spawn zero agents for trivial tasks, one agent for isolated work, or multiple agents for independent slices.",
+		"If the user request is a short follow-up fragment, infer its meaning from the active turn context and visible conversation history before asking for clarification.",
+		"After each handoff returns, synthesize progress and decide whether another child agent is needed.",
+		"Finish with a direct summary of what changed, what agents did, verification, and any unresolved risks.",
+		"Approval mode: " + string(approval) + ".",
+	}
+	if status := gitStatusSummary(context.Background(), git); status != "" {
+		lines = append(lines, "", "Current git context:", status)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func combineTurnContexts(base string, extra string) string {
+	base = strings.TrimSpace(base)
+	extra = strings.TrimSpace(extra)
+	switch {
+	case base == "":
+		return extra
+	case extra == "":
+		return base
+	default:
+		return base + "\n\n" + extra
+	}
+}
+
+func gitStatusSummary(ctx context.Context, git ports.Git) string {
+	if git == nil {
+		return ""
+	}
+	status, err := git.Status(ctx)
+	if err != nil {
+		return ""
+	}
+	if len(status.ChangedFiles) == 0 {
+		return "clean on " + status.Branch
+	}
+	return fmt.Sprintf("branch %s; changed files: %s", status.Branch, strings.Join(status.ChangedFiles, ", "))
+}
+
+func directedAgentPrompt(target workbench.ConversationTarget, text string) string {
+	title := strings.TrimSpace(target.Title)
+	if title == "" {
+		title = strings.TrimSpace(target.ID)
+	}
+	if title == "" {
+		title = "selected agent"
+	}
+	return fmt.Sprintf("Directed follow-up for %s (%s):\n\n%s", title, target.ID, text)
+}
+
+func directedAgentMetadata(ctx context.Context, service *workbench.Service, target workbench.ConversationTarget) map[string]any {
+	metadata := map[string]any{}
+	if id := strings.TrimSpace(target.ID); id != "" {
+		metadata["agent_id"] = id
+		metadata["task_session"] = id
+	}
+	if service == nil {
+		return metadata
+	}
+	state, err := service.Load(ctx)
+	if err != nil {
+		return metadata
+	}
+	for _, agent := range state.Agents {
+		if agent.ID != target.ID && agent.TaskID != target.ID && agent.Name != target.ID {
+			continue
+		}
+		if agent.Name != "" {
+			metadata["agent"] = agent.Name
+		}
+		if agent.Role != "" {
+			metadata["role"] = agent.Role
+		}
+		if agent.TaskID != "" {
+			metadata["task_id"] = agent.TaskID
+			metadata["task_session"] = agent.TaskID
+		}
+		break
+	}
+	return metadata
+}
+
+type metadataEventLog struct {
+	inner    ports.EventLog
+	metadata map[string]any
+}
+
+func (l metadataEventLog) Append(ctx context.Context, event session.Event) error {
+	if l.inner == nil {
+		return nil
+	}
+	if len(l.metadata) > 0 {
+		if event.Payload == nil {
+			event.Payload = map[string]any{}
+		}
+		for key, value := range l.metadata {
+			if strings.TrimSpace(fmt.Sprint(value)) == "" {
+				continue
+			}
+			if existing, ok := event.Payload[key]; ok && strings.TrimSpace(fmt.Sprint(existing)) != "" {
+				continue
+			}
+			event.Payload[key] = value
+		}
+	}
+	return l.inner.Append(ctx, event)
+}
+
+func (l metadataEventLog) Stream(ctx context.Context, id session.ID) (<-chan session.Event, error) {
+	if l.inner == nil {
+		ch := make(chan session.Event)
+		close(ch)
+		return ch, nil
+	}
+	return l.inner.Stream(ctx, id)
 }

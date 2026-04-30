@@ -37,6 +37,8 @@ i                   enter prompt composer
 Enter               focus chat; open/collapse folders; edit files; in Git tab, show diff
 Ctrl+K / ?          open searchable command palette and cheat sheet
 j/k                 move selection
+Ctrl+E/Ctrl+Y       scroll one line down/up in the focused view
+Ctrl+D/Ctrl+U       scroll half-page down/up in chat
 Ctrl+H/Ctrl+L       switch panes
 left/right arrows   local horizontal action; right pane cycles tabs
 h/l or [/]          local horizontal action; right pane cycles tabs
@@ -47,7 +49,8 @@ b                   return to the main orchestrator chat
 o / e               open selected file in external Neovim; activate other selected items
 d                   inspect selected item
 y / Y               copy selected item without/with fences
-v                   copy selection mode; mouse selection/Cmd+C also works on visible text
+v                   visual selection mode; release mouse capture for terminal selection/Cmd+C
+m                   toggle mouse capture for pane scrolling vs native text selection
 a / r               approve or reject selected pending action
 :                   enter command mode
 :ls / :buffers      list conversation buffers

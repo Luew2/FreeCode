@@ -92,6 +92,54 @@ func TestChatRendererSelectionAndFollowTail(t *testing.T) {
 	}
 }
 
+func TestChatRendererScrollDoesNotMoveSelectionAndGRestoresFollow(t *testing.T) {
+	chat := newChatRenderer(50, 5)
+	var items []workbench.TranscriptItem
+	for i := 1; i <= 10; i++ {
+		items = append(items, workbench.TranscriptItem{
+			ID:    fmt.Sprintf("m%d", i),
+			Kind:  workbench.TranscriptAssistant,
+			Actor: "assistant",
+			Text:  "line",
+		})
+	}
+	chat.SetItems(items)
+	chat.LineUp(3)
+	if id, _ := chat.SelectedID(); id != "m10" {
+		t.Fatalf("selected = %q, want scroll without selection move", id)
+	}
+	if chat.follow {
+		t.Fatalf("follow = true after manual scroll, want false")
+	}
+	chat.Bottom()
+	if id, _ := chat.SelectedID(); id != "m10" || !chat.follow || !chat.IsAtBottom() {
+		t.Fatalf("bottom selected/follow/atBottom = %q/%v/%v", id, chat.follow, chat.IsAtBottom())
+	}
+}
+
+func TestChatRendererVisibleLayoutClampsScrolling(t *testing.T) {
+	chat := newChatRenderer(40, 4)
+	chat.SetItems([]workbench.TranscriptItem{{
+		ID:    "m1",
+		Kind:  workbench.TranscriptAssistant,
+		Actor: "assistant",
+		Text:  strings.Repeat("long line ", 40),
+	}})
+	chat.LineDown(1000)
+	if !chat.IsAtBottom() {
+		t.Fatalf("chat should clamp to bottom after large line down")
+	}
+	chat.LineUp(1000)
+	if chat.yOffset != 0 {
+		t.Fatalf("yOffset = %d, want clamped top", chat.yOffset)
+	}
+	for _, line := range strings.Split(chat.View(), "\n") {
+		if width := xansi.StringWidth(line); width > 40 {
+			t.Fatalf("line width = %d, want <= 40 for %q\n%s", width, line, chat.View())
+		}
+	}
+}
+
 func TestChatRendererStreamingCacheInvalidatesOnTextChange(t *testing.T) {
 	chat := newChatRenderer(50, 10)
 	chat.SetItems([]workbench.TranscriptItem{{

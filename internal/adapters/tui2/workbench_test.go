@@ -1136,7 +1136,6 @@ func TestOpsTabRendersOperationalStateAndContextInspector(t *testing.T) {
 func TestPaneFocusMoveDoesNotForceFullRepaint(t *testing.T) {
 	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)
-	m.forceRepaint = true
 	m.focus = focusTranscript
 
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
@@ -1152,6 +1151,26 @@ func TestPaneFocusMoveDoesNotForceFullRepaint(t *testing.T) {
 	m = next.(model)
 	if m.focus != focusTranscript {
 		t.Fatalf("right arrow focus = %d, want local action without pane move", m.focus)
+	}
+}
+
+func TestModeSwitchesDoNotReturnRepaintCommands(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.focus = focusTranscript
+
+	for _, msg := range []tea.KeyMsg{
+		{Type: tea.KeyCtrlK},
+		{Type: tea.KeyEsc},
+		{Type: tea.KeyRunes, Runes: []rune(":")},
+		{Type: tea.KeyEsc},
+		{Type: tea.KeyRunes, Runes: []rune("i")},
+	} {
+		next, cmd := m.Update(msg)
+		if cmd != nil {
+			t.Fatalf("mode switch %q returned repaint cmd", msg.String())
+		}
+		m = next.(model)
 	}
 }
 

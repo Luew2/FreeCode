@@ -574,6 +574,47 @@ func TestFilterCommandsSearchesStructuredMetadata(t *testing.T) {
 	}
 }
 
+func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
+	registry := DefaultCommandRegistry()
+	palette := registry.Palette("mouse")
+	if len(palette) == 0 {
+		t.Fatalf("palette missing mouse command")
+	}
+	seen := map[string]Command{}
+	for _, command := range registry.Palette("") {
+		seen[command.ID] = command
+	}
+	for _, id := range []string{"item.copy", "item.copy.full", "item.copy.select", "mouse.toggle", "tab.ops", "terminal.share_output", "buffer.list", "model.list"} {
+		if _, ok := seen[id]; !ok {
+			t.Fatalf("palette missing %s", id)
+		}
+	}
+	if seen["item.copy"].Description == seen["item.copy.select"].Description {
+		t.Fatalf("copy and visual commands should have distinct descriptions")
+	}
+	if !strings.Contains(seen["item.copy"].Keybinding, "y") || !strings.Contains(seen["item.copy.select"].Keybinding, "v") || !strings.Contains(seen["mouse.toggle"].Keybinding, "m") {
+		t.Fatalf("copy contract keybindings y/v/m missing: copy=%q visual=%q mouse=%q", seen["item.copy"].Keybinding, seen["item.copy.select"].Keybinding, seen["mouse.toggle"].Keybinding)
+	}
+
+	state := State{
+		Files:    []WorkspaceFile{{ID: "f1", Path: "internal/app/workbench/workbench.go"}},
+		Sessions: []SessionSummary{{ID: "session-1"}},
+		Agents:   []AgentItem{{ID: "a1", Name: "worker"}},
+	}
+	if got, ok := registry.Complete("ed", state); !ok || got != "edit " {
+		t.Fatalf("Complete edit = %q/%v, want edit + space", got, ok)
+	}
+	if got, ok := registry.Complete("edit internal/app/work", state); !ok || got != "edit internal/app/workbench/workbench.go" {
+		t.Fatalf("Complete file = %q/%v", got, ok)
+	}
+	if got, ok := registry.Complete("resume sess", state); !ok || got != "resume session-1" {
+		t.Fatalf("Complete session = %q/%v", got, ok)
+	}
+	if got, ok := registry.Complete("b wor", state); !ok || got != "b worker" {
+		t.Fatalf("Complete buffer = %q/%v", got, ok)
+	}
+}
+
 func TestServiceLoadsSessionsWorkspaceFilesGitAndCompletions(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o600); err != nil {

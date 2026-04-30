@@ -14,13 +14,16 @@ import (
 )
 
 type chatRenderer struct {
-	width    int
-	height   int
-	selected int
-	yOffset  int
-	follow   bool
-	items    []workbench.TranscriptItem
-	cache    map[chatCacheKey][]string
+	width     int
+	height    int
+	selected  int
+	yOffset   int
+	follow    bool
+	items     []workbench.TranscriptItem
+	cache     map[chatCacheKey][]string
+	layout    []chatCellLayout
+	lineCount int
+	layoutKey chatLayoutKey
 }
 
 type chatCacheKey struct {
@@ -29,6 +32,19 @@ type chatCacheKey struct {
 	selected  bool
 	streaming bool
 	hash      uint64
+}
+
+type chatLayoutKey struct {
+	width    int
+	selected int
+	hash     uint64
+}
+
+type chatCellLayout struct {
+	index int
+	start int
+	end   int
+	lines []string
 }
 
 func newChatRenderer(width int, height int) chatRenderer {
@@ -44,6 +60,7 @@ func newChatRenderer(width int, height int) chatRenderer {
 func (c *chatRenderer) SetSize(width int, height int) {
 	c.width = max(10, width)
 	c.height = max(1, height)
+	c.invalidateLayout()
 	c.clamp()
 	if c.follow {
 		c.scrollToBottom()
@@ -52,6 +69,7 @@ func (c *chatRenderer) SetSize(width int, height int) {
 
 func (c *chatRenderer) SetItems(items []workbench.TranscriptItem) {
 	c.items = append(c.items[:0], items...)
+	c.invalidateLayout()
 	if c.cache == nil {
 		c.cache = map[chatCacheKey][]string{}
 	}
@@ -67,14 +85,14 @@ func (c *chatRenderer) View() string {
 	if len(c.items) == 0 {
 		return fitLines([]string{mutedStyle.Render("No messages yet")}, c.width, c.height)
 	}
-	lines := c.allLines()
-	c.clampOffsetForLineCount(len(lines))
-	if len(lines) == 0 {
+	c.ensureLayout()
+	c.clampOffsetForLineCount(c.lineCount)
+	if c.lineCount == 0 {
 		return fitLines(nil, c.width, c.height)
 	}
-	start := clamp(c.yOffset, 0, max(0, len(lines)-1))
-	end := min(len(lines), start+c.height)
-	return fitLines(lines[start:end], c.width, c.height)
+	start := clamp(c.yOffset, 0, max(0, c.lineCount-1))
+	end := min(c.lineCount, start+c.height)
+	return fitLines(c.visibleLines(start, end), c.width, c.height)
 }
 
 func (c *chatRenderer) MoveSelection(delta int) {
@@ -82,6 +100,7 @@ func (c *chatRenderer) MoveSelection(delta int) {
 		return
 	}
 	c.selected = clamp(c.selected+delta, 0, len(c.items)-1)
+	c.invalidateLayout()
 	c.follow = c.selected == len(c.items)-1
 	c.ensureSelectedVisible()
 }
@@ -112,7 +131,7 @@ func (c *chatRenderer) SmartMove(delta int) {
 		// Going down: if the end of the selected cell is below the viewport,
 		// scroll down instead of moving selection.
 		if end >= c.yOffset+c.height {
-			c.yOffset = min(end-c.height+1, max(0, len(c.allLines())-c.height))
+			c.yOffset = min(end-c.height+1, max(0, c.totalLineCount()-c.height))
 			c.follow = false
 			c.clampOffset()
 			return
@@ -144,6 +163,7 @@ func (c *chatRenderer) PageUp() {
 func (c *chatRenderer) Top() {
 	c.yOffset = 0
 	c.selected = 0
+	c.invalidateLayout()
 	c.follow = false
 }
 
@@ -155,13 +175,13 @@ func (c *chatRenderer) FollowLatest() {
 	if len(c.items) > 0 {
 		c.selected = len(c.items) - 1
 	}
+	c.invalidateLayout()
 	c.follow = true
 	c.scrollToBottom()
 }
 
 func (c *chatRenderer) IsAtBottom() bool {
-	lines := c.allLines()
-	return c.yOffset >= max(0, len(lines)-c.height)
+	return c.yOffset >= max(0, c.totalLineCount()-c.height)
 }
 
 func (c *chatRenderer) SelectedID() (string, bool) {
@@ -180,12 +200,28 @@ func (c *chatRenderer) SelectedItem() (workbench.TranscriptItem, bool) {
 }
 
 func (c *chatRenderer) allLines() []string {
+	c.ensureLayout()
 	var lines []string
-	for i, item := range c.items {
-		if i > 0 {
-			lines = append(lines, "")
+	for _, cell := range c.layout {
+		lines = append(lines, cell.lines...)
+	}
+	return lines
+}
+
+func (c *chatRenderer) visibleLines(start int, end int) []string {
+	var lines []string
+	for _, cell := range c.layout {
+		if cell.end <= start {
+			continue
 		}
-		lines = append(lines, c.renderCell(item, i == c.selected)...)
+		if cell.start >= end {
+			break
+		}
+		from := max(start, cell.start) - cell.start
+		to := min(end, cell.end) - cell.start
+		if from >= 0 && to <= len(cell.lines) && from < to {
+			lines = append(lines, cell.lines[from:to]...)
+		}
 	}
 	return lines
 }
@@ -435,25 +471,17 @@ func (c *chatRenderer) ensureSelectedVisible() {
 }
 
 func (c *chatRenderer) selectedLineRange() (int, int) {
-	line := 0
-	for i, item := range c.items {
-		if i > 0 {
-			line++
+	c.ensureLayout()
+	for _, cell := range c.layout {
+		if cell.index == c.selected {
+			return cell.start, max(cell.start, cell.end-1)
 		}
-		count := max(1, len(c.renderCell(item, i == c.selected)))
-		start := line
-		end := line + count - 1
-		if i == c.selected {
-			return start, end
-		}
-		line += count
 	}
 	return 0, 0
 }
 
 func (c *chatRenderer) scrollToBottom() {
-	lines := c.allLines()
-	c.yOffset = max(0, len(lines)-c.height)
+	c.yOffset = max(0, c.totalLineCount()-c.height)
 }
 
 func (c *chatRenderer) clamp() {
@@ -462,11 +490,58 @@ func (c *chatRenderer) clamp() {
 }
 
 func (c *chatRenderer) clampOffset() {
-	c.clampOffsetForLineCount(len(c.allLines()))
+	c.clampOffsetForLineCount(c.totalLineCount())
 }
 
 func (c *chatRenderer) clampOffsetForLineCount(count int) {
 	c.yOffset = clamp(c.yOffset, 0, max(0, count-c.height))
+}
+
+func (c *chatRenderer) totalLineCount() int {
+	c.ensureLayout()
+	return c.lineCount
+}
+
+func (c *chatRenderer) invalidateLayout() {
+	c.layout = nil
+	c.lineCount = 0
+	c.layoutKey = chatLayoutKey{}
+}
+
+func (c *chatRenderer) ensureLayout() {
+	key := chatLayoutKey{width: c.width, selected: c.selected, hash: chatItemsHash(c.items)}
+	if c.layout != nil && c.layoutKey == key {
+		return
+	}
+	c.layoutKey = key
+	c.layout = c.layout[:0]
+	line := 0
+	for i, item := range c.items {
+		var lines []string
+		if i > 0 {
+			lines = append(lines, "")
+			line++
+		}
+		cellLines := c.renderCell(item, i == c.selected)
+		lines = append(lines, cellLines...)
+		start := line - 0
+		if i > 0 {
+			start = line - 1
+		}
+		end := start + len(lines)
+		c.layout = append(c.layout, chatCellLayout{index: i, start: start, end: end, lines: lines})
+		line = end
+	}
+	c.lineCount = line
+}
+
+func chatItemsHash(items []workbench.TranscriptItem) uint64 {
+	h := fnv.New64a()
+	for _, item := range items {
+		_, _ = h.Write([]byte(strconv.FormatUint(chatItemHash(item), 10)))
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64()
 }
 
 func chatItemHash(item workbench.TranscriptItem) uint64 {

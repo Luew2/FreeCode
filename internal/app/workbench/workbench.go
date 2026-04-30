@@ -349,9 +349,15 @@ type Command struct {
 	Category       string
 	Description    string
 	Keybinding     string
+	Aliases        []string
+	Keybindings    []string
+	Scopes         []string
+	ArgKind        string
 	Keywords       []string
 	Enabled        bool
 	DisabledReason string
+	PaletteVisible bool
+	HintVisible    bool
 
 	// Key is kept for the plain fallback renderer and older tests.
 	Key string
@@ -2022,10 +2028,14 @@ func DefaultCommands() []Command {
 		command("prompt.insert", "Insert prompt", "Prompt", "Start composing a normal prompt.", "i", "prompt", "composer", "insert"),
 		command("prompt.send", "Send prompt", "Prompt", "Send the composer text to the current session.", "Enter", "send", "chat", "prompt"),
 		command("shell.run", "Run shell command", "Shell", "Run a local shell command and open its output as a local-only artifact.", "!", "shell", "bash", "terminal", "command"),
-		command("terminal.open", "Open terminal", "Shell", "Open the persistent local terminal.", ":term", "terminal", "term", "shell", "pty"),
-		command("terminal.share", "Share terminal with agent", "Shell", "Enable direct terminal_read and terminal_write tools for the selected terminal.", ":st [n]", "terminal", "share", "context", "control"),
-		command("terminal.share_output", "Attach terminal output", "Shell", "Attach recent terminal output to the next model turn without granting live terminal control.", ":sto [n]", "terminal", "output", "attach", "context"),
+		command("terminal.open", "Open terminal", "Shell", "Open the persistent local terminal.", ":term/:terminal/:t", "terminal", "term", "shell", "pty"),
+		command("terminal.share", "Share terminal with agent", "Shell", "Enable direct terminal_read and terminal_write tools for the selected terminal.", ":st/:share-term/:share-terminal [n]", "terminal", "share", "context", "control"),
+		command("terminal.share_output", "Attach terminal output", "Shell", "Attach recent terminal output to the next model turn without granting live terminal control.", ":sto/:share-output [n]", "terminal", "output", "attach", "context"),
 		command("conversation.main", "Return to main chat", "Prompt", "Switch the center pane back to the main orchestrator conversation.", "b", "main", "back", "orchestrator"),
+		command("buffer.list", "List buffers", "Buffers", "List main and agent conversations as Vim-style buffers.", ":ls/:buffers", "buffers", "conversation", "agents"),
+		command("buffer.switch", "Switch buffer", "Buffers", "Switch to a main or agent conversation buffer.", ":b <buffer>", "buffer", "conversation", "agent"),
+		command("buffer.next", "Next buffer", "Buffers", "Switch to the next conversation buffer.", ":bn/:bnext", "buffer", "next", "conversation"),
+		command("buffer.previous", "Previous buffer", "Buffers", "Switch to the previous conversation buffer.", ":bp/:bprevious", "buffer", "previous", "conversation"),
 		command("agent.followup", "Send to selected agent", "Agents", "Send the composer text as a directed follow-up to the selected agent.", ":agent", "agent", "follow up", "conversation"),
 		command("agent.swarm", "Start swarm run", "Agents", "Send a prompt to the main orchestrator as a long-running swarm task.", ":s/:swarm", "swarm", "agent", "staged", "long running"),
 		command("session.list", "List sessions", "Sessions", "Open prior sessions for this workspace.", ":sessions", "sessions", "history", "resume"),
@@ -2035,9 +2045,11 @@ func DefaultCommands() []Command {
 		command("tab.files", "Show files", "Files", "Switch the right pane to project files.", "1/:files", "files", "tree", "project"),
 		command("tab.artifacts", "Show artifacts", "Artifacts", "Switch the right pane to chat artifacts and pending approvals.", "2/:artifacts", "artifacts", "approvals", "patches"),
 		command("tab.git", "Show Git", "Git", "Switch the right pane to changed files and diffs.", "3/:git", "git", "diff", "status"),
-		command("tab.term", "Show terminal", "Shell", "Switch the right pane to the persistent local terminal.", ":term", "terminal", "shell", "right pane"),
+		command("tab.term", "Show terminal", "Shell", "Switch the right pane to the persistent local terminal.", "4", "terminal", "shell", "right pane"),
 		command("tab.ops", "Show operations", "Ops", "Switch the right pane to live runs, queued prompts, approvals, terminal sharing, and context.", "5/:ops", "ops", "operations", "jobs", "queue"),
-		command("file.edit", "Edit file", "Files", "Open a project file in external Neovim.", ":edit", "edit", "nvim", "file"),
+		command("tab.next", "Next right tab", "Tabs", "Cycle to the next right-pane view.", "]/:tabn", "tab", "next", "right pane"),
+		command("tab.previous", "Previous right tab", "Tabs", "Cycle to the previous right-pane view.", "[:tabp", "tab", "previous", "right pane"),
+		command("file.edit", "Edit file", "Files", "Open a project file in external Neovim.", ":edit/:e <file>", "edit", "nvim", "file"),
 		command("item.open", "Open selected item", "Files", "Open a file in $EDITOR or show a non-file item in detail.", "o", "open", "file", "artifact"),
 		command("item.detail", "Inspect selected item", "Files", "Show full details for the selected message, agent, file, code block, or patch.", "d", "detail", "inspect"),
 		command("item.copy", "Copy selected item", "Files", "Copy the selected message, code block, or artifact.", "y", "copy", "clipboard"),
@@ -2057,6 +2069,11 @@ func DefaultCommands() []Command {
 		command("context.noqueue", "Clear queued prompts", "Context", "Drop queued follow-up prompts without cancelling the active run.", ":noqueue", "queue", "clear", "drop"),
 		command("diagnostics.doctor", "Run doctor", "Diagnostics", "Check config, workspace, git, editor, terminal, and provider setup.", ":doctor", "doctor", "diagnostics", "health"),
 		command("diagnostics.debug_bundle", "Create debug bundle", "Diagnostics", "Show a redacted diagnostic bundle for bug reports.", ":debug-bundle", "debug", "bundle", "redact", "diagnostics"),
+		command("debug.toggle", "Toggle debug mode", "Diagnostics", "Toggle raw model chunk diagnostics.", ":debug", "debug", "diagnostics", "chunks"),
+		command("debug.on", "Enable debug mode", "Diagnostics", "Enable raw model chunk diagnostics.", ":debug on", "debug", "diagnostics", "chunks"),
+		command("debug.off", "Disable debug mode", "Diagnostics", "Disable raw model chunk diagnostics.", ":debug off", "debug", "diagnostics", "chunks"),
+		command("model.list", "List models", "Provider", "Show configured provider/model choices.", ":models/:model", "model", "provider", "switch"),
+		command("model.use", "Use model", "Provider", "Switch active provider/model.", ":use <model>", "model", "provider", "switch", "use"),
 		command("settings.open", "Settings", "Provider", "Show provider, model, approval, and editor settings.", ":settings", "settings", "provider", "model", "editor"),
 		command("palette.open", "Command palette", "Help", "Open searchable commands and tutorial shortcuts.", "Ctrl+K", "help", "commands", "cheat sheet"),
 		command("quit", "Quit", "Help", "Exit FreeCode.", "q", "quit", "exit"),
@@ -2075,25 +2092,76 @@ func DefaultCommands() []Command {
 		"approval.approve":      "a p1",
 		"approval.reject":       "r p1",
 	}
+	argKinds := map[string]CommandArgKind{
+		"prompt.insert":         CommandArgPrompt,
+		"shell.run":             CommandArgShell,
+		"terminal.open":         CommandArgTerminal,
+		"tab.term":              CommandArgTerminal,
+		"terminal.share":        CommandArgTerminal,
+		"terminal.share_output": CommandArgTerminal,
+		"buffer.switch":         CommandArgConversation,
+		"agent.followup":        CommandArgPrompt,
+		"agent.swarm":           CommandArgPrompt,
+		"session.rename":        CommandArgPrompt,
+		"session.resume":        CommandArgSession,
+		"file.edit":             CommandArgFile,
+		"item.open":             CommandArgFile,
+		"item.detail":           CommandArgFile,
+		"item.copy":             CommandArgFile,
+		"item.copy.full":        CommandArgFile,
+		"approval.approve":      CommandArgApproval,
+		"approval.reject":       CommandArgApproval,
+		"approval.read_only":    CommandArgApproval,
+		"approval.ask":          CommandArgApproval,
+		"approval.auto":         CommandArgApproval,
+		"approval.danger":       CommandArgApproval,
+		"model.use":             CommandArgModel,
+	}
 	for i := range commands {
 		if syntax := plainSyntax[commands[i].ID]; syntax != "" {
 			commands[i].Key = syntax
+		}
+		if kind := argKinds[commands[i].ID]; kind != "" {
+			commands[i].ArgKind = string(kind)
 		}
 	}
 	return commands
 }
 
 func command(id string, title string, category string, description string, keybinding string, keywords ...string) Command {
+	keybindings := splitKeybinding(keybinding)
 	return Command{
-		ID:          id,
-		Title:       title,
-		Category:    category,
-		Description: description,
-		Keybinding:  keybinding,
-		Key:         keybinding,
-		Keywords:    keywords,
-		Enabled:     true,
+		ID:             id,
+		Title:          title,
+		Category:       category,
+		Description:    description,
+		Keybinding:     keybinding,
+		Aliases:        normalizeAliases(keybindings),
+		Keybindings:    keybindings,
+		Scopes:         []string{string(CommandScopeGlobal)},
+		Key:            keybinding,
+		Keywords:       keywords,
+		Enabled:        true,
+		PaletteVisible: true,
 	}
+}
+
+func splitKeybinding(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == '/' || r == ','
+	})
+	var out []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func FilterCommands(commands []Command, query string) []Command {
