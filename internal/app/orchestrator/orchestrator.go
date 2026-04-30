@@ -159,12 +159,31 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 				if hint := diagnosticHint(turn.diagnostics); hint != "" {
 					notice += " (" + hint + ")"
 				}
+				// Inline a short raw-chunk snippet directly in the chat
+				// message so the user can immediately see what shape the
+				// model is producing. Full dump goes to an artifact below.
+				if turn.diagnostics != nil && turn.diagnostics.RawLastChunk != "" {
+					snippet := turn.diagnostics.RawLastChunk
+					if len(snippet) > 600 {
+						snippet = snippet[:600] + "...[truncated]"
+					}
+					notice += "\n\nLast raw chunk:\n```json\n" + snippet + "\n```"
+				}
 				payload := assistantMessagePayload(step, "empty_retry", nil)
 				if turn.diagnostics != nil {
 					payload["diagnostics"] = diagnosticsPayload(turn.diagnostics)
 				}
 				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", notice, payload); err != nil {
 					return Response{}, err
+				}
+				// Also log the raw response shape as an artifact so the user
+				// can `d`etail it from chat. Without this, debugging "model
+				// said tool_calls but we got nothing" requires tailing the
+				// JSONL log file by hand.
+				if turn.diagnostics != nil && turn.diagnostics.RawLastChunk != "" {
+					if err := r.appendRawDump(ctx, request.SessionID, &sequence, step, turn.diagnostics); err != nil {
+						return Response{}, err
+					}
 				}
 				messages = append(messages, model.TextMessage(model.RoleDeveloper, emptyResponseRetryPrompt(emptyRetries, tools)))
 				// Force tool use on the retry once tools exist; the empty
@@ -265,6 +284,51 @@ func emptyResponseRetryPrompt(attempt int, tools []model.ToolSpec) string {
 	return "Your previous response was still empty. This is the last retry — respond with at least one word of text now, even if it is just a short status update like \"done\" or \"unable to proceed because <reason>\". Do not stay silent."
 }
 
+// appendRawDump records the raw last chunk of a model response as an
+// artifact-bearing event so the user can inspect it from the workbench
+// when an empty turn happens. Surfacing this in the UI is the difference
+// between "the model is broken somehow" and "the model emitted X but we
+// dropped it because Y" — the former is a dead end, the latter is a fix.
+func (r Runner) appendRawDump(ctx context.Context, sessionID session.ID, sequence *int, step int, diag *model.Diagnostics) error {
+	if r.Log == nil || diag == nil || diag.RawLastChunk == "" {
+		return nil
+	}
+	*sequence++
+	now := time.Now
+	if r.Now != nil {
+		now = r.Now
+	}
+	ts := now()
+	artifactID := fmt.Sprintf("dump-%d", ts.UnixNano())
+	return r.Log.Append(ctx, session.Event{
+		ID:        session.EventID(fmt.Sprintf("e%d", *sequence)),
+		SessionID: sessionID,
+		Type:      session.EventArtifact,
+		At:        ts,
+		Actor:     "model",
+		Text:      "raw response from empty turn",
+		Payload: map[string]any{
+			"artifact": map[string]any{
+				"id":        artifactID,
+				"kind":      "model_response_dump",
+				"title":     fmt.Sprintf("model response dump (step %d)", step),
+				"body":      diag.RawLastChunk,
+				"mime_type": "application/json",
+				"metadata": map[string]any{
+					"step":             fmt.Sprintf("%d", step),
+					"finish_reason":    diag.FinishReason,
+					"chunks":           fmt.Sprintf("%d", diag.ChunkCount),
+					"text_deltas":      fmt.Sprintf("%d", diag.TextDeltaCount),
+					"tool_calls":       fmt.Sprintf("%d", diag.ToolCallCount),
+					"dropped_calls":    fmt.Sprintf("%d", diag.DroppedCalls),
+					"local_only":       "false",
+					"share_with_model": "false",
+				},
+			},
+		},
+	})
+}
+
 // diagnosticHint summarizes what the model actually returned in a one-line
 // human-readable form for the empty-retry chat notice. Returns "" when the
 // model client did not populate diagnostics or there is nothing useful to
@@ -279,6 +343,12 @@ func diagnosticHint(diag *model.Diagnostics) string {
 	}
 	if diag.ChunkCount > 0 {
 		parts = append(parts, fmt.Sprintf("chunks=%d", diag.ChunkCount))
+	}
+	if diag.RejectedChunks > 0 {
+		parts = append(parts, fmt.Sprintf("sdk_rejected_chunks=%d", diag.RejectedChunks))
+	}
+	if diag.FallbackCalls > 0 {
+		parts = append(parts, fmt.Sprintf("fallback_recovered_calls=%d", diag.FallbackCalls))
 	}
 	if diag.DroppedCalls > 0 {
 		parts = append(parts, fmt.Sprintf("dropped_tool_calls=%d", diag.DroppedCalls))

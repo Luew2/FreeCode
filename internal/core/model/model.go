@@ -193,7 +193,16 @@ type Diagnostics struct {
 	TextDeltaCount int
 	ToolCallCount  int
 	DroppedCalls   int
-	RawLastChunk   string
+	// RejectedChunks counts chunks the SDK accumulator silently rejected
+	// (most commonly because the chunk's id didn't match the first chunk's
+	// id — a quirk seen with some compat providers and proxies).
+	RejectedChunks int
+	// FallbackCalls counts tool calls recovered by our own per-chunk
+	// accumulator when the SDK accumulator failed to capture them. A
+	// non-zero value indicates the wire format had something the SDK
+	// didn't handle directly.
+	FallbackCalls int
+	RawLastChunk  string
 }
 
 type ToolCall struct {

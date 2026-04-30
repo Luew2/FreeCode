@@ -178,13 +178,26 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 
 	events <- model.Event{Type: model.EventStarted}
 	acc := openai.ChatCompletionAccumulator{}
+	// fallbackTools accumulates tool calls directly off each chunk's
+	// Delta.ToolCalls regardless of whether the SDK's accumulator accepts
+	// the chunk. The SDK rejects any chunk whose `id` does not match the
+	// first chunk's id (streamaccumulator.go:104-109) — some compat
+	// providers (Z.ai's GLM endpoint, certain OpenRouter routes, streaming
+	// proxies) regenerate ids per chunk, which makes the SDK's accumulator
+	// drop the entire stream's tool calls silently. Running our own
+	// accumulator in parallel guarantees we never lose tool calls because
+	// of an id-mismatch quirk.
+	fallbackTools := newToolCallAccumulator()
+	sdkAcceptedChunks := 0
 	diag := &model.Diagnostics{}
 	var lastChunkJSON string
 
 	for stream.Next() {
 		diag.ChunkCount++
 		chunk := stream.Current()
-		acc.AddChunk(chunk)
+		if acc.AddChunk(chunk) {
+			sdkAcceptedChunks++
+		}
 		if raw := chunk.RawJSON(); raw != "" {
 			lastChunkJSON = raw
 		}
@@ -207,6 +220,9 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 			if reason := string(choice.FinishReason); reason != "" {
 				diag.FinishReason = reason
 			}
+			for _, call := range choice.Delta.ToolCalls {
+				fallbackTools.add(call)
+			}
 		}
 		if chunk.Usage.TotalTokens > 0 || chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
 			events <- model.Event{Type: model.EventUsage, Usage: &model.Usage{
@@ -224,7 +240,17 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 		events <- model.Event{Type: model.EventError, Error: "stream response did not contain data frames"}
 		return
 	}
+	if sdkAcceptedChunks < diag.ChunkCount {
+		// Surface this in diagnostics — it's the most common cause of
+		// "model said tool_calls but we got nothing" with compat providers.
+		diag.RejectedChunks = diag.ChunkCount - sdkAcceptedChunks
+	}
 
+	// Prefer SDK-accumulated calls when present (they round-trip
+	// arguments correctly through partial JSON deltas). Fall back to our
+	// own accumulator when the SDK produced nothing — that's the
+	// id-mismatch / wire-format-quirk case.
+	emitted := false
 	for _, choice := range acc.Choices {
 		// Pick up finish_reason from the accumulated final-chunk view
 		// when none of the streamed deltas carried one (some providers
@@ -240,6 +266,7 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 				continue
 			}
 			diag.ToolCallCount++
+			emitted = true
 			events <- model.Event{
 				Type: model.EventToolCall,
 				ToolCall: &model.ToolCall{
@@ -248,6 +275,17 @@ func (c *Client) readStream(stream *openaiStream, events chan<- model.Event) {
 					Arguments: []byte(call.Function.Arguments),
 				},
 			}
+		}
+	}
+	if !emitted {
+		for _, call := range fallbackTools.complete() {
+			if call.Name == "" && len(call.Arguments) == 0 {
+				diag.DroppedCalls++
+				continue
+			}
+			diag.ToolCallCount++
+			diag.FallbackCalls++
+			events <- model.Event{Type: model.EventToolCall, ToolCall: &call}
 		}
 	}
 	if diag.ChunkCount > 0 && len(lastChunkJSON) > 0 {
@@ -313,6 +351,89 @@ func (c *Client) readNonStream(completion *openai.ChatCompletion, events chan<- 
 		diag.RawLastChunk = raw
 	}
 	events <- model.Event{Type: model.EventCompleted, Diagnostics: diag}
+}
+
+// toolCallAccumulator stitches per-chunk tool_call deltas back into
+// complete ToolCall records. We run this in parallel with the SDK's own
+// accumulator so we recover tool calls even when the SDK silently rejects
+// chunks (most commonly because of an id mismatch between chunks — a quirk
+// of certain compat providers and streaming proxies). Slots are keyed by
+// (index, id) so simultaneous parallel tool calls don't collide.
+type toolCallAccumulator struct {
+	bySlot map[accumulatorKey]*partialToolCall
+	order  []accumulatorKey
+}
+
+type accumulatorKey struct {
+	index int
+	id    string
+}
+
+type partialToolCall struct {
+	id        string
+	name      string
+	arguments strings.Builder
+}
+
+func newToolCallAccumulator() *toolCallAccumulator {
+	return &toolCallAccumulator{bySlot: map[accumulatorKey]*partialToolCall{}}
+}
+
+func (a *toolCallAccumulator) add(call openai.ChatCompletionChunkChoiceDeltaToolCall) {
+	key := a.keyFor(call)
+	partial := a.bySlot[key]
+	if partial == nil {
+		partial = &partialToolCall{}
+		a.bySlot[key] = partial
+		a.order = append(a.order, key)
+	}
+	if call.ID != "" {
+		partial.id = call.ID
+	}
+	if call.Function.Name != "" {
+		partial.name = call.Function.Name
+	}
+	if call.Function.Arguments != "" {
+		partial.arguments.WriteString(call.Function.Arguments)
+	}
+}
+
+func (a *toolCallAccumulator) keyFor(call openai.ChatCompletionChunkChoiceDeltaToolCall) accumulatorKey {
+	idx := int(call.Index)
+	if idx < 0 {
+		idx = -1
+	}
+	if call.ID != "" {
+		return accumulatorKey{index: idx, id: call.ID}
+	}
+	// Without an id, match against any existing slot with the same index;
+	// this is what OpenAI does on follow-up deltas (id only in the opening
+	// chunk, subsequent chunks repeat the index).
+	for _, key := range a.order {
+		if key.index == idx {
+			return key
+		}
+	}
+	return accumulatorKey{index: idx}
+}
+
+func (a *toolCallAccumulator) complete() []model.ToolCall {
+	out := make([]model.ToolCall, 0, len(a.order))
+	for _, key := range a.order {
+		partial := a.bySlot[key]
+		if partial == nil {
+			continue
+		}
+		if partial.id == "" && partial.name == "" && partial.arguments.Len() == 0 {
+			continue
+		}
+		out = append(out, model.ToolCall{
+			ID:        partial.id,
+			Name:      partial.name,
+			Arguments: []byte(partial.arguments.String()),
+		})
+	}
+	return out
 }
 
 // extractInlineError returns the human-readable error message from a
