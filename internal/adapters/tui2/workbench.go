@@ -1059,6 +1059,12 @@ func (m model) noticeView() string {
 		}
 		notice = "editor unavailable: " + detail
 	}
+	// Pending approvals get priority over the static cheatsheet so the user
+	// always sees the queue and the relevant command shortcuts when there
+	// is something to approve.
+	if pending := m.pendingApprovalStrip(); pending != "" {
+		notice = pending
+	}
 	if notice == "" {
 		notice = "j/k move  Ctrl+H/L panes  h/l left/right local  Enter activate  :s swarm  :! shell  :term terminal  d detail  y copy  v select  m mouse  q quit"
 	}
@@ -1748,6 +1754,10 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		return m.approveRef(strings.TrimSpace(strings.TrimPrefix(line, ":a ")))
 	case strings.HasPrefix(line, ":r "):
 		return m.rejectRef(strings.TrimSpace(strings.TrimPrefix(line, ":r ")))
+	case line == ":A" || line == ":a all" || line == ":a *":
+		return m.approveRef("all")
+	case line == ":R" || line == ":r all" || line == ":r *":
+		return m.rejectRef("all")
 	default:
 		m.mode = modeNormal
 		m.state.Notice = "unknown command " + line
@@ -2649,13 +2659,28 @@ func (m model) approveSelected() (tea.Model, tea.Cmd) {
 	})
 }
 
-func (m model) approveRef(id string) (tea.Model, tea.Cmd) {
-	if strings.TrimSpace(id) == "" {
-		m.state.Notice = "approve requires an approval id"
+func (m model) approveRef(arg string) (tea.Model, tea.Cmd) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		m.state.Notice = "approve requires an approval id, range like p1-p3, or 'all'"
+		return m, nil
+	}
+	ids := m.resolveApprovalSpec(arg)
+	if len(ids) == 0 {
+		m.state.Notice = "no matching pending approvals for " + arg
 		return m, nil
 	}
 	return m.runAction(func(ctx context.Context) (workbench.State, error) {
-		return m.controller.Approve(ctx, id)
+		var last workbench.State
+		var err error
+		for _, id := range ids {
+			last, err = m.controller.Approve(ctx, id)
+			if err != nil {
+				return last, err
+			}
+		}
+		last.Notice = fmt.Sprintf("approved %d item(s)", len(ids))
+		return last, nil
 	})
 }
 
@@ -2670,13 +2695,28 @@ func (m model) rejectSelected() (tea.Model, tea.Cmd) {
 	})
 }
 
-func (m model) rejectRef(id string) (tea.Model, tea.Cmd) {
-	if strings.TrimSpace(id) == "" {
-		m.state.Notice = "reject requires an approval id"
+func (m model) rejectRef(arg string) (tea.Model, tea.Cmd) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		m.state.Notice = "reject requires an approval id, range like p1-p3, or 'all'"
+		return m, nil
+	}
+	ids := m.resolveApprovalSpec(arg)
+	if len(ids) == 0 {
+		m.state.Notice = "no matching pending approvals for " + arg
 		return m, nil
 	}
 	return m.runAction(func(ctx context.Context) (workbench.State, error) {
-		return m.controller.Reject(ctx, id)
+		var last workbench.State
+		var err error
+		for _, id := range ids {
+			last, err = m.controller.Reject(ctx, id)
+			if err != nil {
+				return last, err
+			}
+		}
+		last.Notice = fmt.Sprintf("rejected %d item(s)", len(ids))
+		return last, nil
 	})
 }
 
@@ -3085,6 +3125,124 @@ func (m model) firstPendingApprovalID() (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// resolveApprovalSpec turns a user argument into the concrete approval ids
+// to act on. Accepted forms:
+//
+//   - "all" / "*": every pending approval, in queue order
+//   - "p3": a specific id
+//   - "p1-p3" / "1-3": an inclusive range over the queue's numeric suffix
+//   - "p1 p2 p4" / "p1,p2,p4": a list of ids
+//
+// Unknown ids that don't match anything pending are silently dropped so the
+// user can retry without typing a partial command.
+func (m model) resolveApprovalSpec(arg string) []string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil
+	}
+	pendingByID := map[string]bool{}
+	pendingOrder := make([]string, 0, len(m.state.Approvals))
+	for _, ap := range m.state.Approvals {
+		if strings.TrimSpace(ap.ID) != "" && !pendingByID[ap.ID] {
+			pendingByID[ap.ID] = true
+			pendingOrder = append(pendingOrder, ap.ID)
+		}
+	}
+	if strings.EqualFold(arg, "all") || arg == "*" {
+		return pendingOrder
+	}
+	// Range: p1-p3 or 1-3.
+	if lo, hi, ok := parseRangeSpec(arg); ok {
+		var ids []string
+		for _, id := range pendingOrder {
+			if num, ok := approvalIDNumber(id); ok && num >= lo && num <= hi {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	}
+	// List: comma- or space-separated.
+	tokens := strings.FieldsFunc(arg, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	var ids []string
+	for _, tok := range tokens {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if pendingByID[tok] {
+			ids = append(ids, tok)
+			continue
+		}
+		// Bare number ("3") matches "p3".
+		prefixed := "p" + tok
+		if pendingByID[prefixed] {
+			ids = append(ids, prefixed)
+		}
+	}
+	return ids
+}
+
+func parseRangeSpec(arg string) (int, int, bool) {
+	idx := strings.IndexByte(arg, '-')
+	if idx < 0 {
+		return 0, 0, false
+	}
+	left := strings.TrimSpace(arg[:idx])
+	right := strings.TrimSpace(arg[idx+1:])
+	if left == "" || right == "" {
+		return 0, 0, false
+	}
+	lo, lok := approvalNumberToken(left)
+	hi, hok := approvalNumberToken(right)
+	if !lok || !hok || hi < lo {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
+func approvalNumberToken(token string) (int, bool) {
+	token = strings.TrimSpace(token)
+	token = strings.TrimPrefix(token, "p")
+	n, err := strconv.Atoi(token)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func approvalIDNumber(id string) (int, bool) {
+	digits := strings.TrimPrefix(id, "p")
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// pendingApprovalStrip renders a one-line summary of the pending approvals
+// queue, suitable for the notice line. Empty string when nothing is pending.
+func (m model) pendingApprovalStrip() string {
+	if len(m.state.Approvals) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(m.state.Approvals))
+	for _, ap := range m.state.Approvals {
+		if id := strings.TrimSpace(ap.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	if len(ids) > 6 {
+		more := len(ids) - 6
+		ids = append(ids[:6], fmt.Sprintf("+%d", more))
+	}
+	return fmt.Sprintf("pending [%s] — a/r approve/reject; :a all / :a p1-p3 / :A all", strings.Join(ids, " "))
 }
 
 func (m *model) moveSelection(delta int) {

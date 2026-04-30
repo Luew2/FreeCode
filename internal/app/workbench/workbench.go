@@ -352,7 +352,19 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 			switch event.Type {
 			case session.EventUserMessage, session.EventAssistantMessage:
 				text := strings.TrimSpace(event.Text)
+				// Tool-call-only assistant turns log empty text with the
+				// tool_calls in the payload; we don't need to render those
+				// as a separate item because the EventTool entries that
+				// follow surface them. But for a true "model returned
+				// nothing" case (no text, no tool_calls) we want to render
+				// a placeholder so the user is not left looking at a stale
+				// "waiting for model output" indicator with no resolution.
 				if text == "" {
+					if event.Type == session.EventAssistantMessage && !assistantPayloadHasToolCalls(event.Payload) {
+						streaming.Reset()
+						modelStarted = false
+						appendTranscript(TranscriptAssistant, event.Actor, "assistant", "(no response)", transcriptEventMeta(event))
+					}
 					continue
 				}
 				streaming.Reset()
@@ -2263,6 +2275,25 @@ func stringValue(value any) string {
 	default:
 		return ""
 	}
+}
+
+// assistantPayloadHasToolCalls reports whether an EventAssistantMessage
+// event was logged for an assistant turn that called tools (vs a turn
+// that produced no text and no tool_calls — the second case is a real
+// "empty response" we want to surface to the user).
+func assistantPayloadHasToolCalls(payload map[string]any) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	calls, ok := payload["tool_calls"].([]any)
+	if ok && len(calls) > 0 {
+		return true
+	}
+	// orchestrator may also encode as []map[string]any.
+	if mapped, ok := payload["tool_calls"].([]map[string]any); ok && len(mapped) > 0 {
+		return true
+	}
+	return false
 }
 
 func mapStringAny(value any) map[string]any {
