@@ -723,11 +723,17 @@ func runMainOwnedSwarm(ctx context.Context, configPath string, bundle runtimeBun
 		return err
 	}
 	spawnBefore := countToolEvents(ctx, service.Log, sessionID, "spawn_agent")
-	prompt := swarmDelegationPrompt(request.Text, request.Approval, bundle.Git)
+	// Send the user's prompt as the actual user message and the swarm
+	// orchestration scaffolding (role, planning rules, current git
+	// context) as the turn-scoped developer message. The earlier
+	// behaviour stuffed everything into Question, which made the chat
+	// transcript appear as if the user had typed the orchestrator
+	// instructions verbatim.
+	turnContext := combineTurnContexts(request.TurnContext, swarmDelegationContext(request.Approval, bundle.Git))
 	response, err := commands.AskWithResponse(ctx, io.Discard, deps, commands.AskOptions{
-		Question:       prompt,
+		Question:       strings.TrimSpace(request.Text),
 		SessionID:      string(sessionID),
-		TurnContext:    request.TurnContext,
+		TurnContext:    turnContext,
 		MaxSteps:       16,
 		IncludeHistory: true,
 	})
@@ -795,12 +801,13 @@ func logSwarmLifecycle(ctx context.Context, log ports.EventLog, sessionID sessio
 	})
 }
 
-func swarmDelegationPrompt(goal string, approval permission.Mode, git ports.Git) string {
-	var lines []string
-	lines = append(lines,
-		"Swarm request:",
-		strings.TrimSpace(goal),
-		"",
+// swarmDelegationContext returns the orchestrator scaffolding for a swarm
+// run as a turn-scoped developer message. It deliberately does NOT include
+// the user's prompt — that flows separately as the user message — so the
+// chat transcript shows the user's actual ask, not the orchestrator role
+// instructions concatenated to it.
+func swarmDelegationContext(approval permission.Mode, git ports.Git) string {
+	lines := []string{
 		"You are the main FreeCode orchestrator for a dynamic swarm run.",
 		"Create a concise plan, then use spawn_agent to delegate as many bounded tasks as the request actually needs.",
 		"Prefer explorer agents for context gathering, worker agents for scoped edits, verifier agents for checks, and reviewer agents for correctness review.",
@@ -809,12 +816,25 @@ func swarmDelegationPrompt(goal string, approval permission.Mode, git ports.Git)
 		"If the user request is a short follow-up fragment, infer its meaning from the active turn context and visible conversation history before asking for clarification.",
 		"After each handoff returns, synthesize progress and decide whether another child agent is needed.",
 		"Finish with a direct summary of what changed, what agents did, verification, and any unresolved risks.",
-		"Approval mode: "+string(approval)+".",
-	)
+		"Approval mode: " + string(approval) + ".",
+	}
 	if status := gitStatusSummary(context.Background(), git); status != "" {
 		lines = append(lines, "", "Current git context:", status)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func combineTurnContexts(base string, extra string) string {
+	base = strings.TrimSpace(base)
+	extra = strings.TrimSpace(extra)
+	switch {
+	case base == "":
+		return extra
+	case extra == "":
+		return base
+	default:
+		return base + "\n\n" + extra
+	}
 }
 
 func swarmSynthesisPrompt(goal string, response swarm.Response, git ports.Git) string {
@@ -916,6 +936,7 @@ func runTUI(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) 
 		Tools:           bundle.WriteTools,
 		Approval:        bundle.Approval,
 		Sessions:        bundle.Sessions,
+		Config:          tomlconfig.New(configPath),
 		LogForSession:   bundle.LogForSession,
 		SessionID:       bundle.SessionID,
 		WorkspaceRoot:   bundle.Workspace.Root(),

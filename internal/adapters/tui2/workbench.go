@@ -66,6 +66,11 @@ type terminalSharer interface {
 	ShareTerminal(ctx context.Context, title string, body string) (workbench.State, error)
 }
 
+type modelSwitcher interface {
+	ListModels(ctx context.Context) ([]workbench.ModelEntry, error)
+	SetActiveModel(ctx context.Context, ref string) (workbench.State, error)
+}
+
 type Options struct {
 	In         io.Reader
 	Out        io.Writer
@@ -1772,6 +1777,12 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 		return m.setDebugMode(true)
 	case line == ":debug off":
 		return m.setDebugMode(false)
+	case line == ":models" || line == ":model":
+		return m.showModels()
+	case strings.HasPrefix(line, ":use "):
+		return m.switchActiveModel(strings.TrimSpace(strings.TrimPrefix(line, ":use ")))
+	case strings.HasPrefix(line, ":model "):
+		return m.switchActiveModel(strings.TrimSpace(strings.TrimPrefix(line, ":model ")))
 	default:
 		m.mode = modeNormal
 		m.state.Notice = "unknown command " + line
@@ -1796,6 +1807,69 @@ func (m model) showSessions() (tea.Model, tea.Cmd) {
 	m.detail.SetYOffset(0)
 	m.syncDetailViewport()
 	return m, nil
+}
+
+func (m model) showModels() (tea.Model, tea.Cmd) {
+	switcher, ok := m.controller.(modelSwitcher)
+	if !ok {
+		m.state.Notice = "model swap is unavailable: controller does not expose a config store"
+		return m, nil
+	}
+	entries, err := switcher.ListModels(m.ctx)
+	if err != nil {
+		m.state.Notice = "models: " + err.Error()
+		return m, nil
+	}
+	var lines []string
+	if len(entries) == 0 {
+		lines = append(lines,
+			"No models configured yet.",
+			"",
+			"Add one from the shell:",
+			"  freecode provider add --name NAME --base-url URL --api-key-env ENV --model MODEL",
+			"  freecode provider add --name openai --base-url https://api.openai.com/v1 --api-key-env OPENAI_API_KEY --model gpt-5 --skip-probe",
+		)
+	} else {
+		lines = append(lines, "Configured models (active marked with *):", "")
+		for _, e := range entries {
+			marker := " "
+			if e.Active {
+				marker = "*"
+			}
+			lines = append(lines, fmt.Sprintf("%s %s   (%s)", marker, e.Ref, e.BaseURL))
+		}
+		lines = append(lines,
+			"",
+			"Switch with:",
+			"  :use <provider>          # use the provider's default_model",
+			"  :use <provider/model>    # use an explicit model",
+			"",
+			"Add another from the shell:",
+			"  freecode provider add --name NAME --base-url URL --api-key-env ENV --model MODEL",
+		)
+	}
+	m.state.Detail = workbench.Item{ID: "models", Kind: "models", Title: "Models", Body: strings.Join(lines, "\n")}
+	m.state.Notice = "models"
+	m.focus = focusContext
+	m.overlay = overlayDetail
+	m.detail.SetYOffset(0)
+	m.syncDetailViewport()
+	return m, nil
+}
+
+func (m model) switchActiveModel(ref string) (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(ref) == "" {
+		m.state.Notice = "usage: :use <provider> or :use <provider/model>"
+		return m, nil
+	}
+	switcher, ok := m.controller.(modelSwitcher)
+	if !ok {
+		m.state.Notice = "model swap is unavailable: controller does not expose a config store"
+		return m, nil
+	}
+	return m.runAction(func(ctx context.Context) (workbench.State, error) {
+		return switcher.SetActiveModel(ctx, ref)
+	})
 }
 
 func (m model) showSettings() (tea.Model, tea.Cmd) {

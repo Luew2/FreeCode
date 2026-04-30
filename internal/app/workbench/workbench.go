@@ -17,6 +17,7 @@ import (
 
 	"github.com/Luew2/FreeCode/internal/app/contextmgr"
 	"github.com/Luew2/FreeCode/internal/core/artifact"
+	"github.com/Luew2/FreeCode/internal/core/config"
 	"github.com/Luew2/FreeCode/internal/core/model"
 	"github.com/Luew2/FreeCode/internal/core/permission"
 	"github.com/Luew2/FreeCode/internal/core/session"
@@ -48,7 +49,11 @@ type Service struct {
 	Submit    Submitter
 	Approval  *ApprovalGate
 	Sessions  SessionIndex
-	Now       func() time.Time
+	// Config powers the :models modal — listing every configured provider
+	// and switching the active model without dropping back to the CLI.
+	// Optional; nil disables the swap UI but everything else still works.
+	Config ports.ConfigStore
+	Now    func() time.Time
 
 	LogForSession      func(session.ID) ports.EventLog
 	SessionID          session.ID
@@ -58,6 +63,108 @@ type Service struct {
 	ActiveConversation ConversationTarget
 	Provider           string
 	Model              model.Ref
+}
+
+// ModelEntry is one row in the :models modal: a provider+model pair the
+// user can pick to activate.
+type ModelEntry struct {
+	Provider model.ProviderID
+	Model    model.ModelID
+	Ref      string
+	BaseURL  string
+	Active   bool
+}
+
+// ListModels returns every provider/model pair from config, with the
+// active one flagged. Returns ([], nil) when no config store is wired so
+// callers can render an empty/disabled modal cleanly.
+func (s *Service) ListModels(ctx context.Context) ([]ModelEntry, error) {
+	if s == nil || s.Config == nil {
+		return nil, nil
+	}
+	settings, err := s.Config.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ModelEntry, 0, len(settings.Models))
+	for ref, m := range settings.Models {
+		provider := settings.Providers[ref.Provider]
+		out = append(out, ModelEntry{
+			Provider: ref.Provider,
+			Model:    m.Ref.ID,
+			Ref:      ref.String(),
+			BaseURL:  provider.BaseURL,
+			Active:   ref == settings.ActiveModel,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Active != out[j].Active {
+			return out[i].Active
+		}
+		return out[i].Ref < out[j].Ref
+	})
+	return out, nil
+}
+
+// SetActiveModel swaps the active model. Accepts either "provider" (the
+// provider's default model is used) or "provider/model" for an explicit
+// pick. Updates the in-memory Service state too so the next Load() picks
+// up the new active model without a restart.
+func (s *Service) SetActiveModel(ctx context.Context, ref string) (State, error) {
+	if s == nil || s.Config == nil {
+		return State{}, errors.New("config store is not configured")
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return State{}, errors.New("model ref is required")
+	}
+	settings, err := s.Config.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	resolved, err := resolveModelRef(settings, ref)
+	if err != nil {
+		return State{}, err
+	}
+	settings.ActiveModel = resolved
+	if err := s.Config.Save(ctx, settings); err != nil {
+		return State{}, err
+	}
+	s.Model = resolved
+	if provider, ok := settings.Providers[resolved.Provider]; ok {
+		s.Provider = provider.Name
+		if s.Provider == "" {
+			s.Provider = string(provider.ID)
+		}
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	state.Notice = "active model: " + resolved.String()
+	return state, nil
+}
+
+func resolveModelRef(settings config.Settings, ref string) (model.Ref, error) {
+	if strings.Contains(ref, "/") {
+		parsed, err := model.ParseRef(ref)
+		if err != nil {
+			return model.Ref{}, err
+		}
+		if _, ok := settings.Models[parsed]; !ok {
+			return model.Ref{}, fmt.Errorf("model %q is not configured", parsed.String())
+		}
+		return parsed, nil
+	}
+	providerID := model.ProviderID(ref)
+	provider, ok := settings.Providers[providerID]
+	if !ok {
+		return model.Ref{}, fmt.Errorf("provider %q is not configured", ref)
+	}
+	if provider.DefaultModel == "" {
+		return model.Ref{}, fmt.Errorf("provider %q has no default_model; specify provider/model explicitly", ref)
+	}
+	return model.NewRef(providerID, provider.DefaultModel), nil
 }
 
 type State struct {

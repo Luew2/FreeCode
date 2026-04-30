@@ -115,13 +115,19 @@ func TestDelegatingToolsHideSpawnAgentAtDepthLimit(t *testing.T) {
 	}
 }
 
-func TestSwarmDelegationPromptAsksMainToSpawnDynamicAgents(t *testing.T) {
-	prompt := swarmDelegationPrompt("ship feature", "auto", nil)
+func TestSwarmDelegationContextAsksMainToSpawnDynamicAgents(t *testing.T) {
+	prompt := swarmDelegationContext("auto", nil)
 	if !strings.Contains(prompt, "use spawn_agent") ||
 		!strings.Contains(prompt, "Do not use a fixed agent count") ||
 		!strings.Contains(prompt, "as many bounded tasks as the request actually needs") ||
 		!strings.Contains(prompt, "orchestrator child agents") {
-		t.Fatalf("prompt = %q, want dynamic main-owned swarm instructions", prompt)
+		t.Fatalf("context = %q, want dynamic main-owned swarm instructions", prompt)
+	}
+	// The user goal must NOT appear here — that ships separately as the
+	// user message. Folding it in was the bug that made the full
+	// scaffolding render as a user prompt in chat.
+	if strings.Contains(prompt, "ship feature") {
+		t.Fatalf("context contains user goal verbatim; should be turn-context only:\n%s", prompt)
 	}
 }
 
