@@ -58,7 +58,12 @@ type Budget struct {
 }
 
 func DefaultBudget() Budget {
-	return Budget{MaxSteps: 12, MaxTokens: 100000}
+	// 40 steps is the right default for a subagent: enough for a real
+	// research / scoped-edit loop with pair tools (e.g. terminal_write +
+	// terminal_read), but tight enough that a confused agent runs out
+	// before the user notices. The main orchestrator gets a higher cap
+	// (orchestrator.DefaultMaxSteps).
+	return Budget{MaxSteps: 40, MaxTokens: 100000}
 }
 
 type HandoffRequirements struct {
@@ -122,7 +127,7 @@ func DefaultDefinitions() []Definition {
 			Description: "Primary interactive agent that coordinates bounded work.",
 			Permissions: permission.DefaultPolicy(),
 			Flow:        FlowDirect,
-			MaxSteps:    24,
+			MaxSteps:    80,
 		},
 		{
 			Name:        "explorer",
@@ -130,7 +135,7 @@ func DefaultDefinitions() []Definition {
 			Description: "Read-only codebase analysis agent.",
 			Permissions: readOnlyPolicy(),
 			Flow:        FlowDirect,
-			MaxSteps:    12,
+			MaxSteps:    40,
 		},
 		{
 			Name:        "worker",
@@ -138,7 +143,7 @@ func DefaultDefinitions() []Definition {
 			Description: "Scoped implementation agent with explicit write grants.",
 			Permissions: permission.DefaultPolicy(),
 			Flow:        FlowDirect,
-			MaxSteps:    12,
+			MaxSteps:    40,
 		},
 		{
 			Name:        "reviewer",
@@ -146,7 +151,7 @@ func DefaultDefinitions() []Definition {
 			Description: "Review-only agent that reports findings before summary.",
 			Permissions: readOnlyPolicy(),
 			Flow:        FlowDirect,
-			MaxSteps:    12,
+			MaxSteps:    40,
 		},
 		{
 			Name:        "verifier",
@@ -154,7 +159,7 @@ func DefaultDefinitions() []Definition {
 			Description: "Runs focused checks with no write permission.",
 			Permissions: verifierPolicy(),
 			Flow:        FlowDirect,
-			MaxSteps:    8,
+			MaxSteps:    24,
 		},
 		{
 			Name:        "summarizer",

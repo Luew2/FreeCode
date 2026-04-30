@@ -16,7 +16,13 @@ import (
 )
 
 const (
-	DefaultMaxSteps = 8
+	// DefaultMaxSteps caps how many model+tool round-trips one Run can
+	// take. Each tool call is one step, and pair tools like
+	// terminal_write+terminal_read burn two steps per logical action, so
+	// the previous default of 8 was about 4 actions — not enough for any
+	// non-trivial task. 60 covers most real interactive sessions while
+	// still bounding obviously-stuck runaway loops.
+	DefaultMaxSteps = 60
 	// maxEmptyRetries caps how many times the orchestrator will re-poll the
 	// model after an empty turn (no text, no tool calls). Empty turns are
 	// almost always provider glitches; retrying twice with progressively
