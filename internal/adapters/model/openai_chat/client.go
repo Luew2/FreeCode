@@ -524,6 +524,14 @@ func parseExtendedDelta(raw string) *extendedDelta {
 	var envelope struct {
 		Choices []struct {
 			Delta struct {
+				// Different compat providers spell the reasoning channel
+				// differently. Z.AI's GLM-5.1 uses bare "reasoning"
+				// (confirmed via raw chunk dump), DeepSeek and many
+				// OpenAI-compat reasoning models use "reasoning_content",
+				// Anthropic-style proxies sometimes use "thinking". We
+				// accept all three; whichever is non-empty is the
+				// reasoning stream for this provider.
+				Reasoning        string `json:"reasoning"`
 				ReasoningContent string `json:"reasoning_content"`
 				Thinking         string `json:"thinking"`
 				FunctionCall     *struct {
@@ -540,11 +548,17 @@ func parseExtendedDelta(raw string) *extendedDelta {
 		return nil
 	}
 	delta := envelope.Choices[0].Delta
-	if delta.ReasoningContent == "" && delta.Thinking == "" && delta.FunctionCall == nil {
+	// Concatenate any non-empty reasoning fields rather than picking one.
+	// In practice we expect at most one to be populated per chunk, but if a
+	// provider duplicates content across "reasoning" and "reasoning_content"
+	// (some proxies do, some are in transition between names) joining them
+	// is strictly safer than picking and losing the other.
+	reasoning := delta.Reasoning + delta.ReasoningContent
+	if reasoning == "" && delta.Thinking == "" && delta.FunctionCall == nil {
 		return nil
 	}
 	out := &extendedDelta{
-		ReasoningContent: delta.ReasoningContent,
+		ReasoningContent: reasoning,
 		Thinking:         delta.Thinking,
 	}
 	if delta.FunctionCall != nil {
