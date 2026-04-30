@@ -145,7 +145,7 @@ go run ./cmd/freecode diff README.md
 Add an OpenAI-compatible provider without probing the network:
 
 ```sh
-go run ./cmd/freecode provider add --name local --base-url https://api.example.com/v1 --api-key-env LOCAL_API_KEY --model coder --protocol auto --skip-probe
+go run ./cmd/freecode provider add --name local --base-url https://api.example.com/v1 --api-key-env LOCAL_API_KEY --model coder --protocol openai-chat --skip-probe
 ```
 
 List configured providers and models:
