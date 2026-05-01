@@ -4443,13 +4443,13 @@ var (
 
 	headerStyle   = tuiRenderer.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8")).Padding(0, 1)
 	titleStyle    = tuiRenderer.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
-	mutedStyle    = tuiRenderer.NewStyle().Foreground(lipgloss.Color("8"))
+	mutedStyle    = tuiRenderer.NewStyle().Foreground(lipgloss.Color("245"))
 	errorStyle    = tuiRenderer.NewStyle().Foreground(lipgloss.Color("9"))
 	selectedStyle = tuiRenderer.NewStyle().Foreground(lipgloss.Color("14"))
 	borderStyle   = tuiRenderer.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8")).Padding(0, 1)
 	activeStyle   = borderStyle.Copy().BorderForeground(lipgloss.Color("14"))
 	composerStyle = tuiRenderer.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("8")).Padding(0, 1)
-	noticeStyle   = tuiRenderer.NewStyle().Foreground(lipgloss.Color("8")).Padding(0, 1)
+	noticeStyle   = tuiRenderer.NewStyle().Foreground(lipgloss.Color("245")).Padding(0, 1)
 	modalStyle    = tuiRenderer.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("14")).Padding(1, 2).Background(lipgloss.Color("0"))
 )
 
@@ -4544,22 +4544,78 @@ func wrapLines(text string, width int, limit int) []string {
 	if text == "" {
 		return []string{""}
 	}
+	width = max(1, width)
 	var lines []string
 	for _, raw := range strings.Split(text, "\n") {
 		raw = strings.TrimSpace(raw)
-		for len(raw) > width && width > 0 {
-			lines = append(lines, raw[:width])
-			raw = raw[width:]
+		if raw == "" {
+			lines = append(lines, "")
+			continue
+		}
+		for _, line := range wordWrapLine(raw, width) {
+			lines = append(lines, line)
 			if limit > 0 && len(lines) >= limit {
 				return append(lines, "...")
 			}
 		}
-		lines = append(lines, raw)
-		if limit > 0 && len(lines) >= limit {
-			return append(lines, "...")
-		}
 	}
 	return lines
+}
+
+func wordWrapLine(line string, width int) []string {
+	if lipgloss.Width(line) <= width {
+		return []string{line}
+	}
+	words := strings.Fields(line)
+	if len(words) == 0 {
+		return []string{""}
+	}
+	var out []string
+	current := ""
+	for _, word := range words {
+		if current == "" {
+			if lipgloss.Width(word) <= width {
+				current = word
+				continue
+			}
+			out = append(out, hardWrapWord(word, width)...)
+			continue
+		}
+		candidate := current + " " + word
+		if lipgloss.Width(candidate) <= width {
+			current = candidate
+			continue
+		}
+		out = append(out, current)
+		current = ""
+		if lipgloss.Width(word) <= width {
+			current = word
+		} else {
+			out = append(out, hardWrapWord(word, width)...)
+		}
+	}
+	if current != "" {
+		out = append(out, current)
+	}
+	return out
+}
+
+func hardWrapWord(word string, width int) []string {
+	var out []string
+	var current []rune
+	for _, r := range []rune(word) {
+		next := string(append(current, r))
+		if len(current) > 0 && lipgloss.Width(next) > width {
+			out = append(out, string(current))
+			current = []rune{r}
+			continue
+		}
+		current = append(current, r)
+	}
+	if len(current) > 0 {
+		out = append(out, string(current))
+	}
+	return out
 }
 
 func visibleRange(total int, cursor int, capacity int) (int, int) {

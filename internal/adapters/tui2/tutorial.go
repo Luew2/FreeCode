@@ -192,6 +192,7 @@ func (g *tutorialGame) Move(delta int, count int) {
 func (m model) tutorialView() string {
 	steps := m.tutorialSteps()
 	width := m.modalContentWidth(94)
+	contentWidth := max(20, width-8)
 	height := max(14, min(max(14, m.height-6), 36))
 	if len(steps) == 0 {
 		return modalStyle.Width(width).Render("No tutorial steps available")
@@ -205,16 +206,13 @@ func (m model) tutorialView() string {
 		}
 	}
 
-	lines := []string{
-		titleStyle.Render("FreeCode Tutorial"),
-		mutedStyle.Render(fmt.Sprintf("progress %d/%d  j/k browse  type inside this overlay  Esc resets input/closes from normal", completed, len(steps))),
-		"",
-		selectedStyle.Render(fmt.Sprintf("Mission %d: %s", m.tutorial.step+1, current.Title)),
-		current.Description,
-		"Task: " + tutorialInstruction(current),
-	}
+	lines := []string{titleStyle.Render("FreeCode Tutorial")}
+	appendTutorialWrapped(&lines, "muted", fmt.Sprintf("progress %d/%d  j/k browse  type inside this overlay  Esc resets input/closes from normal", completed, len(steps)), contentWidth)
+	lines = append(lines, "", selectedStyle.Render(fmt.Sprintf("Mission %d: %s", m.tutorial.step+1, current.Title)))
+	appendTutorialWrapped(&lines, "", current.Description, contentWidth)
+	appendTutorialWrapped(&lines, "", "Task: "+tutorialInstruction(current), contentWidth)
 	if command := m.commandByID(current.CommandID); command.Description != "" {
-		lines = append(lines, mutedStyle.Render("Why: "+truncate(command.Description, max(20, width-8))))
+		appendTutorialWrapped(&lines, "muted", "Why: "+command.Description, contentWidth)
 	}
 	lines = append(lines, "")
 	lines = append(lines, m.tutorialInputLine(current))
@@ -222,10 +220,10 @@ func (m model) tutorialView() string {
 		lines = append(lines, selectedStyle.Render("Complete"))
 	}
 	if m.tutorial.last != "" {
-		lines = append(lines, mutedStyle.Render(m.tutorial.last))
+		appendTutorialWrapped(&lines, "muted", m.tutorial.last, contentWidth)
 	}
 	lines = append(lines, "", titleStyle.Render("Simulated Output"))
-	lines = append(lines, m.tutorialLogLines(max(3, height-len(lines)-8))...)
+	lines = append(lines, m.tutorialLogLines(contentWidth, max(3, height-len(lines)-8))...)
 	lines = append(lines, "", titleStyle.Render("Training Board"))
 	start, end := visibleRange(len(steps), m.tutorial.step, max(4, height-len(lines)-2))
 	for i := start; i < end; i++ {
@@ -235,10 +233,16 @@ func (m model) tutorialView() string {
 			mark = "x"
 		}
 		row := fmt.Sprintf("[%s] %-18s %s", mark, tutorialShortTarget(step), step.Title)
-		lines = append(lines, selectableLine(i == m.tutorial.step, "", row))
+		wrapped := wrapLines(row, contentWidth, 0)
+		for j, line := range wrapped {
+			if j > 0 {
+				line = "    " + line
+			}
+			lines = append(lines, selectableLine(i == m.tutorial.step, "", line))
+		}
 	}
-	lines = append(lines, mutedStyle.Render("No real prompts, shell commands, terminal sharing, or API requests happen in tutorial mode."))
-	return modalStyle.Width(width).Render(fitLines(lines, width-4, height))
+	appendTutorialWrapped(&lines, "muted", "No real prompts, shell commands, terminal sharing, or API requests happen in tutorial mode.", contentWidth)
+	return modalStyle.Width(width).Render(fitLines(lines, contentWidth+2, height))
 }
 
 func (m model) tutorialInputLine(step tutorialStep) string {
@@ -259,16 +263,30 @@ func (m model) tutorialInputLine(step tutorialStep) string {
 	}
 }
 
-func (m model) tutorialLogLines(limit int) []string {
+func (m model) tutorialLogLines(width int, limit int) []string {
 	if len(m.tutorial.log) == 0 {
 		return []string{mutedStyle.Render("tutorial output will appear here")}
 	}
-	start := max(0, len(m.tutorial.log)-limit)
+	contentWidth := max(20, width)
 	var lines []string
-	for _, line := range m.tutorial.log[start:] {
-		lines = append(lines, truncate(line, max(20, m.modalContentWidth(88)-8)))
+	for _, line := range m.tutorial.log {
+		lines = append(lines, wrapLines(line, contentWidth, 0)...)
+	}
+	if limit > 0 && len(lines) > limit {
+		lines = append([]string{mutedStyle.Render("more simulated output above")}, lines[len(lines)-limit+1:]...)
 	}
 	return lines
+}
+
+func appendTutorialWrapped(lines *[]string, style string, text string, width int) {
+	for _, line := range wrapLines(text, width, 0) {
+		switch style {
+		case "muted":
+			*lines = append(*lines, mutedStyle.Render(line))
+		default:
+			*lines = append(*lines, line)
+		}
+	}
 }
 
 func (m model) tutorialSteps() []tutorialStep {

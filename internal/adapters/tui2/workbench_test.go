@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Luew2/FreeCode/internal/app/workbench"
 	"github.com/Luew2/FreeCode/internal/core/permission"
@@ -1954,6 +1955,34 @@ func TestTutorialCommandGivesCorrectionForWrongCommand(t *testing.T) {
 	}
 }
 
+func TestTutorialWrapsTextWithoutHorizontalEllipses(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.width = 150
+	m.height = 52
+	m = m.openTutorial()
+	m.tutorial.step = 3
+	m.tutorial.log = []string{
+		"tutorial: No API calls are made here. Commands and prompts are intercepted locally.",
+		"you: explain this repo",
+		"freecode: That would send a normal chat prompt to the active conversation. No API request was sent.",
+		"you: :ops",
+		"freecode: The right pane would show active runs, queues, approvals, terminal sharing, and context.",
+		"you: :context",
+		"freecode: The context inspector would open with conversation tail, memory, terminal sharing state, and token estimate.",
+	}
+
+	view := stripANSI(m.tutorialView())
+	if strings.Contains(view, "...") {
+		t.Fatalf("tutorial view contains horizontal truncation ellipses, want wrapped text:\n%s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if printableWidth(line) > m.width {
+			t.Fatalf("tutorial line width = %d > terminal width %d: %q\nfull:\n%s", printableWidth(line), m.width, line, view)
+		}
+	}
+}
+
 func TestMCPStatusCommandOpensDetailOverlay(t *testing.T) {
 	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)
@@ -1989,7 +2018,7 @@ func pressKeys(t *testing.T, m model, keys ...string) model {
 }
 
 func printableWidth(value string) int {
-	return len(stripANSI(value))
+	return lipgloss.Width(stripANSI(value))
 }
 
 func stripANSI(value string) string {
