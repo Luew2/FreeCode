@@ -58,7 +58,7 @@ func (m model) openTutorial() model {
 	m.tutorial.input = ""
 	m.tutorial.step = clamp(m.tutorial.step, 0, max(0, len(m.tutorialSteps())-1))
 	if len(m.tutorial.log) == 0 {
-		m.tutorial.log = []string{"tutorial: No API calls are made here. Commands and prompts are intercepted locally."}
+		m.tutorial.log = []string{"tutorial: Agents are buffers, Ops is the control plane, and Vim-style editing is your direct intervention path. No API calls are made here."}
 	}
 	m.state.Notice = "tutorial opened"
 	return m
@@ -207,6 +207,7 @@ func (m model) tutorialView() string {
 	}
 
 	lines := []string{titleStyle.Render("FreeCode Tutorial")}
+	appendTutorialWrapped(&lines, "", "Train the harness: let agents run as buffers, steer them from Ops, and drop into Vim/file edits only when precision beats delegation.", contentWidth)
 	appendTutorialWrapped(&lines, "muted", fmt.Sprintf("progress %d/%d  j/k browse  type inside this overlay  Esc resets input/closes from normal", completed, len(steps)), contentWidth)
 	lines = append(lines, "", selectedStyle.Render(fmt.Sprintf("Mission %d: %s", m.tutorial.step+1, current.Title)))
 	appendTutorialWrapped(&lines, "", current.Description, contentWidth)
@@ -302,15 +303,15 @@ func (m model) tutorialSteps() []tutorialStep {
 		return tutorialStep{ID: id, Title: title, Description: description, CommandID: id, Kind: kind, Expected: expected, Response: response, Keys: keys}
 	}
 	return []tutorialStep{
-		step("prompt.insert", "Start a chat turn", "Open the composer and type a harmless prompt. The tutorial intercepts it instead of calling a model.", tutorialPrompt, []string{"explain this repo"}, "That would send a normal chat prompt to the active conversation. No API request was sent."),
-		step("tab.ops", "Open the Ops board", "Practice a Vim command that jumps to the operational view.", tutorialStepCommand, []string{":ops"}, "The right pane would show active runs, queues, approvals, terminal sharing, and context."),
-		step("context.inspect", "Inspect next context", "Learn the command that answers: what will the model see next?", tutorialStepCommand, []string{":context"}, "The context inspector would open with conversation tail, memory, terminal sharing state, and token estimate."),
-		step("agent.swarm", "Stage a swarm task", "Type a swarm command. In the real app this asks the main orchestrator to plan and allocate agents.", tutorialStepCommand, []string{":s review this codebase"}, "A swarm request would be queued for the orchestrator. No model call was made."),
+		step("prompt.insert", "Start an agent buffer", "Open the composer and type a harmless prompt. The tutorial intercepts it instead of calling a model.", tutorialPrompt, []string{"explain this repo"}, "That would send a normal prompt to the active conversation buffer. No API request was sent."),
+		step("tab.ops", "Open the Ops control plane", "Practice a Vim command that jumps to the operational view for runs, queues, approvals, context, and terminal sharing.", tutorialStepCommand, []string{":ops"}, "The right pane would show active runs, queues, approvals, terminal sharing, and next-turn context."),
+		step("context.inspect", "Inspect next context", "Learn the command that answers: what will the agent see next?", tutorialStepCommand, []string{":context"}, "The context inspector would open with conversation tail, memory, terminal sharing state, and token estimate."),
+		step("agent.swarm", "Stage a swarm task", "Type a swarm command. In the real app this asks the main orchestrator to plan and allocate agent buffers.", tutorialStepCommand, []string{":s review this codebase"}, "A swarm request would be queued for the orchestrator. No model call was made."),
 		step("shell.run", "Run a one-shot shell", "Practice the Vim-style local shell command. Tutorial mode does not run your shell.", tutorialStepCommand, []string{"!pwd"}, "A local-only shell cell would be appended to chat. No command was executed."),
 		step("terminal.open", "Open persistent terminal", "Practice opening the persistent terminal tab.", tutorialStepCommand, []string{":term", ":t"}, "The Term tab would open without stealing focus."),
 		step("terminal.share", "Share terminal control", "Practice the explicit opt-in command that gives the agent terminal_read and terminal_write.", tutorialStepCommand, []string{":st"}, "Terminal 1 would become live-shared with the agent, visibly marked in Ops and Term."),
 		step("terminal.share_output", "Attach terminal output", "Practice one-time output sharing without live terminal control.", tutorialStepCommand, []string{":sto"}, "Recent terminal output would be attached to the next model turn only."),
-		step("buffer.list", "List conversation buffers", "Treat main and agent chats like Vim buffers.", tutorialStepCommand, []string{":ls", ":buffers"}, "A buffer list would show main plus agent conversations."),
+		step("buffer.list", "List agent buffers", "Treat the main orchestrator and worker agents like Vim buffers.", tutorialStepCommand, []string{":ls", ":buffers"}, "A buffer list would show main plus agent conversations."),
 		step("buffer.switch", "Switch to main buffer", "Practice direct buffer navigation.", tutorialStepCommand, []string{":b main"}, "The center pane would switch back to the main orchestrator conversation."),
 		step("palette.open", "Open command palette", "Use the searchable command catalog when you forget a command.", tutorialPress, nil, "The palette would open; search by title, key, category, or keyword.", "ctrl+k", "?"),
 		step("item.copy", "Copy selected item", "Use keyboard copy for the selected message, file, artifact, or code block.", tutorialPress, nil, "The selected item would be copied to the clipboard.", "y"),

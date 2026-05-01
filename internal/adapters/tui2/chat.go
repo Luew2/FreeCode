@@ -83,7 +83,10 @@ func (c *chatRenderer) SetItems(items []workbench.TranscriptItem) {
 
 func (c *chatRenderer) View() string {
 	if len(c.items) == 0 {
-		return fitLines([]string{mutedStyle.Render("No messages yet")}, c.width, c.height)
+		return fitLines([]string{
+			mutedStyle.Render("Agent buffer is empty."),
+			mutedStyle.Render("i starts a prompt; :s stages work for the orchestrator."),
+		}, c.width, c.height)
 	}
 	c.ensureLayout()
 	c.clampOffsetForLineCount(c.lineCount)

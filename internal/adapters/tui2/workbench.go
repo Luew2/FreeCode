@@ -1066,7 +1066,7 @@ func (m model) headerView() string {
 	if m.state.ActiveConversation.Kind == "agent" {
 		conversation = "agent:" + conversation
 	}
-	status := fmt.Sprintf("freecode  provider:%s  model:%s  branch:%s  chat:%s  tokens:~%d  approval:%s",
+	status := fmt.Sprintf("freecode  provider:%s  model:%s  branch:%s  buffer:%s  ctx:~%d  approval:%s",
 		dash(m.state.Provider),
 		dash(m.state.Model),
 		dash(m.state.Branch),
@@ -1075,13 +1075,13 @@ func (m model) headerView() string {
 		dash(string(m.state.Approval)),
 	)
 	if m.busy {
-		status += "  " + spinnerGlyph() + " running"
+		status += "  " + spinnerGlyph() + " agent running"
 	}
 	if len(m.submitQueue) > 0 {
 		status += fmt.Sprintf("  queued:%d", len(m.submitQueue))
 	}
 	if _, slot := m.sharedTerminal(); slot >= 0 {
-		status += fmt.Sprintf("  term:%d shared", slot+1)
+		status += fmt.Sprintf("  term:%d live-shared", slot+1)
 	}
 	return headerStyle.Width(m.width).Render(truncate(status, m.width-2))
 }
@@ -1173,8 +1173,9 @@ func (m model) normalStatusHint() string {
 	parts := []string{
 		"NORMAL",
 		key("prompt.insert", "i") + " prompt",
-		": command",
-		key("shell.run", "!") + " shell",
+		": ops/commands",
+		":s swarm",
+		key("shell.run", "!") + " local shell",
 		key("palette.open", "Ctrl+K") + " palette",
 		"Ctrl+H/L panes",
 		"j/k select",
@@ -1224,14 +1225,14 @@ func (m model) noticeView() string {
 		notice = pending
 	}
 	if notice == "" {
-		notice = "j/k move  Ctrl+E/Y scroll  Ctrl+H/L panes  h/l local  Enter activate  :s swarm  :! shell  :term terminal  :ops ops  :tutorial learn  d detail  y copy  v visual  m mouse  q quit"
+		notice = "agents are buffers  Ops is control plane  Vim/edit is direct intervention  :s swarm  :ops ops  :context context  :st live terminal  :tutorial learn"
 	}
 	return noticeStyle.Width(m.width).Render(truncate(notice, m.width-2))
 }
 
 func (m model) leftView(width int, height int) string {
 	var lines []string
-	lines = append(lines, titleStyle.Render("Agents"))
+	lines = append(lines, titleStyle.Render("Agent Buffers"))
 	orchestrator := "main orchestrator"
 	if m.state.SessionID != "" {
 		orchestrator += "  " + string(m.state.SessionID)
@@ -1242,7 +1243,7 @@ func (m model) leftView(width int, height int) string {
 	}
 	lines = append(lines, selectableLine(m.leftCursor == 0, mainID, orchestrator))
 	if len(m.state.Agents) == 0 {
-		lines = append(lines, mutedStyle.Render("agents idle"))
+		lines = append(lines, mutedStyle.Render("No workers yet. Use :s <task> to fan out from main."))
 	}
 	for rowCursor, row := range m.agentDisplayRows() {
 		agent := m.state.Agents[row.index]
@@ -1367,9 +1368,9 @@ func agentConversationTitle(agent workbench.AgentItem) string {
 func (m model) centerView(width int, height int) string {
 	m.chat.SetSize(max(10, width-2), max(3, height-2))
 	m.chat.SetItems(m.state.Transcript)
-	title := firstNonEmpty(m.state.ActiveConversation.Title, "Main orchestrator")
+	title := firstNonEmpty(m.state.ActiveConversation.Title, "Main Orchestrator Buffer")
 	if m.state.ActiveConversation.Kind == "agent" {
-		title = "Agent: " + title
+		title = "Agent Buffer: " + title
 	}
 	return titleStyle.Render(title) + "\n" + m.chat.View()
 }
@@ -1418,10 +1419,10 @@ func (m model) rightView(width int, height int) string {
 }
 
 func (m model) opsView(width int, height int, lines []string) string {
-	lines = append(lines, mutedStyle.Render("Enter open  d detail  a/r approvals  :context inspect"))
+	lines = append(lines, mutedStyle.Render("Ops control plane  Enter open  d detail  a/r approvals  :context inspect  :noqueue clear queue"))
 	entries := m.contextEntries()
 	if len(entries) == 0 {
-		lines = append(lines, mutedStyle.Render("No active operations"))
+		lines = append(lines, mutedStyle.Render("No active operations. Start with i for one prompt or :s <task> for a swarm run."))
 		return fitLines(lines, width, height)
 	}
 	available := max(0, height-len(lines))
@@ -1462,7 +1463,7 @@ func (m model) terminalContentView(width int, height int) string {
 		return fitLines([]string{
 			mutedStyle.Render(fmt.Sprintf("Terminal %d is ready. Press Enter to focus and start it.", m.termSlot+1)),
 			mutedStyle.Render("Run :t to create another terminal, or :t N to select one."),
-			mutedStyle.Render(":st grants live agent control; :sto attaches output once."),
+			mutedStyle.Render(":st live-shares terminal_read/write; :sto attaches output once."),
 		}, width, height)
 	}
 	bodyHeight := max(1, height-1)
@@ -1472,7 +1473,7 @@ func (m model) terminalContentView(width int, height int) string {
 	}
 	status := fmt.Sprintf("term %d/%d%s  Ctrl+G returns to FreeCode", m.termSlot+1, max(1, len(m.terms)), shared)
 	if m.mode != modeTerminal {
-		status = fmt.Sprintf("term %d/%d%s  Enter focus  z expand  :st live control  :sto attach output", m.termSlot+1, max(1, len(m.terms)), shared)
+		status = fmt.Sprintf("term %d/%d%s  Enter focus  z expand  :st live-share  :sto attach once", m.termSlot+1, max(1, len(m.terms)), shared)
 	}
 	lines := []string{mutedStyle.Render(truncate(status, max(1, width-1)))}
 	lines = append(lines, strings.Split(term.view(width, bodyHeight), "\n")...)
@@ -1589,15 +1590,15 @@ func (m model) rightTabCount(tab workbench.RightTab) int {
 func (m model) emptyRightTabText() string {
 	switch m.activeRightTab() {
 	case workbench.RightTabFiles:
-		return "No workspace files"
+		return "No workspace files indexed. Use :e <path> for direct Neovim intervention."
 	case workbench.RightTabGit:
-		return "No git changes"
+		return "No git changes. Agent edits and Vim interventions will surface here."
 	case workbench.RightTabTerm:
 		return "Terminal is stopped. Run :term to start it."
 	case workbench.RightTabOps:
-		return "No active operations"
+		return "Ops is idle. Use :s <task> for a swarm run or i for one agent turn."
 	default:
-		return "No approvals or artifacts"
+		return "No approvals or artifacts. Patches, code blocks, and gates land here."
 	}
 }
 
@@ -1610,7 +1611,7 @@ func (m model) paletteView() string {
 	lines = append(lines, titleStyle.Render("Command Palette"))
 	lines = append(lines, m.palette.View())
 	if strings.TrimSpace(m.palette.Value()) == "" {
-		lines = append(lines, mutedStyle.Render("Search by command, shortcut, category, or keyword. Enter runs the selected command."))
+		lines = append(lines, mutedStyle.Render("Search commands, shortcuts, agent buffers, Ops, approvals, terminal sharing, or Vim-style edits."))
 	}
 	if len(commands) == 0 {
 		lines = append(lines, mutedStyle.Render("No commands found"))
@@ -2527,7 +2528,7 @@ func firstNonZero(values ...int) int {
 }
 
 func (m model) showBuffers() (tea.Model, tea.Cmd) {
-	lines := []string{"Conversations:"}
+	lines := []string{"Agent buffers:", "  % = active buffer. Main plans; agents execute focused work."}
 	mainMarker := " "
 	if m.state.ActiveConversation.Kind != "agent" {
 		mainMarker = "%"
@@ -3772,7 +3773,7 @@ func (m model) opsEntries() []contextEntry {
 	entries = append(entries, contextEntry{
 		id:     "run",
 		kind:   "ops",
-		label:  "run state",
+		label:  "run queue",
 		status: runStatus,
 		body:   runStatus,
 	})
@@ -3793,7 +3794,7 @@ func (m model) opsEntries() []contextEntry {
 	entries = append(entries, contextEntry{
 		id:     "ctx",
 		kind:   "ops-context",
-		label:  "next model context",
+		label:  "next-turn context",
 		status: contextStatus,
 		body:   m.contextInspectorBody(),
 	})
@@ -3802,7 +3803,7 @@ func (m model) opsEntries() []contextEntry {
 			id:     fmt.Sprintf("term%d", slot+1),
 			kind:   "ops-terminal",
 			label:  fmt.Sprintf("terminal %d live-shared", slot+1),
-			status: "agent can use terminal_read and terminal_write",
+			status: "agent tool access: terminal_read + terminal_write",
 			body:   term.tail(80),
 		})
 	} else if len(m.terms) > 0 {
@@ -3810,7 +3811,7 @@ func (m model) opsEntries() []contextEntry {
 			id:     "term",
 			kind:   "ops-terminal",
 			label:  fmt.Sprintf("%d terminal(s)", len(m.terms)),
-			status: "local-only; run :st [n] for live control or :sto [n] to attach output",
+			status: "local-only; :st [n] live-shares control, :sto [n] attaches output once",
 		})
 	}
 	for _, approval := range m.state.Approvals {

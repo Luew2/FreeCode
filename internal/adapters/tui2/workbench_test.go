@@ -631,6 +631,49 @@ func TestPaletteRowsShowDescriptionAndDisabledState(t *testing.T) {
 	}
 }
 
+func TestAIVimPolishCopyRendersAgenticEmptyStates(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Approval: permission.ModeAsk,
+		Commands: workbench.DefaultCommands(),
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.width = 100
+	m.height = 30
+	m.resize()
+
+	if view := stripANSI(m.leftView(42, 8)); !containsAll(view, "Agent Buffers", "No workers yet", ":s <task>") {
+		t.Fatalf("agent buffer empty state missing polish copy:\n%s", view)
+	}
+	if view := stripANSI(m.centerView(58, 8)); !containsAll(view, "Main Orchestrator Buffer", "Agent buffer is empty", ":s stages work") {
+		t.Fatalf("center empty state missing agent-buffer copy:\n%s", view)
+	}
+	m.setRightTab(workbench.RightTabOps)
+	if view := stripANSI(m.opsView(58, 8, []string{titleStyle.Render(m.rightTabHeader())})); !containsAll(view, "Ops control plane", "run queue", "next-turn context") {
+		t.Fatalf("ops view missing control-plane labels:\n%s", view)
+	}
+	if view := stripANSI(m.noticeView()); !containsAll(view, "agents are buffers", "Ops is control plane", "Vim/edit is direct intervention") {
+		t.Fatalf("notice missing mental-model hint:\n%s", view)
+	}
+}
+
+func TestShowBuffersUsesAgentBufferMentalModel(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Commands: workbench.DefaultCommands(),
+		Agents:   []workbench.AgentItem{{ID: "a1", Name: "worker", Role: "worker", Status: "running"}},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+
+	next, cmd := m.showBuffers()
+	if cmd != nil {
+		t.Fatalf("showBuffers returned unexpected cmd")
+	}
+	m = next.(model)
+	view := stripANSI(m.detail.View())
+	if !containsAll(view, "Agent buffers:", "Main plans; agent", "a1") {
+		t.Fatalf("buffer detail missing agent-buffer copy:\n%s", view)
+	}
+}
+
 func TestAgentTaskBoardRendersCompactMetadata(t *testing.T) {
 	controller := &fakeController{state: workbench.State{
 		Commands: workbench.DefaultCommands(),
@@ -1120,7 +1163,7 @@ func TestOpsTabRendersOperationalStateAndContextInspector(t *testing.T) {
 	m.submitQueue = []queuedSubmit{{text: "follow up"}}
 
 	view := stripANSI(m.rightView(58, 16))
-	if !containsAll(view, "Ops", "run state", "active run #4", "next model context", "approval edit README", "worker running") {
+	if !containsAll(view, "Ops", "run queue", "active run #4", "next-turn context", "approval edit README", "worker running") {
 		t.Fatalf("ops view missing expected state:\n%s", view)
 	}
 	m.contextCursor = 2 // ctx entry after run + queued prompt

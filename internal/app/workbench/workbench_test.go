@@ -772,6 +772,12 @@ func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
 	if !strings.Contains(seen["item.copy"].Keybinding, "y") || !strings.Contains(seen["item.copy.select"].Keybinding, "v") || !strings.Contains(seen["mouse.toggle"].Keybinding, "m") {
 		t.Fatalf("copy contract keybindings y/v/m missing: copy=%q visual=%q mouse=%q", seen["item.copy"].Keybinding, seen["item.copy.select"].Keybinding, seen["mouse.toggle"].Keybinding)
 	}
+	if !strings.Contains(seen["agent.swarm"].Description, "fan out agent buffers") {
+		t.Fatalf("swarm description = %q, want agent-buffer framing", seen["agent.swarm"].Description)
+	}
+	if !strings.Contains(seen["tab.ops"].Title, "Ops control plane") || !strings.Contains(seen["help.tutorial"].Description, "agents as buffers") {
+		t.Fatalf("ops/tutorial copy missing AI-native Vim framing: ops=%q tutorial=%q", seen["tab.ops"].Title, seen["help.tutorial"].Description)
+	}
 
 	state := State{
 		Files:    []WorkspaceFile{{ID: "f1", Path: "internal/app/workbench/workbench.go"}},
