@@ -2,7 +2,6 @@ package tui2
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,10 +9,29 @@ import (
 	"github.com/Luew2/FreeCode/internal/app/workbench"
 )
 
+type tutorialInputMode string
+
+const (
+	tutorialNormal       tutorialInputMode = "normal"
+	tutorialComposer     tutorialInputMode = "composer"
+	tutorialInputCommand tutorialInputMode = "command"
+)
+
+type tutorialStepKind string
+
+const (
+	tutorialPress       tutorialStepKind = "press"
+	tutorialPrompt      tutorialStepKind = "prompt"
+	tutorialStepCommand tutorialStepKind = "command"
+)
+
 type tutorialGame struct {
 	step      int
+	inputMode tutorialInputMode
+	input     string
 	completed map[string]bool
 	last      string
+	log       []string
 }
 
 type tutorialStep struct {
@@ -21,7 +39,10 @@ type tutorialStep struct {
 	Title       string
 	Description string
 	CommandID   string
+	Kind        tutorialStepKind
 	Keys        []string
+	Expected    []string
+	Response    string
 }
 
 func (m model) openTutorial() model {
@@ -33,42 +54,41 @@ func (m model) openTutorial() model {
 	if m.tutorial.completed == nil {
 		m.tutorial.completed = map[string]bool{}
 	}
+	m.tutorial.inputMode = tutorialNormal
+	m.tutorial.input = ""
 	m.tutorial.step = clamp(m.tutorial.step, 0, max(0, len(m.tutorialSteps())-1))
+	if len(m.tutorial.log) == 0 {
+		m.tutorial.log = []string{"tutorial: No API calls are made here. Commands and prompts are intercepted locally."}
+	}
 	m.state.Notice = "tutorial opened"
 	return m
 }
 
-func (m model) handleTutorialKey(key string) (tea.Model, tea.Cmd) {
+func (m model) handleTutorialKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	steps := m.tutorialSteps()
 	if len(steps) == 0 {
 		m.overlay = overlayNone
 		return m, nil
 	}
-	current := steps[clamp(m.tutorial.step, 0, len(steps)-1)]
+	m.tutorial.step = clamp(m.tutorial.step, 0, len(steps)-1)
+	key := msg.String()
+	current := steps[m.tutorial.step]
+
+	if m.tutorial.inputMode != tutorialNormal {
+		return m.handleTutorialInputKey(msg, current)
+	}
+
 	switch key {
 	case "esc", "q":
 		m.overlay = overlayNone
 		m.mode = modeNormal
 		m.state.Notice = "tutorial closed"
 		return m, nil
-	}
-	if tutorialKeyMatches(key, current.Keys) {
-		if m.tutorial.completed == nil {
-			m.tutorial.completed = map[string]bool{}
-		}
-		m.tutorial.completed[current.ID] = true
-		m.tutorial.last = "passed: " + current.Title
-		if m.tutorial.step < len(steps)-1 {
-			m.tutorial.step++
-		}
-		return m, nil
-	}
-	switch key {
-	case "j", "down", "n", "enter":
-		m.tutorial.Move(1)
+	case "j", "down", "n":
+		m.tutorial.Move(1, len(steps))
 		return m, nil
 	case "k", "up", "p":
-		m.tutorial.Move(-1)
+		m.tutorial.Move(-1, len(steps))
 		return m, nil
 	case "home", "g":
 		m.tutorial.step = 0
@@ -77,21 +97,102 @@ func (m model) handleTutorialKey(key string) (tea.Model, tea.Cmd) {
 		m.tutorial.step = len(steps) - 1
 		return m, nil
 	}
-	m.tutorial.last = fmt.Sprintf("try %s for %s", strings.Join(current.Keys, " or "), current.Title)
+
+	switch current.Kind {
+	case tutorialPrompt:
+		if key == "i" || key == "enter" {
+			m.tutorial.inputMode = tutorialComposer
+			m.tutorial.input = ""
+			m.tutorial.last = "composer opened. Type: " + current.Expected[0]
+			return m, nil
+		}
+		m.tutorialWrong(key, current, "press i, type the prompt, then Enter")
+		return m, nil
+	case tutorialStepCommand:
+		if key == ":" || key == "!" {
+			wantPrefix := tutorialCommandPrefix(current)
+			if key != wantPrefix {
+				m.tutorialWrong(key, current, "start with "+wantPrefix)
+				return m, nil
+			}
+			m.tutorial.inputMode = tutorialInputCommand
+			m.tutorial.input = key
+			m.tutorial.last = "command line opened. Type: " + current.Expected[0]
+			return m, nil
+		}
+		m.tutorialWrong(key, current, "type "+current.Expected[0])
+		return m, nil
+	default:
+		if tutorialKeyMatches(key, current.Keys) {
+			m.completeTutorialStep(current, tutorialDisplayKey(key))
+			return m, nil
+		}
+		m.tutorialWrong(key, current, "press "+strings.Join(current.Keys, " or "))
+		return m, nil
+	}
+}
+
+func (m model) handleTutorialInputKey(msg tea.KeyMsg, step tutorialStep) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	switch key {
+	case "esc":
+		m.tutorial.inputMode = tutorialNormal
+		m.tutorial.input = ""
+		m.tutorial.last = fmt.Sprintf("reset. Try again: %s", tutorialInstruction(step))
+		return m, nil
+	case "backspace", "ctrl+h":
+		if len(m.tutorial.input) > 0 {
+			m.tutorial.input = m.tutorial.input[:len(m.tutorial.input)-1]
+		}
+		return m, nil
+	case "enter":
+		if tutorialInputMatches(m.tutorial.input, step.Expected) {
+			m.completeTutorialStep(step, m.tutorial.input)
+			m.tutorial.inputMode = tutorialNormal
+			m.tutorial.input = ""
+			return m, nil
+		}
+		m.tutorial.last = fmt.Sprintf("seems you typed %q wrong. Hit Esc, then %s.", m.tutorial.input, tutorialInstruction(step))
+		return m, nil
+	}
+	if text := tutorialTypedText(msg); text != "" {
+		m.tutorial.input += sanitizeTerminalText(text)
+	}
 	return m, nil
 }
 
-func (g *tutorialGame) Move(delta int) {
-	g.step += delta
-	if g.step < 0 {
-		g.step = 0
+func (m *model) completeTutorialStep(step tutorialStep, typed string) {
+	if m.tutorial.completed == nil {
+		m.tutorial.completed = map[string]bool{}
 	}
+	m.tutorial.completed[step.ID] = true
+	m.tutorial.last = "passed: " + step.Title
+	if typed != "" {
+		m.tutorial.log = append(m.tutorial.log, "you: "+typed)
+	}
+	if step.Response != "" {
+		m.tutorial.log = append(m.tutorial.log, "freecode: "+step.Response)
+	}
+	if m.tutorial.step < len(m.tutorialSteps())-1 {
+		m.tutorial.step++
+	}
+}
+
+func (m *model) tutorialWrong(typed string, step tutorialStep, hint string) {
+	typed = tutorialDisplayKey(typed)
+	m.tutorial.last = fmt.Sprintf("seems you typed %q wrong; %s.", typed, hint)
+}
+
+func (g *tutorialGame) Move(delta int, count int) {
+	g.step = clamp(g.step+delta, 0, max(0, count-1))
+	g.inputMode = tutorialNormal
+	g.input = ""
 }
 
 func (m model) tutorialView() string {
 	steps := m.tutorialSteps()
-	width := m.modalContentWidth(92)
-	height := max(12, min(max(12, m.height-6), 34))
+	width := m.modalContentWidth(94)
+	height := max(14, min(max(14, m.height-6), 36))
 	if len(steps) == 0 {
 		return modalStyle.Width(width).Render("No tutorial steps available")
 	}
@@ -103,94 +204,101 @@ func (m model) tutorialView() string {
 			completed++
 		}
 	}
-	command := m.commandByID(current.CommandID)
-	keybinding := strings.Join(current.Keys, " or ")
-	if command.Keybinding != "" {
-		keybinding = command.Keybinding
-	}
 
 	lines := []string{
 		titleStyle.Render("FreeCode Tutorial"),
-		mutedStyle.Render(fmt.Sprintf("progress %d/%d  j/k or n/p browse  press the requested key to score  Esc close", completed, len(steps))),
+		mutedStyle.Render(fmt.Sprintf("progress %d/%d  j/k browse  type inside this overlay  Esc resets input/closes from normal", completed, len(steps))),
 		"",
 		selectedStyle.Render(fmt.Sprintf("Mission %d: %s", m.tutorial.step+1, current.Title)),
 		current.Description,
-		fmt.Sprintf("Try: %s", keybinding),
+		"Task: " + tutorialInstruction(current),
 	}
-	if command.Description != "" {
+	if command := m.commandByID(current.CommandID); command.Description != "" {
 		lines = append(lines, mutedStyle.Render("Why: "+truncate(command.Description, max(20, width-8))))
 	}
+	lines = append(lines, "")
+	lines = append(lines, m.tutorialInputLine(current))
 	if m.tutorial.completed[current.ID] {
 		lines = append(lines, selectedStyle.Render("Complete"))
 	}
 	if m.tutorial.last != "" {
 		lines = append(lines, mutedStyle.Render(m.tutorial.last))
 	}
+	lines = append(lines, "", titleStyle.Render("Simulated Output"))
+	lines = append(lines, m.tutorialLogLines(max(3, height-len(lines)-8))...)
 	lines = append(lines, "", titleStyle.Render("Training Board"))
-	start, end := visibleRange(len(steps), m.tutorial.step, max(4, height-len(lines)-4))
-	if start > 0 {
-		lines = append(lines, mutedStyle.Render("..."))
-	}
+	start, end := visibleRange(len(steps), m.tutorial.step, max(4, height-len(lines)-2))
 	for i := start; i < end; i++ {
 		step := steps[i]
 		mark := " "
 		if m.tutorial.completed[step.ID] {
 			mark = "x"
 		}
-		key := strings.Join(step.Keys, "/")
-		if cmd := m.commandByID(step.CommandID); cmd.Keybinding != "" {
-			key = cmd.Keybinding
-		}
-		row := fmt.Sprintf("[%s] %-18s %s", mark, key, step.Title)
+		row := fmt.Sprintf("[%s] %-18s %s", mark, tutorialShortTarget(step), step.Title)
 		lines = append(lines, selectableLine(i == m.tutorial.step, "", row))
 	}
-	if end < len(steps) {
-		lines = append(lines, mutedStyle.Render("..."))
-	}
-	lines = append(lines, "", mutedStyle.Render("Full command catalog remains in Ctrl+K; this game drills the muscle-memory path."))
+	lines = append(lines, mutedStyle.Render("No real prompts, shell commands, terminal sharing, or API requests happen in tutorial mode."))
 	return modalStyle.Width(width).Render(fitLines(lines, width-4, height))
 }
 
-func (m model) tutorialSteps() []tutorialStep {
-	commands := m.commandRegistry().Commands()
-	byID := map[string]workbench.Command{}
-	for _, command := range commands {
-		byID[command.ID] = command
+func (m model) tutorialInputLine(step tutorialStep) string {
+	switch m.tutorial.inputMode {
+	case tutorialComposer:
+		return composerStyle.Width(max(20, m.modalContentWidth(82))).Render("TUTORIAL INSERT  Enter checks  Esc reset\n> " + m.tutorial.input)
+	case tutorialInputCommand:
+		return composerStyle.Width(max(20, m.modalContentWidth(82))).Render("TUTORIAL COMMAND  Enter checks  Esc reset\n" + m.tutorial.input)
+	default:
+		switch step.Kind {
+		case tutorialPrompt:
+			return mutedStyle.Render("waiting: press i to open the tutorial composer")
+		case tutorialStepCommand:
+			return mutedStyle.Render("waiting: type " + step.Expected[0])
+		default:
+			return mutedStyle.Render("waiting: press " + strings.Join(step.Keys, " or "))
+		}
 	}
-	step := func(id, title, description string, keys ...string) tutorialStep {
-		if command, ok := byID[id]; ok {
+}
+
+func (m model) tutorialLogLines(limit int) []string {
+	if len(m.tutorial.log) == 0 {
+		return []string{mutedStyle.Render("tutorial output will appear here")}
+	}
+	start := max(0, len(m.tutorial.log)-limit)
+	var lines []string
+	for _, line := range m.tutorial.log[start:] {
+		lines = append(lines, truncate(line, max(20, m.modalContentWidth(88)-8)))
+	}
+	return lines
+}
+
+func (m model) tutorialSteps() []tutorialStep {
+	step := func(id, title, description string, kind tutorialStepKind, expected []string, response string, keys ...string) tutorialStep {
+		if command := m.commandByID(id); command.ID != "" {
 			if title == "" {
 				title = command.Title
 			}
 			if description == "" {
 				description = command.Description
 			}
-			if len(keys) == 0 {
-				keys = nonCommandKeys(command)
-			}
 		}
-		return tutorialStep{ID: id, Title: title, Description: description, CommandID: id, Keys: keys}
+		return tutorialStep{ID: id, Title: title, Description: description, CommandID: id, Kind: kind, Expected: expected, Response: response, Keys: keys}
 	}
 	return []tutorialStep{
-		step("prompt.insert", "Start talking", "Press i to open the composer for the active agent chat."),
-		step("prompt.send", "Send from the composer", "Enter sends the focused prompt. In normal chat, Enter opens the composer.", "enter"),
-		step("context.cancel", "Know the stop command", "Use :cancel when a model/tool run needs to stop.", ":cancel"),
-		step("agent.swarm", "Launch swarm mode", "Use :s or :swarm for a long-running orchestrated task.", ":s", ":swarm"),
-		step("item.open", "Open the selected thing", "Enter or o activates the selected agent, file, artifact, or message.", "enter", "o"),
-		step("item.detail", "Inspect details", "d opens the selected item without changing panes."),
-		step("item.copy", "Copy quickly", "y copies the selected message, file path, artifact, or code block."),
-		step("item.copy.select", "Use visual copy", "v releases mouse capture and expands the focused pane for terminal-native selection."),
-		step("mouse.toggle", "Toggle mouse mode", "m toggles between terminal mouse capture and normal text selection."),
-		step("palette.open", "Open the palette", "Ctrl+K opens searchable commands and cheat sheets.", "ctrl+k", "?"),
-		step("shell.run", "Run a quick shell command", "! runs a one-shot local command and logs it as local-only context."),
-		step("terminal.open", "Open a persistent terminal", ":term opens the terminal tab; Enter focuses it from that tab.", ":term", ":t"),
-		step("terminal.share", "Share terminal control", ":st grants the agent live read/write access to the selected terminal.", ":st"),
-		step("terminal.share_output", "Attach terminal output", ":sto attaches recent terminal output without granting live control.", ":sto"),
-		step("context.inspect", "Preview model context", ":context shows what the next model turn will see.", ":context"),
-		step("tab.ops", "Watch operations", ":ops opens active runs, queues, approvals, and terminal sharing state.", ":ops"),
-		step("buffer.list", "List conversations", ":ls treats main and agents as Vim-style buffers.", ":ls", ":buffers"),
-		step("buffer.switch", "Switch conversations", ":b main or :b a1 jumps between conversation buffers.", ":b"),
-		step("diagnostics.doctor", "Run doctor", ":doctor checks provider, config, git, terminal, editor, and MCP setup.", ":doctor"),
+		step("prompt.insert", "Start a chat turn", "Open the composer and type a harmless prompt. The tutorial intercepts it instead of calling a model.", tutorialPrompt, []string{"explain this repo"}, "That would send a normal chat prompt to the active conversation. No API request was sent."),
+		step("tab.ops", "Open the Ops board", "Practice a Vim command that jumps to the operational view.", tutorialStepCommand, []string{":ops"}, "The right pane would show active runs, queues, approvals, terminal sharing, and context."),
+		step("context.inspect", "Inspect next context", "Learn the command that answers: what will the model see next?", tutorialStepCommand, []string{":context"}, "The context inspector would open with conversation tail, memory, terminal sharing state, and token estimate."),
+		step("agent.swarm", "Stage a swarm task", "Type a swarm command. In the real app this asks the main orchestrator to plan and allocate agents.", tutorialStepCommand, []string{":s review this codebase"}, "A swarm request would be queued for the orchestrator. No model call was made."),
+		step("shell.run", "Run a one-shot shell", "Practice the Vim-style local shell command. Tutorial mode does not run your shell.", tutorialStepCommand, []string{"!pwd"}, "A local-only shell cell would be appended to chat. No command was executed."),
+		step("terminal.open", "Open persistent terminal", "Practice opening the persistent terminal tab.", tutorialStepCommand, []string{":term", ":t"}, "The Term tab would open without stealing focus."),
+		step("terminal.share", "Share terminal control", "Practice the explicit opt-in command that gives the agent terminal_read and terminal_write.", tutorialStepCommand, []string{":st"}, "Terminal 1 would become live-shared with the agent, visibly marked in Ops and Term."),
+		step("terminal.share_output", "Attach terminal output", "Practice one-time output sharing without live terminal control.", tutorialStepCommand, []string{":sto"}, "Recent terminal output would be attached to the next model turn only."),
+		step("buffer.list", "List conversation buffers", "Treat main and agent chats like Vim buffers.", tutorialStepCommand, []string{":ls", ":buffers"}, "A buffer list would show main plus agent conversations."),
+		step("buffer.switch", "Switch to main buffer", "Practice direct buffer navigation.", tutorialStepCommand, []string{":b main"}, "The center pane would switch back to the main orchestrator conversation."),
+		step("palette.open", "Open command palette", "Use the searchable command catalog when you forget a command.", tutorialPress, nil, "The palette would open; search by title, key, category, or keyword.", "ctrl+k", "?"),
+		step("item.copy", "Copy selected item", "Use keyboard copy for the selected message, file, artifact, or code block.", tutorialPress, nil, "The selected item would be copied to the clipboard.", "y"),
+		step("item.copy.select", "Use visual selection", "Release mouse capture when you want terminal-native selection and Cmd+C.", tutorialPress, nil, "FreeCode would enter visual copy mode for native terminal selection.", "v"),
+		step("mouse.toggle", "Toggle mouse capture", "Switch between pane mouse scrolling and native text selection.", tutorialPress, nil, "Mouse capture would toggle.", "m"),
+		step("diagnostics.doctor", "Run doctor", "Practice the diagnostic command for provider, config, git, terminal, editor, and MCP setup.", tutorialStepCommand, []string{":doctor"}, "Doctor would run diagnostics and show actionable setup errors."),
 	}
 }
 
@@ -206,9 +314,6 @@ func (m model) commandByID(id string) workbench.Command {
 func tutorialKeyMatches(key string, wants []string) bool {
 	key = normalizeTutorialKey(key)
 	for _, want := range wants {
-		if strings.HasPrefix(strings.TrimSpace(want), ":") && key == ":" {
-			return true
-		}
 		if key == normalizeTutorialKey(want) {
 			return true
 		}
@@ -216,34 +321,75 @@ func tutorialKeyMatches(key string, wants []string) bool {
 	return false
 }
 
+func tutorialInputMatches(input string, expected []string) bool {
+	input = normalizeTutorialLine(input)
+	for _, want := range expected {
+		if input == normalizeTutorialLine(want) {
+			return true
+		}
+	}
+	return false
+}
+
+func tutorialInstruction(step tutorialStep) string {
+	switch step.Kind {
+	case tutorialPrompt:
+		return fmt.Sprintf("press i, type %q, then Enter", step.Expected[0])
+	case tutorialStepCommand:
+		return "type " + strings.Join(step.Expected, " or ")
+	default:
+		return "press " + strings.Join(step.Keys, " or ")
+	}
+}
+
+func tutorialShortTarget(step tutorialStep) string {
+	switch step.Kind {
+	case tutorialPrompt:
+		return "i + prompt"
+	case tutorialStepCommand:
+		return strings.Join(step.Expected, "/")
+	default:
+		return strings.Join(step.Keys, "/")
+	}
+}
+
+func tutorialCommandPrefix(step tutorialStep) string {
+	for _, want := range step.Expected {
+		want = strings.TrimSpace(want)
+		if strings.HasPrefix(want, "!") {
+			return "!"
+		}
+	}
+	return ":"
+}
+
+func tutorialTypedText(msg tea.KeyMsg) string {
+	if len(msg.Runes) > 0 {
+		return string(msg.Runes)
+	}
+	if msg.String() == "space" {
+		return " "
+	}
+	return ""
+}
+
+func tutorialDisplayKey(key string) string {
+	if key == " " || key == "space" {
+		return "space"
+	}
+	return key
+}
+
 func normalizeTutorialKey(key string) string {
 	key = strings.TrimSpace(strings.ToLower(key))
-	if key == ":" {
-		return key
-	}
-	key = strings.TrimPrefix(key, ":")
 	switch key {
 	case "return":
 		return "enter"
-	case "ctrl+k", "ctrl+h", "ctrl+l", "ctrl+e", "ctrl+y":
-		return key
 	default:
 		return key
 	}
 }
 
-func nonCommandKeys(command workbench.Command) []string {
-	var keys []string
-	for _, key := range command.Keybindings {
-		key = strings.TrimSpace(key)
-		if key == "" || strings.HasPrefix(key, ":") {
-			continue
-		}
-		keys = append(keys, strings.ToLower(key))
-	}
-	sort.Strings(keys)
-	if len(keys) == 0 && command.Keybinding != "" && !strings.HasPrefix(command.Keybinding, ":") {
-		keys = append(keys, strings.ToLower(command.Keybinding))
-	}
-	return keys
+func normalizeTutorialLine(line string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(line)), " "))
 }

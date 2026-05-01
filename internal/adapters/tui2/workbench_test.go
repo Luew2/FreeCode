@@ -1891,7 +1891,7 @@ func TestCommandCompletionCompletesCommandsFilesAndSessions(t *testing.T) {
 	}
 }
 
-func TestTutorialCommandOpensGameAndScoresExpectedKey(t *testing.T) {
+func TestTutorialCommandInterceptsPromptWithoutSubmitting(t *testing.T) {
 	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
 	m := newModel(context.Background(), controller, controller.state)
 
@@ -1909,11 +1909,48 @@ func TestTutorialCommandOpensGameAndScoresExpectedKey(t *testing.T) {
 
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
 	m = next.(model)
+	if m.tutorial.inputMode != tutorialComposer {
+		t.Fatalf("tutorial input mode = %q, want composer", m.tutorial.inputMode)
+	}
+	m = sendRunes(t, m, "explain this repo")
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatalf("tutorial prompt returned cmd, want no API/controller dispatch")
+	}
+	m = next.(model)
 	if !m.tutorial.completed["prompt.insert"] {
 		t.Fatalf("tutorial did not mark prompt.insert complete")
 	}
 	if m.tutorial.step != 1 {
 		t.Fatalf("tutorial step = %d, want 1 after passing first mission", m.tutorial.step)
+	}
+	if controller.submitted.Text != "" {
+		t.Fatalf("tutorial submitted prompt to controller: %#v", controller.submitted)
+	}
+	if got := strings.Join(m.tutorial.log, "\n"); !strings.Contains(got, "No API request was sent") {
+		t.Fatalf("tutorial log = %q, want simulated no-api response", got)
+	}
+}
+
+func TestTutorialCommandGivesCorrectionForWrongCommand(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m = m.openTutorial()
+	m.tutorial.step = 1 // :ops mission
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(":")})
+	m = next.(model)
+	m = sendRunes(t, m, "git")
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatalf("wrong tutorial command returned cmd, want local correction only")
+	}
+	m = next.(model)
+	if m.tutorial.completed["tab.ops"] {
+		t.Fatalf("wrong command completed :ops mission")
+	}
+	if !strings.Contains(m.tutorial.last, `typed ":git" wrong`) || !strings.Contains(m.tutorial.last, "Hit Esc") {
+		t.Fatalf("tutorial correction = %q", m.tutorial.last)
 	}
 }
 

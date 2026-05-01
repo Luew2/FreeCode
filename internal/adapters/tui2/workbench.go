@@ -502,13 +502,13 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.MouseWheelUp:
 			if m.overlay == overlayTutorial {
-				m.tutorial.Move(-1)
+				m.tutorial.Move(-1, len(m.tutorialSteps()))
 			} else {
 				m.detail.LineUp(3)
 			}
 		case tea.MouseWheelDown:
 			if m.overlay == overlayTutorial {
-				m.tutorial.Move(1)
+				m.tutorial.Move(1, len(m.tutorialSteps()))
 			} else {
 				m.detail.LineDown(3)
 			}
@@ -554,7 +554,7 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleDetailOverlayKey(key)
 	}
 	if m.overlay == overlayTutorial {
-		return m.handleTutorialKey(key)
+		return m.handleTutorialKey(msg)
 	}
 	if m.pendingKey == "g" {
 		m.pendingKey = ""
