@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	xansi "github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 
 	"github.com/Luew2/FreeCode/internal/app/workbench"
@@ -893,6 +894,12 @@ func (m model) handleDetailOverlayKey(key string) (tea.Model, tea.Cmd) {
 	case "ctrl+b", "pgup":
 		m.detail.ViewUp()
 		return m, nil
+	case "ctrl+e":
+		m.detail.LineDown(1)
+		return m, nil
+	case "ctrl+y":
+		m.detail.LineUp(1)
+		return m, nil
 	case "j", "down":
 		m.detail.LineDown(1)
 		return m, nil
@@ -939,6 +946,12 @@ func (m model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+b", "pgup":
 		m.approval.ViewUp()
+		return m, nil
+	case "ctrl+e":
+		m.approval.LineDown(1)
+		return m, nil
+	case "ctrl+y":
+		m.approval.LineUp(1)
 		return m, nil
 	case "g", "home":
 		m.approval.SetYOffset(0)
@@ -1494,7 +1507,7 @@ func (m model) contextEntryLines(entry contextEntry, width int, active bool) []s
 		indent := strings.Repeat("  ", entry.depth)
 		head := fmt.Sprintf("%s%s %s/", indent, marker, entry.name)
 		if active {
-			head = selectedStyle.Render(truncate(head, max(1, width-2)))
+			head = selectedStyle.Render(head)
 		}
 		return []string{head}
 	case "file", "git":
@@ -1504,7 +1517,7 @@ func (m model) contextEntryLines(entry contextEntry, width int, active bool) []s
 		head := fmt.Sprintf("%s%s  %-8s %s", indent, prefix, status, name)
 		if entry.kind == "file" {
 			if active {
-				head = selectedStyle.Render(truncate(head, max(1, width-2)))
+				head = selectedStyle.Render(head)
 			}
 			return []string{head}
 		}
@@ -1516,14 +1529,14 @@ func (m model) contextEntryLines(entry contextEntry, width int, active bool) []s
 			path = ""
 		}
 		if active {
-			head = selectedStyle.Render(truncate(head, max(1, width-2)))
+			head = selectedStyle.Render(head)
 		}
 		if path == "" {
 			return []string{head}
 		}
 		return []string{
 			head,
-			mutedStyle.Render("    " + compactPath(path, max(8, width-6))),
+			mutedStyle.Render("    " + path),
 		}
 	case "ops", "ops-agent", "ops-approval", "ops-terminal", "ops-context":
 		head := selectableLine(active, prefix, entry.label)
@@ -1532,7 +1545,7 @@ func (m model) contextEntryLines(entry contextEntry, width int, active bool) []s
 		}
 		return []string{
 			head,
-			mutedStyle.Render("    " + truncate(entry.status, max(8, width-6))),
+			mutedStyle.Render("    " + entry.status),
 		}
 	default:
 		return []string{selectableLine(active, prefix, entry.label)}
@@ -1611,7 +1624,9 @@ func (m model) paletteView() string {
 	lines = append(lines, titleStyle.Render("Command Palette"))
 	lines = append(lines, m.palette.View())
 	if strings.TrimSpace(m.palette.Value()) == "" {
-		lines = append(lines, mutedStyle.Render("Search commands, shortcuts, agent buffers, Ops, approvals, terminal sharing, or Vim-style edits."))
+		for _, line := range wrapANSIToWidth(mutedStyle.Render("Search commands, shortcuts, agent buffers, Ops, approvals, terminal sharing, or Vim-style edits."), max(10, width-4)) {
+			lines = append(lines, line)
+		}
 	}
 	if len(commands) == 0 {
 		lines = append(lines, mutedStyle.Render("No commands found"))
@@ -1633,12 +1648,16 @@ func (m model) paletteView() string {
 			if state != "" {
 				row += "  " + state
 			}
+			lines = append(lines, wrapANSIToWidth(selectableLine(m.paletteCursor == i, "", row), max(10, width-4))...)
 			if command.DisabledReason != "" {
-				row += "  " + command.DisabledReason
+				for _, line := range wrapANSIToWidth(mutedStyle.Render("  "+command.DisabledReason), max(10, width-4)) {
+					lines = append(lines, line)
+				}
 			}
-			lines = append(lines, selectableLine(m.paletteCursor == i, "", row))
 			if command.Description != "" {
-				lines = append(lines, mutedStyle.Render("  "+truncate(command.Description, max(10, width-4))))
+				for _, line := range wrapLines(command.Description, max(10, width-6), 0) {
+					lines = append(lines, mutedStyle.Render("  "+line))
+				}
 			}
 		}
 		if end < len(commands) {
@@ -1658,12 +1677,9 @@ func (m model) detailOverlayView() string {
 	if title == "" {
 		title = "Detail"
 	}
-	lines := []string{
-		titleStyle.Render(title),
-		mutedStyle.Render("j/k or Ctrl+F/B scroll  Esc close  y copies selected item"),
-		"",
-		m.detail.View(),
-	}
+	lines := wrapANSIToWidth(titleStyle.Render(title), max(10, width-4))
+	lines = append(lines, wrapANSIToWidth(mutedStyle.Render("j/k or Ctrl+E/Y or Ctrl+F/B scroll  Esc close  y copies selected item"), max(10, width-4))...)
+	lines = append(lines, "", m.detail.View())
 	return modalStyle.Width(width).Render(strings.Join(lines, "\n"))
 }
 
@@ -1672,13 +1688,10 @@ func (m model) copyOverlayView() string {
 	height := max(8, min(max(8, m.height-6), 30))
 	m.detail.Width = max(10, width-4)
 	m.detail.Height = max(3, height-6)
-	lines := []string{
-		titleStyle.Render("Copy Selection"),
-		mutedStyle.Render("Mouse reporting is off here. Select text with the terminal, press Cmd+C, then Esc."),
-		mutedStyle.Render("Use y/Y outside this overlay for direct clipboard copy."),
-		"",
-		m.detail.View(),
-	}
+	lines := []string{titleStyle.Render("Copy Selection")}
+	lines = append(lines, wrapANSIToWidth(mutedStyle.Render("Mouse reporting is off here. Select text with the terminal, press Cmd+C, then Esc."), max(10, width-4))...)
+	lines = append(lines, wrapANSIToWidth(mutedStyle.Render("Use y/Y outside this overlay for direct clipboard copy."), max(10, width-4))...)
+	lines = append(lines, "", m.detail.View())
 	return modalStyle.Width(width).Render(strings.Join(lines, "\n"))
 }
 
@@ -1692,13 +1705,11 @@ func (m model) approvalView() string {
 	m.approval.Width = max(10, width-2)
 	m.approval.Height = max(3, height-6)
 	m.approval.SetContent(m.approvalContent(approval))
-	lines := []string{
-		titleStyle.Render("Approval Required"),
-		fmt.Sprintf("%s of %d  %s  %s", approval.ID, len(m.state.Approvals), approval.Action, approval.Title),
-		approvalSubjectLine(approval),
-		mutedStyle.Render("a approve/apply  r reject  :approval auto/ask/read-only  d detail  Ctrl+F/B scroll  Esc close"),
-		"",
-	}
+	lines := []string{titleStyle.Render("Approval Required")}
+	lines = append(lines, wrapANSIToWidth(fmt.Sprintf("%s of %d  %s  %s", approval.ID, len(m.state.Approvals), approval.Action, approval.Title), max(10, width-4))...)
+	lines = append(lines, wrapANSIToWidth(approvalSubjectLine(approval), max(10, width-4))...)
+	lines = append(lines, wrapANSIToWidth(mutedStyle.Render("a approve/apply  r reject  :approval auto/ask/read-only  d detail  Ctrl+E/Y or Ctrl+F/B scroll  Esc close"), max(10, width-4))...)
+	lines = append(lines, "")
 	lines = append(lines, m.approval.View())
 	return modalStyle.Width(width).Render(strings.Join(lines, "\n"))
 }
@@ -3785,7 +3796,7 @@ func (m model) opsEntries() []contextEntry {
 		entries = append(entries, contextEntry{
 			id:     fmt.Sprintf("q%d", i+1),
 			kind:   "ops",
-			label:  truncate(title, 80),
+			label:  title,
 			status: "queued prompt",
 			body:   queued.text,
 		})
@@ -4169,11 +4180,7 @@ func (m *model) moveSelection(delta int) {
 	case focusAgents:
 		m.leftCursor = clamp(m.leftCursor+delta, 0, len(m.agentDisplayRows()))
 	case focusTranscript:
-		// SmartMove scrolls within the selected message when it overflows
-		// the viewport before advancing to the next/previous cell — so the
-		// user can read the middle of long messages with j/k instead of
-		// jumping past them.
-		m.chat.SmartMove(delta)
+		m.chat.MoveSelection(delta)
 	case focusContext:
 		m.contextCursor = clamp(m.contextCursor+delta, 0, max(0, len(m.contextEntries())-1))
 	}
@@ -4510,13 +4517,18 @@ func fitLines(lines []string, width int, height int) string {
 	if height <= 0 {
 		return ""
 	}
-	if len(lines) > height {
-		lines = append(lines[:height-1], mutedStyle.Render("..."))
+	contentWidth := max(1, width-2)
+	var wrapped []string
+	for _, line := range lines {
+		wrapped = append(wrapped, wrapANSIToWidth(line, contentWidth)...)
 	}
-	for i := range lines {
-		lines[i] = truncate(lines[i], max(1, width-2))
+	if len(wrapped) > height {
+		wrapped = append(wrapped[:height-1], mutedStyle.Render("⋮"))
 	}
-	return strings.Join(lines, "\n")
+	for i := range wrapped {
+		wrapped[i] = clipANSIToWidth(wrapped[i], contentWidth)
+	}
+	return strings.Join(wrapped, "\n")
 }
 
 func fitFrame(view string, width int, height int) string {
@@ -4561,6 +4573,39 @@ func wrapLines(text string, width int, limit int) []string {
 		}
 	}
 	return lines
+}
+
+func wrapANSIToWidth(line string, width int) []string {
+	width = max(1, width)
+	if line == "" {
+		return []string{""}
+	}
+	if xansi.StringWidth(line) <= width {
+		return []string{line}
+	}
+	wrapped := xansi.Wordwrap(line, width, " /")
+	var out []string
+	for _, candidate := range strings.Split(wrapped, "\n") {
+		if xansi.StringWidth(candidate) <= width {
+			out = append(out, candidate)
+			continue
+		}
+		for _, part := range strings.Split(xansi.Wrap(candidate, width, ""), "\n") {
+			out = append(out, clipANSIToWidth(part, width))
+		}
+	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
+}
+
+func clipANSIToWidth(line string, width int) string {
+	width = max(1, width)
+	if xansi.StringWidth(line) <= width {
+		return line
+	}
+	return xansi.Truncate(line, width, "")
 }
 
 func wordWrapLine(line string, width int) []string {

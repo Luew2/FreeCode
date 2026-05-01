@@ -117,31 +117,57 @@ func TestChatRendererScrollDoesNotMoveSelectionAndGRestoresFollow(t *testing.T) 
 	}
 }
 
-func TestChatRendererSmartMoveScrollsLongSelectedMessageGradually(t *testing.T) {
+func TestChatRendererSetItemsDoesNotRefollowAfterManualSelection(t *testing.T) {
+	chat := newChatRenderer(50, 8)
+	var items []workbench.TranscriptItem
+	for i := 1; i <= 5; i++ {
+		items = append(items, workbench.TranscriptItem{
+			ID:    fmt.Sprintf("m%d", i),
+			Kind:  workbench.TranscriptAssistant,
+			Actor: "assistant",
+			Text:  "line",
+		})
+	}
+	chat.SetItems(items)
+	chat.MoveSelection(-1)
+	if id, _ := chat.SelectedID(); id != "m4" {
+		t.Fatalf("selected = %q, want m4 before refresh", id)
+	}
+	chat.SetItems(items)
+	if id, _ := chat.SelectedID(); id != "m4" {
+		t.Fatalf("selected = %q after same-items refresh, want m4", id)
+	}
+	items = append(items, workbench.TranscriptItem{ID: "m6", Kind: workbench.TranscriptAssistant, Text: "new"})
+	chat.SetItems(items)
+	if id, _ := chat.SelectedID(); id != "m4" {
+		t.Fatalf("selected = %q after append while not following, want m4", id)
+	}
+}
+
+func TestChatRendererMoveSelectionDoesNotScrollInsideLongMessage(t *testing.T) {
 	chat := newChatRenderer(54, 6)
-	chat.SetItems([]workbench.TranscriptItem{{
-		ID:    "m1",
-		Kind:  workbench.TranscriptAssistant,
-		Actor: "assistant",
-		Text:  strings.Repeat("this is a long selected message with enough words to wrap and fill many rows. ", 12),
-	}})
+	chat.SetItems([]workbench.TranscriptItem{
+		{
+			ID:    "m1",
+			Kind:  workbench.TranscriptAssistant,
+			Actor: "assistant",
+			Text:  strings.Repeat("this is a long selected message with enough words to wrap and fill many rows. ", 12),
+		},
+		{
+			ID:    "m2",
+			Kind:  workbench.TranscriptAssistant,
+			Actor: "assistant",
+			Text:  "next message",
+		},
+	})
 
 	chat.Top()
-	chat.SmartMove(1)
-	firstOffset := chat.yOffset
-	if firstOffset <= 0 {
-		t.Fatalf("first smart move yOffset = %d, want scroll within long message", firstOffset)
-	}
-	_, end := chat.selectedLineRange()
-	bottomOffset := max(0, end-chat.height+1)
-	if firstOffset >= bottomOffset {
-		t.Fatalf("first smart move jumped to bottom offset %d; want gradual scroll below %d", firstOffset, bottomOffset)
-	}
-	if id, _ := chat.SelectedID(); id != "m1" {
-		t.Fatalf("selected = %q, want same long message while scrolling within it", id)
+	chat.MoveSelection(1)
+	if id, _ := chat.SelectedID(); id != "m2" {
+		t.Fatalf("selected = %q, want j/k-style selection movement to m2", id)
 	}
 	if clean := stripANSI(chat.View()); !strings.Contains(clean, "▌") {
-		t.Fatalf("selected long message lacks visible gutter:\n%s", clean)
+		t.Fatalf("selected message lacks visible gutter:\n%s", clean)
 	}
 }
 

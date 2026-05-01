@@ -74,7 +74,7 @@ func (c *chatRenderer) SetItems(items []workbench.TranscriptItem) {
 		c.cache = map[chatCacheKey][]string{}
 	}
 	c.clamp()
-	if c.follow || c.selected >= len(c.items)-2 {
+	if c.follow {
 		c.FollowLatest()
 		return
 	}
@@ -106,42 +106,6 @@ func (c *chatRenderer) MoveSelection(delta int) {
 	c.invalidateLayout()
 	c.follow = c.selected == len(c.items)-1
 	c.ensureSelectedVisible()
-}
-
-// SmartMove is the j/k entry point: when the currently selected message is
-// larger than the viewport and partially clipped, scroll within it instead
-// of jumping to the next/previous cell. Once the relevant edge of the cell
-// is visible, the next press advances the selection. Without this the user
-// has no way to read the middle of a long message — selecting it brings the
-// top into view, but pressing k again would fly past it to the previous
-// message.
-func (c *chatRenderer) SmartMove(delta int) {
-	if len(c.items) == 0 || delta == 0 {
-		return
-	}
-	start, end := c.selectedLineRange()
-	maxOffset := max(0, c.totalLineCount()-c.height)
-	switch {
-	case delta < 0:
-		// Going up: if the start of the selected cell is above the viewport,
-		// scroll the viewport up by a small step instead of moving selection.
-		if start < c.yOffset {
-			c.yOffset = max(start, c.yOffset-3)
-			c.follow = false
-			c.clampOffset()
-			return
-		}
-	case delta > 0:
-		// Going down: if the end of the selected cell is below the viewport,
-		// scroll down by a small step instead of jumping to the cell edge.
-		if end >= c.yOffset+c.height {
-			c.yOffset = min(maxOffset, min(end-c.height+1, c.yOffset+3))
-			c.follow = false
-			c.clampOffset()
-			return
-		}
-	}
-	c.MoveSelection(delta)
 }
 
 func (c *chatRenderer) LineDown(n int) {

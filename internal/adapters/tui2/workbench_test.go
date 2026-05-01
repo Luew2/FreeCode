@@ -656,6 +656,37 @@ func TestAIVimPolishCopyRendersAgenticEmptyStates(t *testing.T) {
 	}
 }
 
+func TestRightPaneWrapsInformationalRowsInsteadOfEllipsizing(t *testing.T) {
+	longName := "internal/super/deep/path/with/an_extremely_long_filename_that_should_wrap_instead_of_ellipsis.go"
+	controller := &fakeController{state: workbench.State{
+		Commands: workbench.DefaultCommands(),
+		RightTab: workbench.RightTabFiles,
+		Files: []workbench.WorkspaceFile{{
+			ID:   "f1",
+			Path: longName,
+			Name: "an_extremely_long_filename_that_should_wrap_instead_of_ellipsis.go",
+			Kind: "file",
+		}},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.focus = focusContext
+	m.expandedFolders["internal"] = true
+	m.expandedFolders["internal/super"] = true
+	m.expandedFolders["internal/super/deep"] = true
+	m.expandedFolders["internal/super/deep/path"] = true
+	m.expandedFolders["internal/super/deep/path/with"] = true
+
+	view := stripANSI(m.rightView(34, 18))
+	if strings.Contains(view, "...") {
+		t.Fatalf("right pane contains horizontal ellipsis, want wrapped rows:\n%s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if printableWidth(line) > 34 {
+			t.Fatalf("right pane line width = %d > 34: %q\nfull:\n%s", printableWidth(line), line, view)
+		}
+	}
+}
+
 func TestShowBuffersUsesAgentBufferMentalModel(t *testing.T) {
 	controller := &fakeController{state: workbench.State{
 		Commands: workbench.DefaultCommands(),
@@ -825,6 +856,64 @@ func TestTranscriptSelectionScrollsIntoView(t *testing.T) {
 	}
 	if m.chat.yOffset == 0 {
 		t.Fatalf("chat yOffset = 0, want selected message scrolled into view")
+	}
+}
+
+func TestTranscriptJKAlwaysMovesSelectedMessage(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Commands: workbench.DefaultCommands(),
+		Transcript: []workbench.TranscriptItem{
+			{
+				ID:    "m1",
+				Kind:  workbench.TranscriptAssistant,
+				Actor: "assistant",
+				Text:  strings.Repeat("long selected message that spans several rows. ", 20),
+			},
+			{ID: "m2", Kind: workbench.TranscriptAssistant, Actor: "assistant", Text: "next"},
+		},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.focus = focusTranscript
+	m.chat.SetSize(48, 5)
+	m.chat.SetItems(controller.state.Transcript)
+	m.chat.Top()
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	if cmd != nil {
+		t.Fatalf("j returned unexpected cmd")
+	}
+	m = next.(model)
+	if id, _ := m.chat.SelectedID(); id != "m2" {
+		t.Fatalf("selected = %q, want m2 after j", id)
+	}
+}
+
+func TestTranscriptCtrlEYScrollsContentWithoutTailSnap(t *testing.T) {
+	var transcript []workbench.TranscriptItem
+	for i := 1; i <= 8; i++ {
+		transcript = append(transcript, workbench.TranscriptItem{
+			ID:    fmt.Sprintf("m%d", i),
+			Kind:  workbench.TranscriptAssistant,
+			Actor: "assistant",
+			Text:  "line one\nline two",
+		})
+	}
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands(), Transcript: transcript}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.focus = focusTranscript
+	m.chat.SetSize(40, 5)
+	m.chat.SetItems(transcript)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	m = next.(model)
+	if m.chat.IsAtBottom() {
+		t.Fatalf("Ctrl+Y did not scroll away from bottom")
+	}
+	scrolledOffset := m.chat.yOffset
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlE})
+	m = next.(model)
+	if m.chat.yOffset <= scrolledOffset {
+		t.Fatalf("Ctrl+E yOffset = %d, want > %d", m.chat.yOffset, scrolledOffset)
 	}
 }
 
