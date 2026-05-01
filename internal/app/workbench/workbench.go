@@ -693,7 +693,7 @@ func (s *Service) Load(ctx context.Context) (State, error) {
 		} else if modelStarted {
 			appendTranscript(TranscriptThinking, "assistant", "thinking", "waiting for model output", streamMeta)
 		}
-		state.Transcript = conversationTranscript(fullTranscript, state.Agents, state.ActiveConversation)
+		state.Transcript = compactTranscriptToolRequests(conversationTranscript(fullTranscript, state.Agents, state.ActiveConversation))
 	}
 
 	sort.SliceStable(state.Artifacts, func(i, j int) bool {
@@ -864,6 +864,14 @@ func (s *Service) SubmitPrompt(ctx context.Context, request SubmitRequest) (Stat
 	s.ActiveConversation = normalizeConversationTarget(request.Target)
 	request.TurnContext = combineTurnContexts(s.submitTurnContext(ctx, s.ActiveConversation), request.TurnContext)
 	if err := s.Submit(ctx, request); err != nil {
+		if errors.Is(err, commands.ErrApprovalRequired) {
+			state, loadErr := s.Load(ctx)
+			if loadErr != nil {
+				return State{}, loadErr
+			}
+			state.Notice = "approval required"
+			return state, nil
+		}
 		return State{}, err
 	}
 	state, err := s.Load(ctx)
@@ -2607,23 +2615,33 @@ func approvalFromToolEvent(number int, event session.Event) (Item, bool) {
 	}
 	name := stringValue(event.Payload["name"])
 	errText := stringValue(event.Payload["error"])
-	if name != "run_check" || !strings.Contains(errText, "shell permission requires approval") {
+	action := permission.Action(stringValue(event.Payload["action"]))
+	subject := stringValue(event.Payload["subject"])
+	reason := stringValue(event.Payload["reason"])
+	if action == "" && name == "run_check" && strings.Contains(errText, "shell permission requires approval") {
+		action = permission.ActionShell
+		subject = runCheckCommand(event.Payload["arguments"])
+		reason = "run_check"
+	}
+	if action == "" || !strings.Contains(errText, "permission requires approval") {
 		return Item{}, false
 	}
-	command := runCheckCommand(event.Payload["arguments"])
-	if command == "" {
-		command = "run_check"
+	if subject == "" {
+		subject = firstNonEmpty(name, "tool")
+	}
+	if reason == "" {
+		reason = name
 	}
 	id := fmt.Sprintf("u%d", number)
 	return Item{
 		ID:    id,
 		Kind:  "approval",
-		Title: "Approve shell: " + command,
+		Title: fmt.Sprintf("Approve %s: %s", action, subject),
 		Body:  strings.TrimSpace(event.Text),
 		Meta: map[string]string{
-			"action":          string(permission.ActionShell),
-			"subject":         command,
-			"reason":          "run_check",
+			"action":          string(action),
+			"subject":         subject,
+			"reason":          reason,
 			"state":           "pending",
 			"tool_call_name":  name,
 			"tool_call_error": errText,
@@ -3080,12 +3098,40 @@ func mapStringAny(value any) map[string]any {
 
 func transcriptEventMeta(event session.Event) map[string]string {
 	meta := map[string]string{}
-	for _, key := range []string{"agent", "agent_id", "task_session", "task_id", "role", "status", "name"} {
+	for _, key := range []string{"agent", "agent_id", "task_session", "task_id", "role", "status", "name", "call_id", "arguments", "error"} {
 		if value := scalarString(event.Payload[key]); value != "" {
 			meta[key] = value
 		}
 	}
 	return meta
+}
+
+func compactTranscriptToolRequests(items []TranscriptItem) []TranscriptItem {
+	if len(items) == 0 {
+		return items
+	}
+	resolved := map[string]bool{}
+	for _, item := range items {
+		if item.Status == "requested" {
+			continue
+		}
+		if callID := firstNonEmpty(item.Meta["call_id"], item.Meta["tool_call_id"]); callID != "" {
+			resolved[callID] = true
+		}
+	}
+	if len(resolved) == 0 {
+		return items
+	}
+	out := make([]TranscriptItem, 0, len(items))
+	for _, item := range items {
+		if item.Kind == TranscriptTool && item.Status == "requested" {
+			if callID := firstNonEmpty(item.Meta["tool_call_id"], item.Meta["call_id"]); callID != "" && resolved[callID] {
+				continue
+			}
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func cloneStringMap(input map[string]string) map[string]string {

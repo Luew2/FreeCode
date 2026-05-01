@@ -13,6 +13,7 @@ import (
 
 	"github.com/Luew2/FreeCode/internal/adapters/tools/builtin"
 	"github.com/Luew2/FreeCode/internal/adapters/workspace/localfs"
+	"github.com/Luew2/FreeCode/internal/app/commands"
 	"github.com/Luew2/FreeCode/internal/core/artifact"
 	"github.com/Luew2/FreeCode/internal/core/model"
 	"github.com/Luew2/FreeCode/internal/core/permission"
@@ -547,6 +548,101 @@ func TestServiceLoadsShellPermissionApproval(t *testing.T) {
 	}
 	if decision != permission.DecisionAllow {
 		t.Fatalf("decision = %q, want allow", decision)
+	}
+}
+
+func TestServiceLoadsMCPPermissionApproval(t *testing.T) {
+	log := &memoryLog{events: []session.Event{{
+		ID:        "e1",
+		SessionID: "s1",
+		Type:      session.EventTool,
+		At:        time.Now(),
+		Actor:     "tool",
+		Text:      "network permission requires approval for mcp_exa_web_search",
+		Payload: map[string]any{
+			"call_id":   "call_mcp",
+			"name":      "mcp_exa_web_search",
+			"arguments": `{"query":"freecode"}`,
+			"error":     "network permission requires approval for mcp_exa_web_search",
+			"action":    string(permission.ActionNetwork),
+			"subject":   "mcp_exa_web_search",
+			"reason":    "mcp:exa:web_search:network",
+			"state":     "pending",
+		},
+	}}}
+	gate := NewApprovalGate(permission.ModeAsk)
+	service := &Service{Log: log, Approval: gate, SessionID: "s1"}
+
+	state, err := service.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(state.Approvals) != 1 || state.Approvals[0].Action != string(permission.ActionNetwork) || state.Approvals[0].Subject != "mcp_exa_web_search" {
+		t.Fatalf("approvals = %#v, want MCP network approval", state.Approvals)
+	}
+	state, err = service.Approve(context.Background(), state.Approvals[0].ID)
+	if err != nil {
+		t.Fatalf("Approve MCP returned error: %v", err)
+	}
+	if len(state.Approvals) != 0 {
+		t.Fatalf("approvals = %#v, want resolved MCP approval", state.Approvals)
+	}
+	decision, err := gate.Decide(context.Background(), permission.Request{Action: permission.ActionNetwork, Subject: "mcp_exa_web_search", Reason: "mcp:exa:web_search:network"})
+	if err != nil {
+		t.Fatalf("Decide returned error: %v", err)
+	}
+	if decision != permission.DecisionAllow {
+		t.Fatalf("decision = %q, want allow", decision)
+	}
+}
+
+func TestSubmitPromptReturnsApprovalStateWithoutError(t *testing.T) {
+	log := &memoryLog{events: []session.Event{{
+		ID:        "e1",
+		SessionID: "s1",
+		Type:      session.EventTool,
+		At:        time.Now(),
+		Actor:     "tool",
+		Text:      "network permission requires approval for mcp_exa_web_search",
+		Payload: map[string]any{
+			"name":    "mcp_exa_web_search",
+			"error":   "network permission requires approval for mcp_exa_web_search",
+			"action":  string(permission.ActionNetwork),
+			"subject": "mcp_exa_web_search",
+			"reason":  "mcp:exa:web_search:network",
+			"state":   "pending",
+		},
+	}}}
+	service := &Service{
+		Log:       log,
+		SessionID: "s1",
+		Approval:  NewApprovalGate(permission.ModeAsk),
+		Submit: func(ctx context.Context, request SubmitRequest) error {
+			return commands.ErrApprovalRequired
+		},
+	}
+
+	state, err := service.SubmitPrompt(context.Background(), SubmitRequest{Text: "search with exa"})
+	if err != nil {
+		t.Fatalf("SubmitPrompt returned error: %v", err)
+	}
+	if state.Notice != "approval required" || len(state.Approvals) != 1 {
+		t.Fatalf("state notice/approvals = %q/%#v, want approval state", state.Notice, state.Approvals)
+	}
+}
+
+func TestCompactTranscriptToolRequestsDropsResolvedRequestRows(t *testing.T) {
+	items := []TranscriptItem{
+		{ID: "m1", Kind: TranscriptUser, Text: "search"},
+		{ID: "m2", Kind: TranscriptTool, Title: "mcp_exa_web_search", Status: "requested", Text: `{"query":"freecode"}`, Meta: map[string]string{"tool_call_id": "call_1"}},
+		{ID: "m3", Kind: TranscriptTool, Title: "mcp_exa_web_search", Text: "result", Meta: map[string]string{"call_id": "call_1"}},
+	}
+	got := compactTranscriptToolRequests(items)
+	if len(got) != 2 {
+		t.Fatalf("compacted = %#v, want requested row dropped", got)
+	}
+	if got[1].ID != "m3" {
+		t.Fatalf("second item = %#v, want result row", got[1])
 	}
 }
 

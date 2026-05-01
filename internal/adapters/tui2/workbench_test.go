@@ -1954,6 +1954,22 @@ func TestTutorialCommandGivesCorrectionForWrongCommand(t *testing.T) {
 	}
 }
 
+func TestMCPStatusCommandOpensDetailOverlay(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+
+	next, cmd := m.executeLine(":mcp status")
+	if cmd == nil {
+		t.Fatalf(":mcp status returned nil cmd, want action")
+	}
+	msg := firstActionMsg(t, cmd)
+	next, _ = next.(model).Update(msg)
+	m = next.(model)
+	if m.overlay != overlayDetail || m.state.Detail.ID != "mcp-status" {
+		t.Fatalf("overlay/detail = %v/%#v, want MCP detail overlay", m.overlay, m.state.Detail)
+	}
+}
+
 func sendRunes(t *testing.T, m model, value string) model {
 	t.Helper()
 	for _, r := range value {
@@ -2169,5 +2185,29 @@ func (c *fakeController) ShareTerminal(ctx context.Context, title string, body s
 	c.sharedTerminalBody = body
 	c.state.Detail = workbench.Item{ID: "term1", Kind: "terminal", Title: title, Body: body}
 	c.state.Notice = "terminal shared"
+	return c.state, nil
+}
+
+func (c *fakeController) MCPStatus(ctx context.Context) (workbench.State, error) {
+	c.state.Detail = workbench.Item{ID: "mcp-status", Kind: "mcp", Title: "MCP status", Body: "mcp: ready"}
+	c.state.Notice = "mcp status"
+	return c.state, nil
+}
+
+func (c *fakeController) MCPTools(ctx context.Context) (workbench.State, error) {
+	c.state.Detail = workbench.Item{ID: "mcp-tools", Kind: "mcp", Title: "MCP tools", Body: "mcp tool list"}
+	c.state.Notice = "mcp tools"
+	return c.state, nil
+}
+
+func (c *fakeController) MCPReload(ctx context.Context) (workbench.State, error) {
+	c.state.Detail = workbench.Item{ID: "mcp-status", Kind: "mcp", Title: "MCP status", Body: "mcp reloaded"}
+	c.state.Notice = "mcp reloaded"
+	return c.state, nil
+}
+
+func (c *fakeController) MCPDoctor(ctx context.Context) (workbench.State, error) {
+	c.state.Detail = workbench.Item{ID: "mcp-doctor", Kind: "mcp", Title: "MCP doctor", Body: "mcp doctor"}
+	c.state.Notice = "mcp doctor"
 	return c.state, nil
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/Luew2/FreeCode/internal/app/prompt"
 	"github.com/Luew2/FreeCode/internal/core/artifact"
 	"github.com/Luew2/FreeCode/internal/core/model"
+	"github.com/Luew2/FreeCode/internal/core/permission"
 	"github.com/Luew2/FreeCode/internal/core/session"
 	"github.com/Luew2/FreeCode/internal/ports"
 )
@@ -30,6 +31,8 @@ const (
 	// model is genuinely stuck.
 	maxEmptyRetries = 2
 )
+
+var ErrApprovalRequired = permission.ErrApprovalRequired
 
 type Runner struct {
 	Model  ports.ModelClient
@@ -261,9 +264,16 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 			return Response{}, err
 		}
 
-		for _, toolCall := range turn.toolCalls {
+		for i, toolCall := range turn.toolCalls {
 			resultText, err := r.runTool(ctx, request.SessionID, &sequence, toolCall)
 			if err != nil {
+				if errors.Is(err, ErrApprovalRequired) {
+					for _, skipped := range turn.toolCalls[i+1:] {
+						if logErr := r.appendSkippedTool(ctx, request.SessionID, &sequence, skipped, toolCall.Name); logErr != nil {
+							return Response{}, logErr
+						}
+					}
+				}
 				return Response{}, err
 			}
 			toolMessage := model.TextMessage(model.RoleTool, resultText)
@@ -579,8 +589,19 @@ func (r Runner) runTool(ctx context.Context, sessionID session.ID, sequence *int
 	result, err := r.Tools.RunTool(ctx, call)
 	if err != nil {
 		message := err.Error()
-		if logErr := r.append(ctx, sessionID, sequence, session.EventTool, "tool", message, toolCallPayload(call, map[string]any{"error": message})); logErr != nil {
+		extra := map[string]any{"error": message}
+		if request, ok := permission.ApprovalRequest(err); ok {
+			extra["approval_required"] = true
+			extra["action"] = string(request.Action)
+			extra["subject"] = request.Subject
+			extra["reason"] = request.Reason
+			extra["state"] = "pending"
+		}
+		if logErr := r.append(ctx, sessionID, sequence, session.EventTool, "tool", message, toolCallPayload(call, extra)); logErr != nil {
 			return "", logErr
+		}
+		if errors.Is(err, permission.ErrApprovalRequired) {
+			return "", ErrApprovalRequired
 		}
 		return "tool error: " + message, nil
 	}
@@ -596,6 +617,22 @@ func (r Runner) runTool(ctx context.Context, sessionID session.ID, sequence *int
 		return "", err
 	}
 	return result.Content, nil
+}
+
+func (r Runner) appendSkippedTool(ctx context.Context, sessionID session.ID, sequence *int, call model.ToolCall, blockedBy string) error {
+	name := call.Name
+	if name == "" {
+		name = "tool"
+	}
+	if blockedBy == "" {
+		blockedBy = "another tool call"
+	}
+	message := fmt.Sprintf("%s was not run because %s is waiting for approval", name, blockedBy)
+	return r.append(ctx, sessionID, sequence, session.EventTool, "tool", message, toolCallPayload(call, map[string]any{
+		"error":   message,
+		"skipped": true,
+		"state":   "skipped",
+	}))
 }
 
 func (r Runner) toolSpecs() []model.ToolSpec {

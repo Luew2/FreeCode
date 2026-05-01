@@ -382,7 +382,7 @@ func (p *Provider) checkPermission(ctx context.Context, tool toolRuntime) error 
 				return err
 			}
 			if granted != permission.DecisionAllow {
-				return fmt.Errorf("%s %s permission was not approved", tool.publicName, action)
+				return permission.ApprovalRequired(request)
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package permission
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -63,6 +64,38 @@ type Request struct {
 	Action  Action
 	Subject string
 	Reason  string
+}
+
+var ErrApprovalRequired = errors.New("permission requires approval")
+
+type ApprovalRequiredError struct {
+	Request Request
+}
+
+func (e ApprovalRequiredError) Error() string {
+	if e.Request.Action == "" {
+		return ErrApprovalRequired.Error()
+	}
+	if e.Request.Subject != "" {
+		return fmt.Sprintf("%s permission requires approval for %s", e.Request.Action, e.Request.Subject)
+	}
+	return fmt.Sprintf("%s permission requires approval", e.Request.Action)
+}
+
+func (e ApprovalRequiredError) Unwrap() error {
+	return ErrApprovalRequired
+}
+
+func ApprovalRequired(request Request) error {
+	return ApprovalRequiredError{Request: request}
+}
+
+func ApprovalRequest(err error) (Request, bool) {
+	var approvalErr ApprovalRequiredError
+	if errors.As(err, &approvalErr) {
+		return approvalErr.Request, true
+	}
+	return Request{}, false
 }
 
 func ParseMode(value string) (Mode, error) {

@@ -3622,6 +3622,7 @@ func (m model) runMCPAction(action string) (tea.Model, tea.Cmd) {
 		m.state.Notice = "mcp is unavailable"
 		return m, nil
 	}
+	m.detailPending = true
 	switch action {
 	case "status":
 		return m.runAction(reporter.MCPStatus)

@@ -42,6 +42,8 @@ type AskDependencies struct {
 	SessionContextMaxTokens int
 }
 
+var ErrApprovalRequired = orchestrator.ErrApprovalRequired
+
 func Ask(ctx context.Context, w io.Writer, deps AskDependencies, opts AskOptions) error {
 	_, err := AskWithResponse(ctx, w, deps, opts)
 	return err

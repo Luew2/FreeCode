@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -77,6 +78,17 @@ func TestProviderFiltersReadOnlyAndRequestsPermission(t *testing.T) {
 	}
 	if len(gate.requests) != 1 || gate.requests[0].Action != permission.ActionWrite {
 		t.Fatalf("permission requests = %#v, want write request", gate.requests)
+	}
+
+	askGate := &recordingGate{decision: permission.DecisionAsk}
+	needsApproval := manager.Provider(permission.ModeAsk, askGate)
+	_, err := needsApproval.RunTool(context.Background(), model.ToolCall{Name: "mcp_fake_write_file", Arguments: []byte(`{}`)})
+	if !errors.Is(err, permission.ErrApprovalRequired) {
+		t.Fatalf("RunTool ask decision = %v, want approval required", err)
+	}
+	request, ok := permission.ApprovalRequest(err)
+	if !ok || request.Action != permission.ActionWrite || request.Subject != "mcp_fake_write_file" {
+		t.Fatalf("approval request = %#v/%v", request, ok)
 	}
 }
 

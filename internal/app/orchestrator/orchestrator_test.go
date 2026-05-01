@@ -11,6 +11,7 @@ import (
 	"github.com/Luew2/FreeCode/internal/app/prompt"
 	"github.com/Luew2/FreeCode/internal/core/artifact"
 	"github.com/Luew2/FreeCode/internal/core/model"
+	"github.com/Luew2/FreeCode/internal/core/permission"
 	"github.com/Luew2/FreeCode/internal/core/session"
 	"github.com/Luew2/FreeCode/internal/ports"
 )
@@ -84,6 +85,58 @@ func TestRunnerLoopsThroughToolCalls(t *testing.T) {
 	}
 	if !foundToolEvent {
 		t.Fatalf("events = %#v, want persisted tool event", log.events)
+	}
+}
+
+func TestRunnerStopsForApprovalAndCompletesToolCallGroup(t *testing.T) {
+	client := &scriptedModelClient{
+		scripts: [][]model.Event{{
+			{Type: model.EventStarted},
+			{Type: model.EventToolCall, ToolCall: &model.ToolCall{ID: "call_1", Name: "mcp_exa_web_search", Arguments: []byte(`{"query":"freecode"}`)}},
+			{Type: model.EventToolCall, ToolCall: &model.ToolCall{ID: "call_2", Name: "read_file", Arguments: []byte(`{"path":"README.md"}`)}},
+			{Type: model.EventCompleted},
+		}},
+	}
+	log := &memoryEventLog{}
+	tools := approvalRequiredTools{}
+
+	_, err := Runner{
+		Model: client,
+		Tools: tools,
+		Log:   log,
+		Now:   func() time.Time { return time.Unix(1, 0).UTC() },
+	}.Run(context.Background(), Request{
+		SessionID:   "s1",
+		Model:       model.NewRef("local", "coder"),
+		UserRequest: "search",
+		Environment: prompt.Environment{
+			WorkspaceRoot: "/repo",
+		},
+		MaxSteps: 2,
+	})
+	if !errors.Is(err, ErrApprovalRequired) {
+		t.Fatalf("Run error = %v, want approval required", err)
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("model requests = %d, want no follow-up model turn", len(client.requests))
+	}
+	var toolEvents []session.Event
+	for _, event := range log.events {
+		if event.Type == session.EventTool {
+			toolEvents = append(toolEvents, event)
+		}
+	}
+	if len(toolEvents) != 2 {
+		t.Fatalf("tool events = %#v, want approval event plus skipped sibling", toolEvents)
+	}
+	if got := toolEvents[0].Payload["call_id"]; got != "call_1" {
+		t.Fatalf("first tool call id = %#v, want call_1", got)
+	}
+	if got := toolEvents[1].Payload["call_id"]; got != "call_2" {
+		t.Fatalf("second tool call id = %#v, want call_2", got)
+	}
+	if skipped, _ := toolEvents[1].Payload["skipped"].(bool); !skipped || !strings.Contains(toolEvents[1].Text, "waiting for approval") {
+		t.Fatalf("second tool event = %#v, want skipped approval marker", toolEvents[1])
 	}
 }
 
@@ -428,6 +481,20 @@ func (t *fakeTools) Tools() []model.ToolSpec {
 func (t *fakeTools) RunTool(ctx context.Context, call model.ToolCall) (ports.ToolResult, error) {
 	t.calls++
 	return ports.ToolResult{CallID: call.ID, Content: t.result, Artifact: t.artifact, Metadata: t.metadata}, nil
+}
+
+type approvalRequiredTools struct{}
+
+func (approvalRequiredTools) Tools() []model.ToolSpec {
+	return []model.ToolSpec{{Name: "mcp_exa_web_search"}, {Name: "read_file"}}
+}
+
+func (approvalRequiredTools) RunTool(ctx context.Context, call model.ToolCall) (ports.ToolResult, error) {
+	return ports.ToolResult{}, permission.ApprovalRequired(permission.Request{
+		Action:  permission.ActionNetwork,
+		Subject: call.Name,
+		Reason:  "test",
+	})
 }
 
 type memoryEventLog struct {
