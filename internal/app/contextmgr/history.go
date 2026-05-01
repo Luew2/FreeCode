@@ -138,6 +138,9 @@ func toolFromEvent(event session.Event) (model.Message, bool) {
 	if event.Payload == nil {
 		return model.Message{}, false
 	}
+	if boolField(event.Payload, "approval_required") || boolField(event.Payload, "skipped") {
+		return model.Message{}, false
+	}
 	callID := stringField(event.Payload, "call_id", "tool_call_id", "id")
 	if callID == "" {
 		return model.Message{}, false
@@ -149,6 +152,21 @@ func toolFromEvent(event session.Event) (model.Message, bool) {
 	msg := model.TextMessage(model.RoleTool, text)
 	msg.ToolCallID = callID
 	return msg, true
+}
+
+func boolField(payload map[string]any, key string) bool {
+	value, ok := payload[key]
+	if !ok {
+		return false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
 }
 
 // assistantStatus extracts the "status" field of an assistant event payload

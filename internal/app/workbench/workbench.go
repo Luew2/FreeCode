@@ -33,6 +33,15 @@ type Clipboard interface {
 
 type Submitter func(ctx context.Context, request SubmitRequest) error
 
+type ApprovalContinuation func(ctx context.Context, request ApprovalContinuationRequest) error
+
+type ApprovalContinuationRequest struct {
+	ApprovalID string
+	Item       Item
+	Permission permission.Request
+	Target     ConversationTarget
+}
+
 type SubmitRequest struct {
 	Text          string
 	Approval      permission.Mode
@@ -43,16 +52,17 @@ type SubmitRequest struct {
 }
 
 type Service struct {
-	Log       ports.EventLog
-	Git       ports.Git
-	Editor    ports.Editor
-	Files     ports.FileSystem
-	Clipboard Clipboard
-	Tools     ports.ToolRegistry
-	Submit    Submitter
-	Approval  *ApprovalGate
-	Sessions  SessionIndex
-	MCP       ports.MCPController
+	Log              ports.EventLog
+	Git              ports.Git
+	Editor           ports.Editor
+	Files            ports.FileSystem
+	Clipboard        Clipboard
+	Tools            ports.ToolRegistry
+	Submit           Submitter
+	ContinueApproval ApprovalContinuation
+	Approval         *ApprovalGate
+	Sessions         SessionIndex
+	MCP              ports.MCPController
 	// Config powers the :models modal — listing every configured provider
 	// and switching the active model without dropping back to the CLI.
 	// Optional; nil disables the swap UI but everything else still works.
@@ -1413,12 +1423,159 @@ func (s *Service) Approve(ctx context.Context, id string) (State, error) {
 	if err := s.logPermission(ctx, "approved", id, request); err != nil {
 		return State{}, err
 	}
+	if s.ContinueApproval != nil && resumableApprovalItem(item) {
+		err := s.ContinueApproval(ctx, ApprovalContinuationRequest{
+			ApprovalID: id,
+			Item:       item,
+			Permission: request,
+			Target:     s.activeConversation(),
+		})
+		if err != nil {
+			if errors.Is(err, commands.ErrApprovalRequired) {
+				state, loadErr := s.Load(ctx)
+				if loadErr != nil {
+					return State{}, loadErr
+				}
+				state.Notice = "approval required"
+				return state, nil
+			}
+			return State{}, err
+		}
+		state, err = s.Load(ctx)
+		if err != nil {
+			return State{}, err
+		}
+		state.Notice = "approved " + id + " and resumed"
+		return state, nil
+	}
 	state, err = s.Load(ctx)
 	if err != nil {
 		return State{}, err
 	}
 	state.Notice = "approved " + id
 	return state, nil
+}
+
+func resumableApprovalItem(item Item) bool {
+	return item.Kind == "approval" &&
+		strings.TrimSpace(item.Meta["tool_call_id"]) != "" &&
+		strings.TrimSpace(item.Meta["tool_call_name"]) != ""
+}
+
+func (s *Service) ApprovalContinuationToolCalls(ctx context.Context, item Item) ([]model.ToolCall, error) {
+	targetID := strings.TrimSpace(item.Meta["tool_call_id"])
+	if targetID == "" {
+		return nil, errors.New("approval is missing tool_call_id")
+	}
+	if s.Log == nil {
+		return fallbackApprovalToolCall(item)
+	}
+	stream, err := s.Log.Stream(ctx, s.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	var latestGroup []model.ToolCall
+	for event := range stream {
+		if event.Type != session.EventAssistantMessage || stringValue(event.Payload["status"]) != "tool_calls" {
+			continue
+		}
+		calls := toolCallsFromPayload(event.Payload)
+		if toolCallIndex(calls, targetID) >= 0 {
+			latestGroup = calls
+		}
+	}
+	if len(latestGroup) == 0 {
+		return fallbackApprovalToolCall(item)
+	}
+	index := toolCallIndex(latestGroup, targetID)
+	if index < 0 {
+		return fallbackApprovalToolCall(item)
+	}
+	return append([]model.ToolCall(nil), latestGroup[index:]...), nil
+}
+
+func fallbackApprovalToolCall(item Item) ([]model.ToolCall, error) {
+	name := strings.TrimSpace(item.Meta["tool_call_name"])
+	if name == "" {
+		return nil, errors.New("approval is missing tool_call_name")
+	}
+	callID := strings.TrimSpace(item.Meta["tool_call_id"])
+	if callID == "" {
+		callID = "approval_" + item.ID
+	}
+	return []model.ToolCall{{
+		ID:        callID,
+		Name:      name,
+		Arguments: toolArgumentsBytes(item.Meta["tool_call_arguments"]),
+	}}, nil
+}
+
+func toolCallsFromPayload(payload map[string]any) []model.ToolCall {
+	if len(payload) == 0 {
+		return nil
+	}
+	var rawCalls []any
+	switch calls := payload["tool_calls"].(type) {
+	case []any:
+		rawCalls = calls
+	case []map[string]any:
+		rawCalls = make([]any, 0, len(calls))
+		for _, call := range calls {
+			rawCalls = append(rawCalls, call)
+		}
+	default:
+		return nil
+	}
+	out := make([]model.ToolCall, 0, len(rawCalls))
+	for _, raw := range rawCalls {
+		call, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := firstNonEmpty(stringValue(call["id"]), stringValue(call["call_id"]))
+		name := stringValue(call["name"])
+		if id == "" && name == "" {
+			continue
+		}
+		out = append(out, model.ToolCall{ID: id, Name: name, Arguments: toolArgumentsBytes(call["arguments"])})
+	}
+	return out
+}
+
+func toolCallIndex(calls []model.ToolCall, id string) int {
+	for i, call := range calls {
+		if call.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func toolArgumentsBytes(value any) []byte {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case []byte:
+		return append([]byte(nil), v...)
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return nil
+		}
+		if json.Valid([]byte(trimmed)) {
+			return []byte(trimmed)
+		}
+		encoded, _ := json.Marshal(v)
+		return encoded
+	case map[string]any, []any:
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return nil
+		}
+		return encoded
+	default:
+		return nil
+	}
 }
 
 func (s *Service) Reject(ctx context.Context, id string) (State, error) {
@@ -1950,6 +2107,69 @@ func (s *Service) logToolResult(ctx context.Context, call model.ToolCall, result
 		Actor:     "tool",
 		Text:      result.Content,
 		Payload:   payload,
+	})
+}
+
+func (s *Service) LogToolResult(ctx context.Context, call model.ToolCall, result ports.ToolResult) error {
+	return s.logToolResult(ctx, call, result)
+}
+
+func (s *Service) LogToolError(ctx context.Context, call model.ToolCall, err error) error {
+	if s.Log == nil {
+		return nil
+	}
+	message := err.Error()
+	payload := map[string]any{
+		"call_id":   call.ID,
+		"name":      call.Name,
+		"arguments": string(call.Arguments),
+		"error":     message,
+	}
+	if request, ok := permission.ApprovalRequest(err); ok {
+		payload["approval_required"] = true
+		payload["action"] = string(request.Action)
+		payload["subject"] = request.Subject
+		payload["reason"] = request.Reason
+		payload["state"] = "pending"
+	}
+	return s.Log.Append(ctx, session.Event{
+		ID:        s.eventID("tool"),
+		SessionID: s.SessionID,
+		Type:      session.EventTool,
+		At:        s.now(),
+		Actor:     "tool",
+		Text:      message,
+		Payload:   payload,
+	})
+}
+
+func (s *Service) LogToolSkipped(ctx context.Context, call model.ToolCall, blockedBy string) error {
+	if s.Log == nil {
+		return nil
+	}
+	name := call.Name
+	if name == "" {
+		name = "tool"
+	}
+	if blockedBy == "" {
+		blockedBy = "another tool call"
+	}
+	message := fmt.Sprintf("%s was not run because %s is waiting for approval", name, blockedBy)
+	return s.Log.Append(ctx, session.Event{
+		ID:        s.eventID("tool"),
+		SessionID: s.SessionID,
+		Type:      session.EventTool,
+		At:        s.now(),
+		Actor:     "tool",
+		Text:      message,
+		Payload: map[string]any{
+			"call_id":   call.ID,
+			"name":      call.Name,
+			"arguments": string(call.Arguments),
+			"error":     message,
+			"skipped":   true,
+			"state":     "skipped",
+		},
 	})
 }
 
@@ -2639,12 +2859,14 @@ func approvalFromToolEvent(number int, event session.Event) (Item, bool) {
 		Title: fmt.Sprintf("Approve %s: %s", action, subject),
 		Body:  strings.TrimSpace(event.Text),
 		Meta: map[string]string{
-			"action":          string(action),
-			"subject":         subject,
-			"reason":          reason,
-			"state":           "pending",
-			"tool_call_name":  name,
-			"tool_call_error": errText,
+			"action":              string(action),
+			"subject":             subject,
+			"reason":              reason,
+			"state":               "pending",
+			"tool_call_id":        firstNonEmpty(stringValue(event.Payload["call_id"]), stringValue(event.Payload["tool_call_id"]), stringValue(event.Payload["id"])),
+			"tool_call_name":      name,
+			"tool_call_error":     errText,
+			"tool_call_arguments": stringValue(event.Payload["arguments"]),
 		},
 	}, true
 }

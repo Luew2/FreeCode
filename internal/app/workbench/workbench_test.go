@@ -596,6 +596,87 @@ func TestServiceLoadsMCPPermissionApproval(t *testing.T) {
 	}
 }
 
+func TestApprovePermissionContinuesBlockedToolCall(t *testing.T) {
+	log := &memoryLog{events: []session.Event{
+		{
+			ID:        "e1",
+			SessionID: "s1",
+			Type:      session.EventAssistantMessage,
+			At:        time.Now(),
+			Actor:     "assistant",
+			Payload: map[string]any{
+				"status": "tool_calls",
+				"tool_calls": []any{
+					map[string]any{"id": "call_1", "name": "mcp_exa_web_search", "arguments": `{"query":"freecode"}`},
+					map[string]any{"id": "call_2", "name": "read_file", "arguments": `{"path":"README.md"}`},
+				},
+			},
+		},
+		{
+			ID:        "e2",
+			SessionID: "s1",
+			Type:      session.EventTool,
+			At:        time.Now(),
+			Actor:     "tool",
+			Text:      "network permission requires approval for mcp_exa_web_search",
+			Payload: map[string]any{
+				"call_id":           "call_1",
+				"name":              "mcp_exa_web_search",
+				"arguments":         `{"query":"freecode"}`,
+				"error":             "network permission requires approval for mcp_exa_web_search",
+				"action":            string(permission.ActionNetwork),
+				"subject":           "mcp_exa_web_search",
+				"reason":            "mcp:exa:web_search:network",
+				"state":             "pending",
+				"approval_required": true,
+			},
+		},
+	}}
+	var continued workbenchContinuationRecord
+	service := &Service{
+		Log:       log,
+		SessionID: "s1",
+		Approval:  NewApprovalGate(permission.ModeAsk),
+	}
+	service.ContinueApproval = func(ctx context.Context, request ApprovalContinuationRequest) error {
+		continued.called = true
+		continued.request = request
+		calls, err := service.ApprovalContinuationToolCalls(ctx, request.Item)
+		continued.calls = calls
+		return err
+	}
+
+	state, err := service.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(state.Approvals) != 1 {
+		t.Fatalf("approvals = %#v, want one pending approval", state.Approvals)
+	}
+	state, err = service.Approve(context.Background(), state.Approvals[0].ID)
+	if err != nil {
+		t.Fatalf("Approve returned error: %v", err)
+	}
+	if !continued.called {
+		t.Fatalf("ContinueApproval was not called")
+	}
+	if continued.request.Permission.Action != permission.ActionNetwork || continued.request.Permission.Subject != "mcp_exa_web_search" {
+		t.Fatalf("continuation request = %#v, want exact network permission", continued.request)
+	}
+	if len(continued.calls) != 2 || continued.calls[0].ID != "call_1" || continued.calls[1].ID != "call_2" {
+		t.Fatalf("continuation calls = %#v, want blocked call plus skipped sibling", continued.calls)
+	}
+	if state.Notice != "approved u1 and resumed" {
+		t.Fatalf("notice = %q, want resumed notice", state.Notice)
+	}
+}
+
+type workbenchContinuationRecord struct {
+	called  bool
+	request ApprovalContinuationRequest
+	calls   []model.ToolCall
+}
+
 func TestSubmitPromptReturnsApprovalStateWithoutError(t *testing.T) {
 	log := &memoryLog{events: []session.Event{{
 		ID:        "e1",

@@ -86,6 +86,58 @@ func TestLoadMessageHistoryReplaysUserAssistantToolGroup(t *testing.T) {
 	}
 }
 
+func TestLoadMessageHistorySkipsPendingApprovalAndSkippedToolEvents(t *testing.T) {
+	log := &fakeLog{}
+	now := time.Now()
+	sessionID := session.ID("s1")
+	events := []session.Event{
+		{ID: "e1", SessionID: sessionID, Type: session.EventUserMessage, At: now, Actor: "user", Text: "search with exa"},
+		{ID: "e2", SessionID: sessionID, Type: session.EventAssistantMessage, At: now, Actor: "assistant", Payload: map[string]any{
+			"step":   1,
+			"status": "tool_calls",
+			"tool_calls": []any{
+				map[string]any{"id": "call_1", "name": "mcp_exa_web_search", "arguments": `{"query":"freecode"}`},
+				map[string]any{"id": "call_2", "name": "read_file", "arguments": `{"path":"README.md"}`},
+			},
+		}},
+		{ID: "e3", SessionID: sessionID, Type: session.EventTool, At: now, Actor: "tool", Text: "network permission requires approval", Payload: map[string]any{
+			"call_id":           "call_1",
+			"name":              "mcp_exa_web_search",
+			"approval_required": true,
+		}},
+		{ID: "e4", SessionID: sessionID, Type: session.EventTool, At: now, Actor: "tool", Text: "read_file was not run because mcp_exa_web_search is waiting for approval", Payload: map[string]any{
+			"call_id": "call_2",
+			"name":    "read_file",
+			"skipped": true,
+		}},
+		{ID: "e5", SessionID: sessionID, Type: session.EventTool, At: now, Actor: "tool", Text: "exa result", Payload: map[string]any{
+			"call_id": "call_1",
+			"name":    "mcp_exa_web_search",
+		}},
+		{ID: "e6", SessionID: sessionID, Type: session.EventTool, At: now, Actor: "tool", Text: "readme result", Payload: map[string]any{
+			"call_id": "call_2",
+			"name":    "read_file",
+		}},
+	}
+	for _, e := range events {
+		_ = log.Append(context.Background(), e)
+	}
+
+	got, err := LoadMessageHistory(context.Background(), log, sessionID)
+	if err != nil {
+		t.Fatalf("LoadMessageHistory returned error: %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("messages = %#v, want user + assistant + 2 final tool results", got)
+	}
+	if got[2].Role != model.RoleTool || got[2].ToolCallID != "call_1" || got[2].Content[0].Text != "exa result" {
+		t.Fatalf("first tool result = %#v, want resumed exa result", got[2])
+	}
+	if got[3].Role != model.RoleTool || got[3].ToolCallID != "call_2" || got[3].Content[0].Text != "readme result" {
+		t.Fatalf("second tool result = %#v, want resumed read_file result", got[3])
+	}
+}
+
 func TestLoadMessageHistorySkipsReasoningAssistantEvents(t *testing.T) {
 	log := &fakeLog{}
 	now := time.Now()

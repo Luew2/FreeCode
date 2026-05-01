@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -265,6 +266,9 @@ func (r *Runtime) Workbench(ctx context.Context) (*workbench.Service, error) {
 	service.Submit = func(ctx context.Context, request workbench.SubmitRequest) error {
 		return r.submit(ctx, service, request)
 	}
+	service.ContinueApproval = func(ctx context.Context, request workbench.ApprovalContinuationRequest) error {
+		return r.continueApproval(ctx, service, request)
+	}
 	return service, nil
 }
 
@@ -357,6 +361,72 @@ func (r *Runtime) submit(ctx context.Context, service *workbench.Service, reques
 		TurnContext:    request.TurnContext,
 		IncludeHistory: true,
 	})
+}
+
+func (r *Runtime) continueApproval(ctx context.Context, service *workbench.Service, request workbench.ApprovalContinuationRequest) error {
+	if service == nil {
+		return fmt.Errorf("workbench service is not configured")
+	}
+	calls, err := service.ApprovalContinuationToolCalls(ctx, request.Item)
+	if err != nil {
+		return err
+	}
+	if len(calls) == 0 {
+		return fmt.Errorf("approval %s has no resumable tool call", request.ApprovalID)
+	}
+	tools := r.currentToolsForApproval(r.ApprovalMode())
+	parentID := "main"
+	if request.Target.Kind == "agent" && strings.TrimSpace(request.Target.ID) != "" {
+		parentID = request.Target.ID
+	}
+	tools, err = r.withDelegationTools(ctx, service.Log, service.SessionID, r.ApprovalMode(), parentID, tools)
+	if err != nil {
+		return err
+	}
+	for i, call := range calls {
+		result, runErr := tools.RunTool(ctx, call)
+		if runErr != nil {
+			if logErr := service.LogToolError(ctx, call, runErr); logErr != nil {
+				return logErr
+			}
+			if errors.Is(runErr, permission.ErrApprovalRequired) {
+				for _, skipped := range calls[i+1:] {
+					if logErr := service.LogToolSkipped(ctx, skipped, call.Name); logErr != nil {
+						return logErr
+					}
+				}
+				return commands.ErrApprovalRequired
+			}
+			return runErr
+		}
+		if err := service.LogToolResult(ctx, call, result); err != nil {
+			return err
+		}
+	}
+	deps, err := r.askDependencies(ctx, tools, service.Log)
+	if err != nil {
+		return err
+	}
+	_, err = commands.ContinueAfterApproval(ctx, io.Discard, deps, commands.ContinueOptions{
+		SessionID:   string(service.SessionID),
+		TurnContext: approvalContinuationContext(request),
+	})
+	return err
+}
+
+func approvalContinuationContext(request workbench.ApprovalContinuationRequest) string {
+	parts := []string{"Approval continuation:"}
+	if request.Permission.Action != "" {
+		parts = append(parts, "approved action: "+string(request.Permission.Action))
+	}
+	if strings.TrimSpace(request.Permission.Subject) != "" {
+		parts = append(parts, "approved subject: "+request.Permission.Subject)
+	}
+	if strings.TrimSpace(request.Permission.Reason) != "" {
+		parts = append(parts, "approved reason: "+request.Permission.Reason)
+	}
+	parts = append(parts, "The approved tool call has been executed. Continue the outstanding user request from the new tool output.")
+	return strings.Join(parts, "\n")
 }
 
 func (r *Runtime) askDependencies(ctx context.Context, tools ports.ToolRegistry, eventLog ports.EventLog) (commands.AskDependencies, error) {

@@ -60,6 +60,17 @@ type Request struct {
 	PriorMessages []model.Message
 }
 
+type ContinueRequest struct {
+	SessionID      session.ID
+	Model          model.Ref
+	Environment    prompt.Environment
+	MaxSteps       int
+	SessionContext string
+	TurnContext    string
+	ContextBudget  contextmgr.Budget
+	PriorMessages  []model.Message
+}
+
 type Response struct {
 	Text      string
 	Steps     int
@@ -92,6 +103,58 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 		return Response{}, err
 	}
 
+	return r.runMessageLoop(ctx, loopRequest{
+		SessionID:     request.SessionID,
+		Model:         request.Model,
+		Messages:      messages,
+		MaxSteps:      maxSteps,
+		ContextBudget: request.ContextBudget,
+		Sequence:      sequence,
+	})
+}
+
+func (r Runner) Continue(ctx context.Context, request ContinueRequest) (Response, error) {
+	if r.Model == nil {
+		return Response{}, errors.New("model client is required")
+	}
+	if request.Model == (model.Ref{}) {
+		return Response{}, errors.New("model ref is required")
+	}
+	if len(request.PriorMessages) == 0 {
+		return Response{}, errors.New("prior messages are required")
+	}
+
+	maxSteps := request.MaxSteps
+	if maxSteps <= 0 {
+		maxSteps = DefaultMaxSteps
+	}
+
+	builder := r.Prompt
+	if builder == (prompt.Builder{}) {
+		builder = prompt.NewBuilder()
+	}
+	messages := buildContinuationMessages(builder, request)
+	return r.runMessageLoop(ctx, loopRequest{
+		SessionID:     request.SessionID,
+		Model:         request.Model,
+		Messages:      messages,
+		MaxSteps:      maxSteps,
+		ContextBudget: request.ContextBudget,
+	})
+}
+
+type loopRequest struct {
+	SessionID     session.ID
+	Model         model.Ref
+	Messages      []model.Message
+	MaxSteps      int
+	ContextBudget contextmgr.Budget
+	Sequence      int
+}
+
+func (r Runner) runMessageLoop(ctx context.Context, request loopRequest) (Response, error) {
+	messages := request.Messages
+	sequence := request.Sequence
 	var totalToolCalls int
 	// Tool-followthrough can only fire once per Run. The heuristic is a
 	// nudge, not a contract: if the model produces a "I'll check..." style
@@ -108,7 +171,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 	// After the forced turn we drop back to default (auto) regardless.
 	forceToolNextTurn := false
 	emptyRetries := 0
-	for step := 1; step <= maxSteps; step++ {
+	for step := 1; step <= request.MaxSteps; step++ {
 		tools := r.toolSpecs()
 		prepared, err := contextmgr.Prepare(messages, tools, request.ContextBudget)
 		if err != nil {
@@ -180,7 +243,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 			// progressively stronger nudge before accepting the empty
 			// outcome. This keeps the agent from quietly giving up after
 			// a single transient hiccup.
-			if text == "" && emptyRetries < maxEmptyRetries && step < maxSteps {
+			if text == "" && emptyRetries < maxEmptyRetries && step < request.MaxSteps {
 				emptyRetries++
 				notice := fmt.Sprintf("model returned empty response, retrying %d/%d", emptyRetries, maxEmptyRetries)
 				if hint := diagnosticHint(turn.diagnostics); hint != "" {
@@ -238,7 +301,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 				}
 				continue
 			}
-			if !followThroughFired && needsToolFollowThrough(text, tools) && step < maxSteps {
+			if !followThroughFired && needsToolFollowThrough(text, tools) && step < request.MaxSteps {
 				if err := r.append(ctx, request.SessionID, &sequence, session.EventAssistantMessage, "assistant", text, assistantMessagePayload(step, "needs_tool_followthrough", nil)); err != nil {
 					return Response{}, err
 				}
@@ -285,8 +348,8 @@ func (r Runner) Run(ctx context.Context, request Request) (Response, error) {
 		}
 	}
 
-	err := fmt.Errorf("agent stopped after %d steps without final response", maxSteps)
-	_ = r.append(ctx, request.SessionID, &sequence, session.EventError, "orchestrator", err.Error(), map[string]any{"max_steps": maxSteps})
+	err := fmt.Errorf("agent stopped after %d steps without final response", request.MaxSteps)
+	_ = r.append(ctx, request.SessionID, &sequence, session.EventError, "orchestrator", err.Error(), map[string]any{"max_steps": request.MaxSteps})
 	return Response{}, err
 }
 
@@ -684,6 +747,19 @@ func buildInitialMessages(builder prompt.Builder, request Request) []model.Messa
 	merged = append(merged, request.PriorMessages...)
 	merged = append(merged, scaffold[insertAt:]...)
 	return withSessionContext(merged, combined)
+}
+
+func buildContinuationMessages(builder prompt.Builder, request ContinueRequest) []model.Message {
+	scaffold := builder.Build(request.Environment, "Continue after the approved tool call.")
+	if len(scaffold) > 0 && scaffold[len(scaffold)-1].Role == model.RoleUser {
+		scaffold = scaffold[:len(scaffold)-1]
+	}
+	messages := make([]model.Message, 0, len(scaffold)+len(request.PriorMessages)+2)
+	messages = append(messages, scaffold...)
+	messages = append(messages, request.PriorMessages...)
+	messages = withSessionContext(messages, combinedContext(request.SessionContext, request.TurnContext))
+	messages = append(messages, model.TextMessage(model.RoleDeveloper, "A previously blocked tool call has now been approved and its tool result has been recorded in the conversation. Continue the outstanding user request from the latest tool result. Do not ask the user to resend the request."))
+	return messages
 }
 
 func assistantMessagePayload(step int, status string, toolCalls []model.ToolCall) map[string]any {

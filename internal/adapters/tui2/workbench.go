@@ -3539,7 +3539,7 @@ func (m model) approveSelected() (tea.Model, tea.Cmd) {
 		m.state.Notice = "no pending approval"
 		return m, nil
 	}
-	return m.runAction(func(ctx context.Context) (workbench.State, error) {
+	return m.runStreamingAction(func(ctx context.Context) (workbench.State, error) {
 		return m.controller.Approve(ctx, approval.ID)
 	})
 }
@@ -3555,7 +3555,7 @@ func (m model) approveRef(arg string) (tea.Model, tea.Cmd) {
 		m.state.Notice = "no matching pending approvals for " + arg
 		return m, nil
 	}
-	return m.runAction(func(ctx context.Context) (workbench.State, error) {
+	return m.runStreamingAction(func(ctx context.Context) (workbench.State, error) {
 		var last workbench.State
 		var err error
 		for _, id := range ids {
@@ -3614,6 +3614,19 @@ func (m model) runAction(fn func(context.Context) (workbench.State, error)) (tea
 	m.overlay = overlayNone
 	m = m.startRun()
 	return m, m.actionCmd(m.activeRun, fn)
+}
+
+func (m model) runStreamingAction(fn func(context.Context) (workbench.State, error)) (tea.Model, tea.Cmd) {
+	if m.busy {
+		m.state.Notice = "agent is still running; wait for the current action to finish"
+		return m, nil
+	}
+	m.mode = modeNormal
+	m.overlay = overlayNone
+	m = m.startRun()
+	m.followTranscript = true
+	runID := m.activeRun
+	return m, tea.Batch(m.actionCmd(runID, fn), streamTickCmd(runID))
 }
 
 func (m model) runMCPAction(action string) (tea.Model, tea.Cmd) {
