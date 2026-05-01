@@ -105,8 +105,8 @@ func TestChatRendererScrollDoesNotMoveSelectionAndGRestoresFollow(t *testing.T) 
 	}
 	chat.SetItems(items)
 	chat.LineUp(3)
-	if id, _ := chat.SelectedID(); id != "m10" {
-		t.Fatalf("selected = %q, want scroll without selection move", id)
+	if id, _ := chat.SelectedID(); id == "m10" {
+		t.Fatalf("selected = %q, want selection to follow visible scrolled messages", id)
 	}
 	if chat.follow {
 		t.Fatalf("follow = true after manual scroll, want false")
@@ -114,6 +114,56 @@ func TestChatRendererScrollDoesNotMoveSelectionAndGRestoresFollow(t *testing.T) 
 	chat.Bottom()
 	if id, _ := chat.SelectedID(); id != "m10" || !chat.follow || !chat.IsAtBottom() {
 		t.Fatalf("bottom selected/follow/atBottom = %q/%v/%v", id, chat.follow, chat.IsAtBottom())
+	}
+}
+
+func TestChatRendererSmartMoveScrollsLongSelectedMessageGradually(t *testing.T) {
+	chat := newChatRenderer(54, 6)
+	chat.SetItems([]workbench.TranscriptItem{{
+		ID:    "m1",
+		Kind:  workbench.TranscriptAssistant,
+		Actor: "assistant",
+		Text:  strings.Repeat("this is a long selected message with enough words to wrap and fill many rows. ", 12),
+	}})
+
+	chat.Top()
+	chat.SmartMove(1)
+	firstOffset := chat.yOffset
+	if firstOffset <= 0 {
+		t.Fatalf("first smart move yOffset = %d, want scroll within long message", firstOffset)
+	}
+	_, end := chat.selectedLineRange()
+	bottomOffset := max(0, end-chat.height+1)
+	if firstOffset >= bottomOffset {
+		t.Fatalf("first smart move jumped to bottom offset %d; want gradual scroll below %d", firstOffset, bottomOffset)
+	}
+	if id, _ := chat.SelectedID(); id != "m1" {
+		t.Fatalf("selected = %q, want same long message while scrolling within it", id)
+	}
+	if clean := stripANSI(chat.View()); !strings.Contains(clean, "▌") {
+		t.Fatalf("selected long message lacks visible gutter:\n%s", clean)
+	}
+}
+
+func TestChatRendererLineScrollKeepsSelectedCellVisible(t *testing.T) {
+	chat := newChatRenderer(40, 4)
+	var items []workbench.TranscriptItem
+	for i := 1; i <= 8; i++ {
+		items = append(items, workbench.TranscriptItem{
+			ID:    fmt.Sprintf("m%d", i),
+			Kind:  workbench.TranscriptAssistant,
+			Actor: "assistant",
+			Text:  "line",
+		})
+	}
+	chat.SetItems(items)
+	chat.LineUp(6)
+	start, end := chat.selectedLineRange()
+	if end < chat.yOffset || start >= chat.yOffset+chat.height {
+		t.Fatalf("selected range %d-%d not visible in viewport %d-%d", start, end, chat.yOffset, chat.yOffset+chat.height)
+	}
+	if clean := stripANSI(chat.View()); !strings.Contains(clean, "▌") {
+		t.Fatalf("visible chat lacks selected gutter:\n%s", clean)
 	}
 }
 

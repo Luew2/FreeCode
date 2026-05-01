@@ -117,21 +117,22 @@ func (c *chatRenderer) SmartMove(delta int) {
 		return
 	}
 	start, end := c.selectedLineRange()
+	maxOffset := max(0, c.totalLineCount()-c.height)
 	switch {
 	case delta < 0:
 		// Going up: if the start of the selected cell is above the viewport,
-		// scroll the viewport up by a step instead of moving selection.
+		// scroll the viewport up by a small step instead of moving selection.
 		if start < c.yOffset {
-			c.yOffset = max(0, c.yOffset-3)
+			c.yOffset = max(start, c.yOffset-3)
 			c.follow = false
 			c.clampOffset()
 			return
 		}
 	case delta > 0:
 		// Going down: if the end of the selected cell is below the viewport,
-		// scroll down instead of moving selection.
+		// scroll down by a small step instead of jumping to the cell edge.
 		if end >= c.yOffset+c.height {
-			c.yOffset = min(end-c.height+1, max(0, c.totalLineCount()-c.height))
+			c.yOffset = min(maxOffset, min(end-c.height+1, c.yOffset+3))
 			c.follow = false
 			c.clampOffset()
 			return
@@ -144,12 +145,14 @@ func (c *chatRenderer) LineDown(n int) {
 	c.yOffset += max(1, n)
 	c.follow = false
 	c.clampOffset()
+	c.selectVisibleIfHidden(true)
 }
 
 func (c *chatRenderer) LineUp(n int) {
 	c.yOffset -= max(1, n)
 	c.follow = false
 	c.clampOffset()
+	c.selectVisibleIfHidden(false)
 }
 
 func (c *chatRenderer) PageDown() {
@@ -407,15 +410,15 @@ func chatGutter(item workbench.TranscriptItem, selected bool) string {
 	if selected {
 		gutter = "▌ "
 	}
+	if selected {
+		return selectedStyle.Render(gutter)
+	}
 	switch item.Kind {
 	case workbench.TranscriptError:
 		return errorStyle.Render(gutter)
 	case workbench.TranscriptTool, workbench.TranscriptPatch, workbench.TranscriptShell, workbench.TranscriptAgent, workbench.TranscriptContext, workbench.TranscriptThinking:
 		return mutedStyle.Render(gutter)
 	default:
-		if selected {
-			return selectedStyle.Render(gutter)
-		}
 		return gutter
 	}
 }
@@ -474,10 +477,46 @@ func (c *chatRenderer) selectedLineRange() (int, int) {
 	c.ensureLayout()
 	for _, cell := range c.layout {
 		if cell.index == c.selected {
-			return cell.start, max(cell.start, cell.end-1)
+			start := cell.start
+			if len(cell.lines) > 0 && strings.TrimSpace(xansi.Strip(cell.lines[0])) == "" {
+				start++
+			}
+			return start, max(start, cell.end-1)
 		}
 	}
 	return 0, 0
+}
+
+func (c *chatRenderer) selectVisibleIfHidden(preferBottom bool) {
+	if len(c.items) == 0 {
+		return
+	}
+	start, end := c.selectedLineRange()
+	viewStart := c.yOffset
+	viewEnd := c.yOffset + c.height
+	if end >= viewStart && start < viewEnd {
+		return
+	}
+	c.ensureLayout()
+	chosen := -1
+	for _, cell := range c.layout {
+		cellStart := cell.start
+		if len(cell.lines) > 0 && strings.TrimSpace(xansi.Strip(cell.lines[0])) == "" {
+			cellStart++
+		}
+		cellEnd := max(cellStart, cell.end-1)
+		if cellEnd < viewStart || cellStart >= viewEnd {
+			continue
+		}
+		chosen = cell.index
+		if !preferBottom {
+			break
+		}
+	}
+	if chosen >= 0 && chosen != c.selected {
+		c.selected = chosen
+		c.invalidateLayout()
+	}
 }
 
 func (c *chatRenderer) scrollToBottom() {

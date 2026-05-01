@@ -1891,6 +1891,32 @@ func TestCommandCompletionCompletesCommandsFilesAndSessions(t *testing.T) {
 	}
 }
 
+func TestTutorialCommandOpensGameAndScoresExpectedKey(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+
+	next, cmd := m.executeLine(":tutorial")
+	if cmd != nil {
+		t.Fatalf(":tutorial returned cmd, want local overlay only")
+	}
+	m = next.(model)
+	if m.overlay != overlayTutorial {
+		t.Fatalf("overlay = %v, want tutorial", m.overlay)
+	}
+	if view := stripANSI(m.View()); !strings.Contains(view, "FreeCode Tutorial") || !strings.Contains(view, "Mission 1") {
+		t.Fatalf("tutorial view missing expected content:\n%s", view)
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	m = next.(model)
+	if !m.tutorial.completed["prompt.insert"] {
+		t.Fatalf("tutorial did not mark prompt.insert complete")
+	}
+	if m.tutorial.step != 1 {
+		t.Fatalf("tutorial step = %d, want 1 after passing first mission", m.tutorial.step)
+	}
+}
+
 func sendRunes(t *testing.T, m model, value string) model {
 	t.Helper()
 	for _, r := range value {

@@ -584,7 +584,7 @@ func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
 	for _, command := range registry.Palette("") {
 		seen[command.ID] = command
 	}
-	for _, id := range []string{"item.copy", "item.copy.full", "item.copy.select", "mouse.toggle", "tab.ops", "terminal.share_output", "buffer.list", "model.list", "mcp.status", "mcp.tools", "mcp.reload", "mcp.doctor"} {
+	for _, id := range []string{"item.copy", "item.copy.full", "item.copy.select", "mouse.toggle", "tab.ops", "terminal.share_output", "buffer.list", "model.list", "mcp.status", "mcp.tools", "mcp.reload", "mcp.doctor", "help.tutorial"} {
 		if _, ok := seen[id]; !ok {
 			t.Fatalf("palette missing %s", id)
 		}
@@ -615,6 +615,9 @@ func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
 	}
 	if invocation, ok := registry.ResolveLine(":mcp tools"); !ok || invocation.ID != "mcp.tools" {
 		t.Fatalf("ResolveLine :mcp tools = %#v/%v", invocation, ok)
+	}
+	if invocation, ok := registry.ResolveLine(":tutorial"); !ok || invocation.ID != "help.tutorial" {
+		t.Fatalf("ResolveLine :tutorial = %#v/%v", invocation, ok)
 	}
 }
 

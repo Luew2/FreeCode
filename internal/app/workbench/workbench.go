@@ -2232,6 +2232,7 @@ func DefaultCommands() []Command {
 		command("model.use", "Use model", "Provider", "Switch active provider/model.", ":use <model>", "model", "provider", "switch", "use"),
 		command("settings.open", "Settings", "Provider", "Show provider, model, approval, and editor settings.", ":settings", "settings", "provider", "model", "editor"),
 		command("palette.open", "Command palette", "Help", "Open searchable commands and tutorial shortcuts.", "Ctrl+K", "help", "commands", "cheat sheet"),
+		command("help.tutorial", "Tutorial game", "Help", "Play a guided keybinding tutorial built from the command registry.", ":tutorial/:tutor", "tutorial", "training", "onboarding", "game", "keybindings"),
 		command("quit", "Quit", "Help", "Exit FreeCode.", "q", "quit", "exit"),
 	}
 	plainSyntax := map[string]string{

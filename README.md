@@ -36,6 +36,7 @@ Useful TUI shortcuts:
 i                   enter prompt composer
 Enter               focus chat; open/collapse folders; edit files; in Git tab, show diff
 Ctrl+K / ?          open searchable command palette and cheat sheet
+:tutorial           open the guided keybinding tutorial game
 j/k                 move selection
 Ctrl+E/Ctrl+Y       scroll one line down/up in the focused view
 Ctrl+D/Ctrl+U       scroll half-page down/up in chat

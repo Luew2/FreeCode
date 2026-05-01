@@ -151,6 +151,7 @@ const (
 	overlayApproval
 	overlayDetail
 	overlayCopy
+	overlayTutorial
 )
 
 // queuedSubmit captures a user prompt that arrived while a turn was already
@@ -202,6 +203,7 @@ type model struct {
 	sharedTermSlot int
 	terminalShared bool
 	overlay        overlayKind
+	tutorial       tutorialGame
 
 	detailPending    bool
 	followTranscript bool
@@ -496,12 +498,20 @@ func (m model) handleTerminalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if m.overlay == overlayDetail || m.overlay == overlayCopy {
+	if m.overlay == overlayDetail || m.overlay == overlayCopy || m.overlay == overlayTutorial {
 		switch msg.Type {
 		case tea.MouseWheelUp:
-			m.detail.LineUp(3)
+			if m.overlay == overlayTutorial {
+				m.tutorial.Move(-1)
+			} else {
+				m.detail.LineUp(3)
+			}
 		case tea.MouseWheelDown:
-			m.detail.LineDown(3)
+			if m.overlay == overlayTutorial {
+				m.tutorial.Move(1)
+			} else {
+				m.detail.LineDown(3)
+			}
 		}
 		return m, nil
 	}
@@ -542,6 +552,9 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	if m.overlay == overlayDetail || m.overlay == overlayCopy {
 		return m.handleDetailOverlayKey(key)
+	}
+	if m.overlay == overlayTutorial {
+		return m.handleTutorialKey(key)
 	}
 	if m.pendingKey == "g" {
 		m.pendingKey = ""
@@ -1041,6 +1054,8 @@ func (m model) View() string {
 		return placeOverlay(view, m.detailOverlayView(), m.width, m.height)
 	case overlayCopy:
 		return placeOverlay(view, m.copyOverlayView(), m.width, m.height)
+	case overlayTutorial:
+		return placeOverlay(view, m.tutorialView(), m.width, m.height)
 	default:
 		return view
 	}
@@ -1209,7 +1224,7 @@ func (m model) noticeView() string {
 		notice = pending
 	}
 	if notice == "" {
-		notice = "j/k move  Ctrl+E/Y scroll  Ctrl+H/L panes  h/l local  Enter activate  :s swarm  :! shell  :term terminal  :ops ops  d detail  y copy  v visual  m mouse  q quit"
+		notice = "j/k move  Ctrl+E/Y scroll  Ctrl+H/L panes  h/l local  Enter activate  :s swarm  :! shell  :term terminal  :ops ops  :tutorial learn  d detail  y copy  v visual  m mouse  q quit"
 	}
 	return noticeStyle.Width(m.width).Render(truncate(notice, m.width-2))
 }
@@ -1822,6 +1837,8 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "palette.open":
 		return m.openPalette(), nil
+	case "help.tutorial":
+		return m.openTutorial(), nil
 	case "session.list", "workspace.sessions":
 		return m.showSessions()
 	case "session.new", "workspace.new":
@@ -2095,6 +2112,8 @@ func (m model) executeInvocation(invocation workbench.CommandInvocation) (tea.Mo
 		return next, cmd, true
 	case "palette.open":
 		return m.openPalette(), nil, true
+	case "help.tutorial":
+		return m.openTutorial(), nil, true
 	case "conversation.main":
 		next, cmd := m.activateMainConversation()
 		return next, cmd, true
