@@ -29,6 +29,50 @@ func TestChatRendererSpacingAndSanitization(t *testing.T) {
 	}
 }
 
+func TestChatRendererCollapsesExcessBodyBlankLines(t *testing.T) {
+	chat := newChatRenderer(60, 20)
+	chat.SetItems([]workbench.TranscriptItem{{
+		ID:    "m1",
+		Kind:  workbench.TranscriptAssistant,
+		Actor: "assistant",
+		Text:  "first\r\n\r\n\r\n\r\nsecond",
+	}})
+
+	view := stripANSI(chat.View())
+	if !strings.Contains(view, "first\n▌ \n▌ second") {
+		t.Fatalf("view does not preserve a readable paragraph break:\n%s", view)
+	}
+	blankRun := 0
+	for _, line := range strings.Split(view, "\n") {
+		if strings.TrimSpace(line) == "" {
+			blankRun++
+			if blankRun > 1 {
+				t.Fatalf("view has excessive blank lines:\n%s", view)
+			}
+			continue
+		}
+		blankRun = 0
+	}
+}
+
+func TestChatRendererCollapsesBareCarriageReturnProgress(t *testing.T) {
+	chat := newChatRenderer(60, 20)
+	chat.SetItems([]workbench.TranscriptItem{{
+		ID:    "m1",
+		Kind:  workbench.TranscriptShell,
+		Actor: "local",
+		Text:  "download 10%\rdownload 20%\rdownload complete",
+	}})
+
+	view := stripANSI(chat.View())
+	if strings.Contains(view, "10%") || strings.Contains(view, "20%") {
+		t.Fatalf("view should collapse overwritten carriage-return progress:\n%s", view)
+	}
+	if !strings.Contains(view, "download complete") {
+		t.Fatalf("view missing final progress line:\n%s", view)
+	}
+}
+
 func TestChatRendererWrapsToWidth(t *testing.T) {
 	chat := newChatRenderer(28, 20)
 	chat.SetItems([]workbench.TranscriptItem{{

@@ -292,7 +292,7 @@ func (c *chatRenderer) renderBody(item workbench.TranscriptItem, width int) []st
 		line = strings.TrimRight(line, " ")
 		lines = append(lines, hardWrapToWidth(line, width)...)
 	}
-	return trimOuterBlankLines(lines)
+	return normalizeChatBodyLines(lines)
 }
 
 // hardWrapToWidth wraps a single line to width, falling back to a hard break
@@ -588,4 +588,26 @@ func trimOuterBlankLines(lines []string) []string {
 		end--
 	}
 	return lines[start:end]
+}
+
+func normalizeChatBodyLines(lines []string) []string {
+	lines = trimOuterBlankLines(lines)
+	if len(lines) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(lines))
+	blank := false
+	for _, line := range lines {
+		if strings.TrimSpace(xansi.Strip(line)) == "" {
+			if blank {
+				continue
+			}
+			out = append(out, "")
+			blank = true
+			continue
+		}
+		out = append(out, line)
+		blank = false
+	}
+	return out
 }

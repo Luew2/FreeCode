@@ -223,6 +223,12 @@ type actionMsg struct {
 	runID int
 }
 
+type stateUpdateMsg struct {
+	state workbench.State
+	err   error
+	runID int
+}
+
 type loadMsg struct {
 	state workbench.State
 	err   error
@@ -383,6 +389,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(fireCmd, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus))
 			}
 		}
+		return m, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus)
+	case stateUpdateMsg:
+		prevMode, prevOverlay, prevFocus := m.mode, m.overlay, m.focus
+		prevRightTab := m.activeRightTab()
+		if msg.err != nil {
+			m.state.Notice = "error: " + msg.err.Error()
+			return m, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus)
+		}
+		if msg.runID != 0 && (!m.busy || msg.runID != m.activeRun) {
+			runID := 0
+			if m.busy {
+				runID = m.activeRun
+			}
+			return m, tea.Batch(m.loadCmd(runID), m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus))
+		}
+		m.state = preserveRightTab(msg.state, prevRightTab)
+		m.clampCursors()
+		m.syncViewports()
 		return m, m.repaintIfStructureChanged(prevMode, prevOverlay, prevFocus)
 	case loadMsg:
 		if msg.runID != 0 && msg.runID != m.activeRun {
@@ -1788,17 +1812,11 @@ func (m model) executeCommand(id string) (tea.Model, tea.Cmd) {
 	case "approval.reject":
 		return m.rejectSelected()
 	case "approval.read_only":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeReadOnly)
-		})
+		return m.setApprovalMode(permission.ModeReadOnly)
 	case "approval.ask":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAsk)
-		})
+		return m.setApprovalMode(permission.ModeAsk)
 	case "approval.auto":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAuto)
-		})
+		return m.setApprovalMode(permission.ModeAuto)
 	case "approval.danger":
 		m.state.Notice = "type :danger confirm to enable danger mode"
 		return m, nil
@@ -2038,26 +2056,18 @@ func (m model) executeLine(line string) (tea.Model, tea.Cmd) {
 			m.state.Notice = fmt.Sprintf("cancelled %d queued prompt(s)", dropped)
 		}
 		return m, nil
-	case line == ":approval auto":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAuto)
-		})
-	case line == ":approval ask":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAsk)
-		})
-	case line == ":approval read-only":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeReadOnly)
-		})
+	case line == ":approval auto" || line == ":a auto":
+		return m.setApprovalMode(permission.ModeAuto)
+	case line == ":approval ask" || line == ":a ask":
+		return m.setApprovalMode(permission.ModeAsk)
+	case line == ":approval read-only" || line == ":approval readonly" || line == ":a read-only" || line == ":a readonly" || line == ":a ro":
+		return m.setApprovalMode(permission.ModeReadOnly)
 	case line == ":danger" || line == ":approval danger":
 		m.mode = modeNormal
 		m.state.Notice = "type :danger confirm to enable danger mode"
 		return m, nil
 	case line == ":danger confirm":
-		return m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeDanger)
-		})
+		return m.setApprovalMode(permission.ModeDanger)
 	case line == ":w":
 		m.state.Notice = "external Neovim owns file writes"
 		return m, nil
@@ -2231,19 +2241,13 @@ func (m model) executeInvocation(invocation workbench.CommandInvocation) (tea.Mo
 	case "context.cancel":
 		return m.cancelRunAndQueue()
 	case "approval.auto":
-		next, cmd := m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAuto)
-		})
+		next, cmd := m.setApprovalMode(permission.ModeAuto)
 		return next, cmd, true
 	case "approval.ask":
-		next, cmd := m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeAsk)
-		})
+		next, cmd := m.setApprovalMode(permission.ModeAsk)
 		return next, cmd, true
 	case "approval.read_only":
-		next, cmd := m.runAction(func(ctx context.Context) (workbench.State, error) {
-			return m.controller.SetApproval(ctx, permission.ModeReadOnly)
-		})
+		next, cmd := m.setApprovalMode(permission.ModeReadOnly)
 		return next, cmd, true
 	case "diagnostics.doctor":
 		if reporter, ok := m.controller.(diagnosticsReporter); ok {
@@ -2294,7 +2298,25 @@ func (m model) executeInvocation(invocation workbench.CommandInvocation) (tea.Mo
 		}
 		next, cmd := m.switchActiveModel(args)
 		return next, cmd, true
-	case "prompt.insert", "prompt.send", "agent.swarm", "agent.followup", "item.open", "item.detail", "item.copy", "item.copy.full", "approval.approve", "approval.reject":
+	case "approval.approve":
+		if mode, ok := approvalModeFromArg(args); ok {
+			next, cmd := m.setApprovalMode(mode)
+			return next, cmd, true
+		}
+		if args == "" {
+			next, cmd := m.approveSelected()
+			return next, cmd, true
+		}
+		next, cmd := m.approveRef(args)
+		return next, cmd, true
+	case "approval.reject":
+		if args == "" {
+			next, cmd := m.rejectSelected()
+			return next, cmd, true
+		}
+		next, cmd := m.rejectRef(args)
+		return next, cmd, true
+	case "prompt.insert", "prompt.send", "agent.swarm", "agent.followup", "item.open", "item.detail", "item.copy", "item.copy.full":
 		return m, nil, false
 	default:
 		return m, nil, false
@@ -3183,17 +3205,7 @@ func (m model) activateAgentTranscriptItem(item workbench.TranscriptItem) (tea.M
 		return m, nil
 	}
 	target := workbench.ConversationTarget{Kind: "agent", ID: id, Title: firstNonEmpty(item.Title, item.Actor, id)}
-	selector, ok := m.controller.(conversationSelector)
-	if !ok {
-		m.state.ActiveConversation = target
-		m.state.Notice = "conversation: " + target.Title
-		m.focus = focusTranscript
-		return m, nil
-	}
-	m.focus = focusTranscript
-	return m.runAction(func(ctx context.Context) (workbench.State, error) {
-		return selector.SetActiveConversation(ctx, target)
-	})
+	return m.setActiveConversation(target)
 }
 
 func (m model) startConversationComposer() (tea.Model, tea.Cmd) {
@@ -3230,17 +3242,7 @@ func (m model) activateSelectedConversation() (tea.Model, tea.Cmd) {
 		m.state.Notice = "nothing selected"
 		return m, nil
 	}
-	selector, ok := m.controller.(conversationSelector)
-	if !ok {
-		m.state.ActiveConversation = target
-		m.state.Notice = "conversation: " + target.Title
-		m.focus = focusTranscript
-		return m, nil
-	}
-	m.focus = focusTranscript
-	return m.runAction(func(ctx context.Context) (workbench.State, error) {
-		return selector.SetActiveConversation(ctx, target)
-	})
+	return m.setActiveConversation(target)
 }
 
 func (m model) selectedConversationTarget() (workbench.ConversationTarget, bool) {
@@ -3257,15 +3259,25 @@ func (m model) selectedConversationTarget() (workbench.ConversationTarget, bool)
 
 func (m model) activateMainConversation() (tea.Model, tea.Cmd) {
 	target := workbench.ConversationTarget{Kind: "main", ID: "main", Title: "Main orchestrator"}
+	return m.setActiveConversation(target)
+}
+
+func (m model) setActiveConversation(target workbench.ConversationTarget) (tea.Model, tea.Cmd) {
 	selector, ok := m.controller.(conversationSelector)
 	if !ok {
 		m.state.ActiveConversation = target
 		m.state.Notice = "conversation: " + target.Title
+		m.mode = modeNormal
+		m.overlay = overlayNone
 		m.focus = focusTranscript
 		return m, nil
 	}
+	m.state.ActiveConversation = target
+	m.state.Notice = "conversation: " + target.Title
+	m.mode = modeNormal
+	m.overlay = overlayNone
 	m.focus = focusTranscript
-	return m.runAction(func(ctx context.Context) (workbench.State, error) {
+	return m.runStateUpdate(func(ctx context.Context) (workbench.State, error) {
 		return selector.SetActiveConversation(ctx, target)
 	})
 }
@@ -3617,6 +3629,29 @@ func (m model) rejectRef(arg string) (tea.Model, tea.Cmd) {
 	})
 }
 
+func (m model) setApprovalMode(mode permission.Mode) (tea.Model, tea.Cmd) {
+	m.mode = modeNormal
+	m.overlay = overlayNone
+	m.state.Approval = mode
+	m.state.Notice = "approval: " + string(mode)
+	return m.runStateUpdate(func(ctx context.Context) (workbench.State, error) {
+		return m.controller.SetApproval(ctx, mode)
+	})
+}
+
+func approvalModeFromArg(arg string) (permission.Mode, bool) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "auto":
+		return permission.ModeAuto, true
+	case "ask":
+		return permission.ModeAsk, true
+	case "read-only", "readonly", "read_only", "ro":
+		return permission.ModeReadOnly, true
+	default:
+		return "", false
+	}
+}
+
 func (m model) runAction(fn func(context.Context) (workbench.State, error)) (tea.Model, tea.Cmd) {
 	if m.busy {
 		m.state.Notice = "agent is still running; wait for the current action to finish"
@@ -3626,6 +3661,17 @@ func (m model) runAction(fn func(context.Context) (workbench.State, error)) (tea
 	m.overlay = overlayNone
 	m = m.startRun()
 	return m, m.actionCmd(m.activeRun, fn)
+}
+
+func (m model) runStateUpdate(fn func(context.Context) (workbench.State, error)) (tea.Model, tea.Cmd) {
+	runID := 0
+	if m.busy {
+		runID = m.activeRun
+	}
+	return m, func() tea.Msg {
+		state, err := fn(m.ctx)
+		return stateUpdateMsg{state: state, err: err, runID: runID}
+	}
 }
 
 func (m model) runStreamingAction(fn func(context.Context) (workbench.State, error)) (tea.Model, tea.Cmd) {
@@ -4686,6 +4732,8 @@ func sanitizeTerminalText(text string) string {
 	if text == "" {
 		return ""
 	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = collapseBareCarriageReturns(text)
 	text = ansiPattern.ReplaceAllString(text, "")
 	text = oscColorPattern.ReplaceAllString(text, "$1")
 	return strings.Map(func(r rune) rune {
@@ -4697,6 +4745,19 @@ func sanitizeTerminalText(text string) string {
 		}
 		return r
 	}, text)
+}
+
+func collapseBareCarriageReturns(text string) string {
+	if !strings.Contains(text, "\r") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if index := strings.LastIndex(line, "\r"); index >= 0 {
+			lines[i] = line[index+1:]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func placeOverlay(base string, overlay string, width int, height int) string {

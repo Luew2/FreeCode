@@ -52,6 +52,8 @@ type SubmitRequest struct {
 }
 
 type Service struct {
+	mu sync.RWMutex
+
 	Log              ports.EventLog
 	Git              ports.Git
 	Editor           ports.Editor
@@ -871,8 +873,8 @@ func (s *Service) SubmitPrompt(ctx context.Context, request SubmitRequest) (Stat
 	if request.Target.Kind == "" {
 		request.Target = s.activeConversation()
 	}
-	s.ActiveConversation = normalizeConversationTarget(request.Target)
-	request.TurnContext = combineTurnContexts(s.submitTurnContext(ctx, s.ActiveConversation), request.TurnContext)
+	request.Target = s.setActiveConversation(request.Target)
+	request.TurnContext = combineTurnContexts(s.submitTurnContext(ctx, request.Target), request.TurnContext)
 	if err := s.Submit(ctx, request); err != nil {
 		if errors.Is(err, commands.ErrApprovalRequired) {
 			state, loadErr := s.Load(ctx)
@@ -1012,7 +1014,7 @@ func (s *Service) SetActiveConversation(ctx context.Context, target Conversation
 	if target.Kind == "agent" && strings.TrimSpace(target.ID) == "" {
 		return State{}, errors.New("agent conversation requires an id")
 	}
-	s.ActiveConversation = target
+	target = s.setActiveConversation(target)
 	state, err := s.Load(ctx)
 	if err != nil {
 		return State{}, err
@@ -2211,7 +2213,17 @@ func (s *Service) editorState() EditorState {
 }
 
 func (s *Service) activeConversation() ConversationTarget {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return normalizeConversationTarget(s.ActiveConversation)
+}
+
+func (s *Service) setActiveConversation(target ConversationTarget) ConversationTarget {
+	target = normalizeConversationTarget(target)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ActiveConversation = target
+	return target
 }
 
 func normalizeConversationTarget(target ConversationTarget) ConversationTarget {
@@ -2474,7 +2486,7 @@ func DefaultCommands() []Command {
 		"item.detail":           "d/:d p1|m1|a1",
 		"item.copy":             "y c1|m1",
 		"item.copy.full":        "Y c1|m1",
-		"approval.approve":      "a p1",
+		"approval.approve":      "a p1|all, :a auto",
 		"approval.reject":       "r p1",
 	}
 	argKinds := map[string]CommandArgKind{

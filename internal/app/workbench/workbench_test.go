@@ -780,9 +780,10 @@ func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
 	}
 
 	state := State{
-		Files:    []WorkspaceFile{{ID: "f1", Path: "internal/app/workbench/workbench.go"}},
-		Sessions: []SessionSummary{{ID: "session-1"}},
-		Agents:   []AgentItem{{ID: "a1", Name: "worker"}},
+		Files:     []WorkspaceFile{{ID: "f1", Path: "internal/app/workbench/workbench.go"}},
+		Sessions:  []SessionSummary{{ID: "session-1"}},
+		Agents:    []AgentItem{{ID: "a1", Name: "worker"}},
+		Approvals: []ApprovalItem{{ID: "p1", Subject: "README.md"}},
 	}
 	if got, ok := registry.Complete("ed", state); !ok || got != "edit " {
 		t.Fatalf("Complete edit = %q/%v, want edit + space", got, ok)
@@ -796,8 +797,23 @@ func TestCommandRegistryPaletteCompletionAndCopyContract(t *testing.T) {
 	if got, ok := registry.Complete("b wor", state); !ok || got != "b worker" {
 		t.Fatalf("Complete buffer = %q/%v", got, ok)
 	}
+	if got, ok := registry.Complete("a au", state); !ok || got != "a auto" {
+		t.Fatalf("Complete approval mode = %q/%v, want a auto", got, ok)
+	}
+	if got, ok := registry.Complete("a p", state); !ok || got != "a p1" {
+		t.Fatalf("Complete approval id = %q/%v, want a p1", got, ok)
+	}
+	if got, ok := registry.Complete("r au", state); ok {
+		t.Fatalf("Complete reject mode = %q/%v, want no mode completion", got, ok)
+	}
+	if got, ok := registry.Complete("r p", state); !ok || got != "r p1" {
+		t.Fatalf("Complete reject id = %q/%v, want r p1", got, ok)
+	}
 	if invocation, ok := registry.ResolveLine(":mcp tools"); !ok || invocation.ID != "mcp.tools" {
 		t.Fatalf("ResolveLine :mcp tools = %#v/%v", invocation, ok)
+	}
+	if invocation, ok := registry.ResolveLine(":a auto"); !ok || invocation.ID != "approval.approve" || invocation.Args != "auto" {
+		t.Fatalf("ResolveLine :a auto = %#v/%v", invocation, ok)
 	}
 	if invocation, ok := registry.ResolveLine(":tutorial"); !ok || invocation.ID != "help.tutorial" {
 		t.Fatalf("ResolveLine :tutorial = %#v/%v", invocation, ok)

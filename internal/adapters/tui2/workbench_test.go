@@ -226,6 +226,138 @@ func TestBusyQueuesSecondSubmitAndIgnoresStaleAction(t *testing.T) {
 	}
 }
 
+func TestBusyAllowsAgentConversationSwitch(t *testing.T) {
+	controller := &fakeController{state: workbench.State{
+		Approval: permission.ModeAuto,
+		Commands: workbench.DefaultCommands(),
+		Agents: []workbench.AgentItem{{
+			ID:      "a1",
+			Name:    "worker",
+			Role:    "worker",
+			Status:  "running",
+			TaskID:  "task-1",
+			Summary: "editing README",
+		}},
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.busy = true
+	m.activeRun = 9
+	m.actionSeq = 9
+	m.focus = focusAgents
+	m.leftCursor = 1
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("enter on busy agent returned nil cmd, want lightweight conversation switch")
+	}
+	m = next.(model)
+	if !m.busy || m.activeRun != 9 {
+		t.Fatalf("busy/run = %v/%d, want active run preserved", m.busy, m.activeRun)
+	}
+	msg := firstActionMsg(t, cmd)
+	next, _ = m.Update(msg)
+	m = next.(model)
+	if !m.busy || m.activeRun != 9 {
+		t.Fatalf("busy/run after state update = %v/%d, want active run preserved", m.busy, m.activeRun)
+	}
+	if controller.activeConversation.Kind != "agent" || controller.activeConversation.ID != "a1" {
+		t.Fatalf("controller active conversation = %#v, want agent a1", controller.activeConversation)
+	}
+	if m.state.ActiveConversation.Kind != "agent" || m.state.ActiveConversation.ID != "a1" {
+		t.Fatalf("model active conversation = %#v, want agent a1", m.state.ActiveConversation)
+	}
+}
+
+func TestBusyAllowsApprovalModeCommands(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Approval: permission.ModeAsk, Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.busy = true
+	m.activeRun = 4
+	m.actionSeq = 4
+
+	next, cmd := m.executeLine(":approval auto")
+	if cmd == nil {
+		t.Fatalf(":approval auto while busy returned nil cmd")
+	}
+	m = next.(model)
+	if m.state.Approval != permission.ModeAuto || !m.busy {
+		t.Fatalf("immediate approval/busy = %s/%v, want auto and still busy", m.state.Approval, m.busy)
+	}
+	msg := firstActionMsg(t, cmd)
+	next, _ = m.Update(msg)
+	m = next.(model)
+	if controller.state.Approval != permission.ModeAuto || m.state.Approval != permission.ModeAuto {
+		t.Fatalf("approval mode controller/model = %s/%s, want auto", controller.state.Approval, m.state.Approval)
+	}
+	if !m.busy || m.activeRun != 4 {
+		t.Fatalf("busy/run = %v/%d, want active run preserved", m.busy, m.activeRun)
+	}
+}
+
+func TestStaleStateUpdateDoesNotOverwriteCompletedRun(t *testing.T) {
+	oldTranscript := []workbench.TranscriptItem{{ID: "m1", Kind: workbench.TranscriptAssistant, Text: "old"}}
+	newTranscript := []workbench.TranscriptItem{{ID: "m2", Kind: workbench.TranscriptAssistant, Text: "new"}}
+	controller := &fakeController{state: workbench.State{
+		Approval:   permission.ModeAsk,
+		Commands:   workbench.DefaultCommands(),
+		Transcript: oldTranscript,
+	}}
+	m := newModel(context.Background(), controller, controller.state)
+	m.busy = true
+	m.activeRun = 6
+	m.actionSeq = 6
+
+	next, cmd := m.executeLine(":approval auto")
+	if cmd == nil {
+		t.Fatalf(":approval auto returned nil cmd")
+	}
+	stale := firstActionMsg(t, cmd)
+	controller.state.Transcript = newTranscript
+	next, _ = next.(model).Update(actionMsg{
+		runID: 6,
+		state: workbench.State{
+			Approval:   permission.ModeAuto,
+			Commands:   workbench.DefaultCommands(),
+			Transcript: newTranscript,
+			Notice:     "turn done",
+		},
+	})
+	m = next.(model)
+	if got := m.state.Transcript[0].ID; got != "m2" {
+		t.Fatalf("transcript before stale update = %q, want m2", got)
+	}
+
+	next, refreshCmd := m.Update(stale)
+	m = next.(model)
+	if got := m.state.Transcript[0].ID; got != "m2" {
+		t.Fatalf("stale state update overwrote transcript with %q", got)
+	}
+	if refreshCmd == nil {
+		t.Fatalf("stale state update returned nil cmd, want fresh load")
+	}
+	next, _ = m.Update(refreshCmd())
+	m = next.(model)
+	if got := m.state.Transcript[0].ID; got != "m2" {
+		t.Fatalf("fresh load transcript = %q, want m2", got)
+	}
+}
+
+func TestColonASetsApprovalMode(t *testing.T) {
+	controller := &fakeController{state: workbench.State{Approval: permission.ModeAsk, Commands: workbench.DefaultCommands()}}
+	m := newModel(context.Background(), controller, controller.state)
+
+	next, cmd := m.executeLine(":a auto")
+	if cmd == nil {
+		t.Fatalf(":a auto returned nil cmd")
+	}
+	msg := firstActionMsg(t, cmd)
+	next, _ = next.(model).Update(msg)
+	m = next.(model)
+	if controller.state.Approval != permission.ModeAuto || m.state.Approval != permission.ModeAuto {
+		t.Fatalf("approval mode controller/model = %s/%s, want auto", controller.state.Approval, m.state.Approval)
+	}
+}
+
 func TestBusyQueueDrainsAfterCurrentRunCompletes(t *testing.T) {
 	// User types two prompts during a single busy turn; both should queue,
 	// the first should auto-fire when the active run lands, and the second

@@ -313,6 +313,19 @@ func completionValuesForCommand(command Command, state State) []string {
 			}
 		}
 		return values
+	case CommandArgApproval:
+		values := []string{"all", "*"}
+		if command.ID == "approval.approve" {
+			values = append([]string{"auto", "ask", "read-only"}, values...)
+		}
+		for _, approval := range state.Approvals {
+			for _, value := range []string{approval.ID, approval.ArtifactID, approval.Subject} {
+				if strings.TrimSpace(value) != "" {
+					values = append(values, value)
+				}
+			}
+		}
+		return values
 	default:
 		return nil
 	}
